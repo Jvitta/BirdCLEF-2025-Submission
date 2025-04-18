@@ -105,16 +105,12 @@ class BirdCLEFDataset(Dataset):
                 spec = np.load(npy_file)
         except KeyError:
             print(f"Warning: Spectrogram chunk for key \t'{chunk_key}' (file: {npy_filename_in_zip}) not found in zip archive. Using zeros.")
-            # Create zeros array with float16 dtype
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float16)
         except Exception as e:
             print(f"Error loading chunk \t'{chunk_key}' from zip ({npy_filename_in_zip}): {e}. Using zeros.")
-            # Create zeros array with float16 dtype
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float16)
 
-        # spec is now loaded as float16 or created as float16 zeros
-        # spec = spec.astype(np.float32) # Remove conversion back to float32
-        spec = torch.tensor(spec, dtype=torch.float16).unsqueeze(0) # Create float16 tensor
+        spec = torch.tensor(spec, dtype=torch.float16).unsqueeze(0)
 
         if self.mode == "train" and random.random() < self.config.aug_prob:
             spec = self.apply_spec_augmentations(spec)
