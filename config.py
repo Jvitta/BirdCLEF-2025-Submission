@@ -1,6 +1,37 @@
 import torch
 import os
 
+# --- Environment Detection --- 
+# Simple check for Kaggle environment variables
+IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+
+# --- Base Path Definitions --- 
+if IS_KAGGLE:
+    print("Config: Detected Kaggle environment")
+    # Kaggle specific paths
+    BASE_INPUT_DIR = '/kaggle/input/birdclef-2025' # Adjust if dataset name changes
+    BASE_OUTPUT_DIR = '/kaggle/working/'
+    # Specific Kaggle input datasets if needed
+    VAD_INPUT_DIR = '/kaggle/input/bc25-separation-voice-from-data-by-silero-vad'
+    PRECOMPUTED_MODEL_DIR = '/kaggle/input/birdclef-m136-fft1024-hop64-fullv2/models'
+else:
+    print("Config: Assuming GCP/External environment (using gcsfuse mount point)")
+    # *** REPLACE WITH YOUR ACTUAL GCSFUSE MOUNT POINT ***
+    GCS_MOUNT_POINT = '/mnt/gcs_bucket' 
+    print(f"Config: Using GCS mount point: {GCS_MOUNT_POINT}")
+
+    # Define base paths relative to the mount point
+    # Adjust these sub-paths if your bucket structure is different
+    BASE_INPUT_DIR = os.path.join(GCS_MOUNT_POINT, 'input/birdclef-2025')
+    BASE_OUTPUT_DIR = os.path.join(GCS_MOUNT_POINT, 'working/')
+    VAD_INPUT_DIR = os.path.join(GCS_MOUNT_POINT, 'input/bc25-separation-voice-from-data-by-silero-vad')
+    PRECOMPUTED_MODEL_DIR = os.path.join(GCS_MOUNT_POINT, 'input/birdclef-m136-fft1024-hop64-fullv2/models')
+
+    # Ensure the output directory structure exists on the mounted drive
+    os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(os.path.join(BASE_OUTPUT_DIR, 'models/'), exist_ok=True)
+
+
 class Config:
     # --- General ---
     seed = 42
@@ -10,15 +41,14 @@ class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # --- Paths ---
-    DATA_ROOT = '/kaggle/input/birdclef-2025'
-    OUTPUT_DIR = '/kaggle/working/' # General output for logs, figures, etc.
+    DATA_ROOT = BASE_INPUT_DIR
+    OUTPUT_DIR = BASE_OUTPUT_DIR # General output for logs, figures, etc.
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models/') # Where trained models are saved
-    PREPROCESSED_DATA_DIR = os.path.join(OUTPUT_DIR, 'preprocessed/') # Where spectrograms.npy will be saved/loaded from
-    MODEL_INPUT_DIR = '/kaggle/input/birdclef-m136-fft1024-hop64-fullv2/models' # <--- UPDATE! Path to dataset containing saved models for inference
+    MODEL_INPUT_DIR = PRECOMPUTED_MODEL_DIR # Path to load models FROM
 
     # Paths for precomputed VAD/interval data
-    FABIO_CSV_PATH = '/kaggle/input/bc25-separation-voice-from-data-by-silero-vad/fabio.csv'
-    VOICE_DATA_PKL_PATH = '/kaggle/input/bc25-separation-voice-from-data-by-silero-vad/train_voice_data.pkl'
+    FABIO_CSV_PATH = os.path.join(VAD_INPUT_DIR, 'fabio.csv')
+    VOICE_DATA_PKL_PATH = os.path.join(VAD_INPUT_DIR, 'train_voice_data.pkl')
 
     # Derived paths
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
@@ -55,11 +85,11 @@ class Config:
     _MODE_STR = f"sample{N_MAX_PREPROCESS}" if debug_preprocessing_mode else "full"
     # Construct the full filename and path
     PREPROCESSED_FILENAME = f"{_PREPROCESSED_FILENAME_BASE}_{_MODE_STR}.npy"
-    PREPROCESSED_FILEPATH = os.path.join(PREPROCESSED_DATA_DIR, PREPROCESSED_FILENAME)
+    PREPROCESSED_FILEPATH = os.path.join(OUTPUT_DIR, 'preprocessed', PREPROCESSED_FILENAME)
 
     # Path for the metadata file corresponding to the chunks
     CHUNKED_METADATA_FILENAME = f"train_metadata_chunked_{_MODE_STR}.csv"
-    CHUNKED_METADATA_PATH = os.path.join(PREPROCESSED_DATA_DIR, CHUNKED_METADATA_FILENAME)
+    CHUNKED_METADATA_PATH = os.path.join(OUTPUT_DIR, CHUNKED_METADATA_FILENAME)
 
     # Path to specific preprocessed file for verification/testing
 
@@ -107,3 +137,23 @@ class Config:
 
 # --- Instantiate config ---
 config = Config()
+
+# --- Post-Instantiation Checks/Setup (Optional but Recommended) --- 
+# Example: Update num_classes based on taxonomy
+try:
+    if os.path.exists(config.taxonomy_path):
+        import pandas as pd
+        taxonomy_df = pd.read_csv(config.taxonomy_path)
+        actual_num_classes = taxonomy_df['primary_label'].nunique()
+        if config.num_classes != actual_num_classes:
+             print(f"Config Warning: num_classes ({config.num_classes}) does not match taxonomy unique labels ({actual_num_classes}). Updating config.")
+             config.num_classes = actual_num_classes
+    else:
+        print(f"Config Warning: Taxonomy file not found at {config.taxonomy_path}. Using default num_classes: {config.num_classes}.")
+except Exception as e:
+    print(f"Config Error during taxonomy check: {e}. Using default num_classes: {config.num_classes}.")
+
+
+print(f"Config: Device set to \"{config.device}\"")
+print(f"Config: Using DATA_ROOT: {config.DATA_ROOT}")
+print(f"Config: Using OUTPUT_DIR: {config.OUTPUT_DIR}")
