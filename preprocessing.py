@@ -117,15 +117,18 @@ def generate_and_save_spectrograms(df, config):
     chunked_df = pd.DataFrame(chunked_metadata)
     print(f"Generated chunked metadata DataFrame with {len(chunked_df)} rows.")
 
-    print(f"Saving chunked metadata to: {config.CHUNKED_METADATA_PATH}")
+    # --- Save Chunked Metadata --- 
+    # Ensure we save to the designated OUTPUT path
+    save_path = config.CHUNKED_METADATA_OUTPUT_PATH
+    print(f"Saving chunked metadata to: {save_path}")
     try:
-        os.makedirs(os.path.dirname(config.CHUNKED_METADATA_PATH), exist_ok=True)
-        chunked_df.to_csv(config.CHUNKED_METADATA_PATH, index=False)
-        print(f"Successfully saved chunked metadata.")
+        # Ensure the output directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        chunked_df.to_csv(save_path, index=False)
     except Exception as e:
-        print(f"Error saving chunked metadata to {config.CHUNKED_METADATA_PATH}: {e}")
-        # If metadata fails, the zip file still exists but training will likely fail.
-        # Consider deleting the zip file here if metadata is essential?
+        print(f"Error saving chunked metadata to {save_path}: {e}")
+
+    print(f"\nPreprocessing script finished successfully. Output: {config.PREPROCESSED_ZIP_OUTPUT_PATH}, {save_path}")
 
     return chunked_df
 
@@ -208,7 +211,7 @@ def main(config):
     if chunked_metadata_df is None:
         print("Spectrogram generation or metadata creation failed. Preprocessing incomplete.")
     else:
-         print(f"\nPreprocessing script finished successfully. Output: {config.PREPROCESSED_ZIP_PATH}, {config.CHUNKED_METADATA_PATH}")
+         print(f"\nPreprocessing script finished successfully. Output: {config.PREPROCESSED_ZIP_OUTPUT_PATH}, {config.CHUNKED_METADATA_OUTPUT_PATH}")
 
 if __name__ == "__main__":
     main(config)

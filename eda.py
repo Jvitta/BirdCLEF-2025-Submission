@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 
-df = pd.read_csv('data/train_metadata_chunked_full.csv')
+df = pd.read_csv('data/train_metadata_chunked_full2.csv')
 
 label_counts = df['primary_label'].value_counts().sort_values(ascending=False)
 
