@@ -1,0 +1,28 @@
+numpy
+pandas
+scikit-learn
+# torch # See note below regarding manual installation!
+timm # PyTorch Image Models
+
+# Audio Processing
+librosa
+opencv-python
+
+# Utilities & Visualization
+tqdm 
+matplotlib
+seaborn
+plotly 
+optuna 
+
+# Environment/Execution
+ipython # For IPython.display used in utils (optional if not running in notebook)
+
+# Note on PyTorch installation:
+# Installing PyTorch ('torch') typically requires specific commands
+# depending on your OS and CUDA version (if using GPU).
+# Please DO NOT rely on installing 'torch' via this file alone.
+# Refer to the official PyTorch website for instructions:
+# https://pytorch.org/get-started/locally/
+# Example (replace with appropriate versions for your system):
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 

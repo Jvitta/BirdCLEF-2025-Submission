@@ -3,12 +3,11 @@ import logging
 import random
 import gc
 import time
-import math
 import warnings
 from pathlib import Path
 import sys
 import glob
-import zipfile
+# import zipfile # No longer needed
 
 import numpy as np
 import pandas as pd
@@ -51,26 +50,24 @@ def set_seed(seed=42):
 
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
-    Handles loading pre-computed spectrogram CHUNKS from a zip archive
+    Handles loading pre-computed spectrogram CHUNKS from a directory structure
     based on chunked metadata.
     """
     def __init__(self, df, config, mode="train"):
         self.df = df.copy()
         self.config = config
         self.mode = mode
-        self.zip_path = config.PREPROCESSED_ZIP_PATH
-        self.zip_ref = None 
+        # Store the base directory where chunk .npy files are located
+        self.chunk_dir_path = config.PREPROCESSED_CHUNK_DIR 
+        # self.zip_path = config.PREPROCESSED_ZIP_PATH # Removed zip logic
+        # self.zip_ref = None # Removed zip logic
 
-        try:
-            self.zip_ref = zipfile.ZipFile(self.zip_path, 'r')
-            print(f"Dataset mode \t'{self.mode}': Opened zip archive {self.zip_path}")
-        except zipfile.BadZipFile:
-            print(f"Error: Failed to open {self.zip_path}. It might be corrupted.")
-            raise
-        except Exception as e:
-            print(f"Error opening zip file {self.zip_path}: {e}")
-            if self.zip_ref: self.zip_ref.close() 
-            raise
+        # Check if chunk directory exists
+        if not os.path.isdir(self.chunk_dir_path):
+             raise FileNotFoundError(f"Preprocessed chunk directory not found at: {self.chunk_dir_path}")
+        print(f"Dataset mode '{self.mode}': Reading chunks from directory {self.chunk_dir_path}")
+
+        # --- Removed zip opening logic --- 
 
         try:
             taxonomy_df = pd.read_csv(self.config.taxonomy_path)
@@ -83,37 +80,47 @@ class BirdCLEFDataset(Dataset):
             self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
         except Exception as e:
             print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
-            if self.zip_ref: self.zip_ref.close()
+            # No zip_ref to close here
             raise
 
         required_cols = ['chunk_key', 'primary_label', 'secondary_labels', 'filename']
         if not all(col in self.df.columns for col in required_cols):
-            if self.zip_ref: self.zip_ref.close()
+            # No zip_ref to close here
             raise ValueError(f"Chunked DataFrame missing required columns: {required_cols}")
+        
+        # Verification of files vs dir could be added here if needed (might be slow)
+        # Example: Check if first few chunk_key.npy files exist? 
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        chunk_key = row['chunk_key']
+        chunk_key = row['chunk_key'] # e.g., 'label/XC123.ogg_chunk0'
         spec = None
-        npy_filename_in_zip = f"{chunk_key}.npy"
+        
+        # Construct the full path to the .npy file
+        npy_filepath = os.path.join(self.chunk_dir_path, f"{chunk_key}.npy")
 
         try:
-            with self.zip_ref.open(npy_filename_in_zip, 'r') as npy_file:
-                spec = np.load(npy_file)
-        except KeyError:
-            print(f"Warning: Spectrogram chunk for key \t'{chunk_key}' (file: {npy_filename_in_zip}) not found in zip archive. Using zeros.")
+            # Load directly from the .npy file path
+            spec = np.load(npy_filepath)
+        except FileNotFoundError:
+            print(f"Warning: Spectrogram chunk file not found: {npy_filepath}. Using zeros.")
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float16)
         except Exception as e:
-            print(f"Error loading chunk \t'{chunk_key}' from zip ({npy_filename_in_zip}): {e}. Using zeros.")
+            print(f"Error loading chunk file {npy_filepath}: {e}. Using zeros.")
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float16)
 
-        spec = torch.tensor(spec, dtype=torch.float16).unsqueeze(0)
+        # Load as float16 initially, then cast to float32 for the model
+        spec = torch.tensor(spec, dtype=torch.float16) 
+        spec = spec.float() # Cast to float32
+        spec = spec.unsqueeze(0) # Add channel dimension
 
         if self.mode == "train" and random.random() < self.config.aug_prob:
-            spec = self.apply_spec_augmentations(spec)
+            # Ensure augmentations work with float32 or handle casting internally
+            spec = self.apply_spec_augmentations(spec) # Now feeding float32 to augmentations
+            # --- End Apply Augmentations ---
 
         target = self.encode_label(row['primary_label'])
         
@@ -138,7 +145,7 @@ class BirdCLEFDataset(Dataset):
                     target[self.label_to_idx[label]] = 1.0 # Target remains float32
 
         return {
-            'melspec': spec, # This is now float16
+            'melspec': spec, # This is float16
             'target': torch.tensor(target, dtype=torch.float32), # Target is float32
             'chunk_key': chunk_key
         }
@@ -178,12 +185,6 @@ class BirdCLEFDataset(Dataset):
         if label in self.label_to_idx:
             target[self.label_to_idx[label]] = 1.0
         return target
-
-    def __del__(self):
-        # Ensure the zip file is closed when the dataset object is garbage collected
-        if self.zip_ref:
-            print(f"Closing zip file reference for dataset mode \t'{self.mode}'")
-            self.zip_ref.close()
 
 def collate_fn(batch):
     # ... (Check expected keys should now include chunk_key, remove filename if not needed) ...
@@ -412,13 +413,18 @@ def train_one_epoch(model, loader, optimizer, criterion, device, config, schedul
             continue
 
         optimizer.zero_grad()
-        # Pass targets only if mixup is enabled
-        outputs = model(inputs, targets if model.training and model.mixup_enabled else None)
+        # Access mixup_enabled via model.module when using DataParallel
+        apply_mixup = model.training and getattr(model, 'module', model).mixup_enabled
+        outputs = model(inputs, targets if apply_mixup else None)
 
         # Handle model output (logits or logits, loss)
         if isinstance(outputs, tuple):
-            logits, loss = outputs
+            logits, loss_tensor = outputs
+            # When using DataParallel with loss computed inside model.forward,
+            # the returned loss might be a tensor with loss per device. Average it.
+            loss = loss_tensor.mean()
         else:
+            # If mixup is off, calculate loss here (criterion handles reduction)
             logits = outputs
             loss = criterion(logits, targets)
 
@@ -505,22 +511,34 @@ def validate(model, loader, criterion, device, config):
 
 def run_training(df, config, trial=None):
     """Runs the cross-validation training loop using GroupKFold and returns metrics and history."""
-    # df is now the CHUNKED metadata dataframe
     print("\n--- Starting Training Run with Chunked Data ---")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
-    # LOAD_PREPROCESSED_DATA must be true
+
     if not config.LOAD_PREPROCESSED_DATA:
          print("Error: LOAD_PREPROCESSED_DATA must be True in config for chunked data.")
          return 0.0, {}
          
-    print(f"Training will load chunks individually from: {config.PREPROCESSED_ZIP_PATH}")
-    if not os.path.exists(config.PREPROCESSED_ZIP_PATH):
-         print(f"Error: Preprocessed zip archive not found at {config.PREPROCESSED_ZIP_PATH}. Run preprocessing. Exiting.")
+    # These checks might need adjustment based on final config logic
+    if config.PREPROCESSED_DATA_TYPE == "dir":
+        print(f"Training will load chunks individually from directory: {config.PREPROCESSED_CHUNK_DIR}")
+        if not os.path.isdir(config.PREPROCESSED_CHUNK_DIR):
+             print(f"Error: Preprocessed chunk directory not found at {config.PREPROCESSED_CHUNK_DIR}. Check config or run preprocessing. Exiting.")
+             return 0.0, {}
+    elif config.PREPROCESSED_DATA_TYPE == "zip":
+         print(f"Training will load chunks individually from: {config.PREPROCESSED_ZIP_PATH}")
+         if not os.path.exists(config.PREPROCESSED_ZIP_PATH):
+             print(f"Error: Preprocessed zip archive not found at {config.PREPROCESSED_ZIP_PATH}. Run preprocessing. Exiting.")
+             return 0.0, {}
+    else:
+         print(f"Error: Invalid config.PREPROCESSED_DATA_TYPE: {config.PREPROCESSED_DATA_TYPE}")
          return 0.0, {}
-
+         
     # The input df IS the chunked dataframe
     working_df = df.copy()
+
+    # --- Ensure Model Output Directory Exists --- #
+    os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
 
     # --- Group K-Fold Cross-validation Setup --- 
     # Need a column identifying the original audio file for grouping
@@ -585,8 +603,22 @@ def run_training(df, config, trial=None):
 
         # --- Model, Optimizer, Criterion, Scheduler Setup for Fold ---
         print("\nSetting up model, optimizer, criterion, scheduler...")
-        model = BirdCLEFModel(config).to(config.device)
-        optimizer = get_optimizer(model, config)
+        # Instantiate model on CPU first (if device changes occur later)
+        model = BirdCLEFModel(config) 
+
+        # Check if multiple GPUs are available and wrap with DataParallel
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs via nn.DataParallel.")
+            model = nn.DataParallel(model) # Wrap the model
+        elif torch.cuda.is_available():
+             print(f"Using single GPU: {config.device}")
+        else:
+            print("Using CPU")
+
+        # Move the model (or wrapped model) to the primary CUDA device (or CPU)
+        model.to(config.device)
+
+        optimizer = get_optimizer(model, config) # Pass the potentially wrapped model
         criterion = get_criterion(config)
 
         # Handle OneCycleLR setup separately as per original logic
@@ -779,6 +811,7 @@ def plot_training_history(history, config):
 
 if __name__ == "__main__":
     print("\n--- Initializing Training Script --- ")
+    set_seed(config.seed) # Set seed for reproducibility
 
     # --- Load CHUNKED Metadata --- 
     print(f"Loading CHUNKED training metadata from: {config.CHUNKED_METADATA_PATH}")

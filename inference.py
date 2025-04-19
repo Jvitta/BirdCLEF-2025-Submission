@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from tqdm.auto import tqdm
+from collections import OrderedDict
 
 # Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
 from config import config # Import central config
@@ -184,8 +185,35 @@ class BirdCLEF2025Pipeline:
                 print(f"Loading model: {model_path}")
                 checkpoint = torch.load(model_path, map_location=torch.device(self.config.device))
                 model = self.BirdCLEFModel(self.config, self.num_classes)
-                model.load_state_dict(checkpoint['model_state_dict'])
-                model = model.to(self.config.device)
+
+                # --- Key Handling Logic ---
+                original_state_dict = checkpoint['model_state_dict']
+                new_state_dict = OrderedDict()
+                is_parallel = False 
+
+                # Check if keys start with 'module.' (indicating DataParallel save)
+                # Use items() to iterate over key-value pairs
+                for k, v in original_state_dict.items():
+                    if k.startswith('module.'):
+                        is_parallel = True
+                        name = k[7:] # remove 'module.' prefix
+                        new_state_dict[name] = v
+                    else:
+                        # If not prefixed, assume it's already the correct format
+                        # But if we find a mix, something is wrong. Break if inconsistency detected.
+                        if is_parallel and not k.startswith('module.'): 
+                            print(f"Warning: Inconsistent state_dict keys found in {model_path}. Some keys have 'module.' prefix, others don't.")
+                            # Fallback: Load original dict directly if inconsistent
+                            new_state_dict = original_state_dict
+                            break 
+                        else:
+                            new_state_dict[k] = v
+
+                # Load the corrected state dict
+                model.load_state_dict(new_state_dict) 
+                # --- End Key Handling Logic ---
+
+                model.to(self.config.device)
                 model.eval()
                 self.models.append(model)
                 print(f"Successfully loaded model from {model_path}")
