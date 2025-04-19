@@ -358,10 +358,11 @@ def get_scheduler(optimizer, config, steps_per_epoch=None): # Pass config, poten
         raise NotImplementedError(f"Scheduler '{config.scheduler}' not implemented")
     return scheduler
 
-def get_criterion(config): # Pass config object
+def get_criterion(config, pos_weight=None): # Pass config object and optional pos_weight
     """Creates loss criterion based on config settings."""
     if config.criterion == 'BCEWithLogitsLoss':
-        criterion = nn.BCEWithLogitsLoss()
+        # Pass pos_weight tensor if provided
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     else:
         raise NotImplementedError(f"Criterion '{config.criterion}' not implemented")
     return criterion
@@ -537,6 +538,50 @@ def run_training(df, config, trial=None):
     # The input df IS the chunked dataframe
     working_df = df.copy()
 
+    # --- Calculate Class Weights (pos_weight) --- #
+    print("Calculating class weights for BCEWithLogitsLoss...")
+    pos_weight_tensor = None
+    try:
+        # Load the specific metadata file for weight calculation
+        weight_meta_path = "/kaggle/input/train-metadata/train_metadata_chunked_full2.csv"
+        print(f"Loading metadata for weights from: {weight_meta_path}")
+        weight_df = pd.read_csv(weight_meta_path)
+        
+        # Load taxonomy to get label mapping
+        taxonomy_df = pd.read_csv(config.taxonomy_path)
+        species_ids = taxonomy_df['primary_label'].tolist()
+        num_classes = len(species_ids)
+        label_to_idx = {label: idx for idx, label in enumerate(species_ids)}
+
+        # Calculate primary label counts
+        primary_counts_series = weight_df['primary_label'].value_counts()
+        total_samples = len(weight_df)
+        
+        # Create positive counts tensor
+        positive_counts = torch.zeros(num_classes)
+        for label, count in primary_counts_series.items():
+            if label in label_to_idx:
+                idx = label_to_idx[label]
+                positive_counts[idx] = count
+            else:
+                print(f"Warning: Label '{label}' from weight metadata not found in taxonomy.")
+
+        # Calculate pos_weight: num_neg / num_pos = (total - num_pos) / num_pos
+        epsilon = 1e-6 # Prevent division by zero
+        pos_weight_tensor = (total_samples - positive_counts) / (positive_counts + epsilon)
+        
+        # Ensure tensor is on the correct device
+        pos_weight_tensor = pos_weight_tensor.to(config.device)
+        print(f"Calculated pos_weight tensor (shape: {pos_weight_tensor.shape}, device: {pos_weight_tensor.device})")
+        # Optional: Clamp weights
+        # pos_weight_tensor = torch.clamp(pos_weight_tensor, min=1.0, max=100.0)
+
+    except FileNotFoundError:
+        print(f"Error: Metadata file for weight calculation not found at {weight_meta_path}. Proceeding without class weights.")
+    except Exception as e:
+        print(f"Error calculating class weights: {e}. Proceeding without class weights.")
+        pos_weight_tensor = None # Ensure it's None if calculation fails
+
     # --- Ensure Model Output Directory Exists --- #
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
 
@@ -619,7 +664,8 @@ def run_training(df, config, trial=None):
         model.to(config.device)
 
         optimizer = get_optimizer(model, config) # Pass the potentially wrapped model
-        criterion = get_criterion(config)
+        # Pass the calculated pos_weight tensor to the criterion function
+        criterion = get_criterion(config, pos_weight=pos_weight_tensor).to(config.device)
 
         # Handle OneCycleLR setup separately as per original logic
         if config.scheduler == 'OneCycleLR':
