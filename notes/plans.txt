@@ -1,0 +1,19 @@
+-chunk submission
+-look into reducing training time
+-class weighted loss training
+-class weighted loss submission
+
+--break to study and learn from code--
+
+-HPO vs 5 submissions per day if training time is low?
+-GCP mount bucket
+-GCP setup custom training job
+-GCP preprocessing test
+-GCP training test
+-pseudo labeling inference (get label + probability for train_soundscapes)
+-training with additional pseudo labeled data
+-pseudo labeled submission
+
+--break to study and learn from code--
+
+-SSL
