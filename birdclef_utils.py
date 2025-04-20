@@ -67,33 +67,46 @@ def process_audio_file(audio_path, cfg):
         return None
 
 def generate_spectrograms(df, cfg):
-    """Generate spectrograms from audio files"""
+    """Generate spectrograms from audio files and return as a dictionary."""
     print("Generating mel spectrograms from audio files...")
     start_time = time.time()
 
-    all_bird_data = {}
+    # Re-initialize the dictionary to store results
+    all_bird_data = {} 
     errors = []
 
-    for i, row in tqdm(df.iterrows(), total=len(df)):
-        if cfg.debug and i >= 1000:
-            break
+    # Revert tqdm usage if necessary (it might work either way, but revert for consistency)
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Preprocessing Audio"):
+        # Use original debug limit logic if N_MAX_PREPROCESS is defined and debug is on
+        if cfg.debug and cfg.N_MAX_PREPROCESS is not None and i >= cfg.N_MAX_PREPROCESS:
+             print(f"DEBUG: Stopping preprocessing early after {cfg.N_MAX_PREPROCESS} files.")
+             break
         
         try:
             samplename = row['samplename']
             filepath = row['filepath']
-            
+            # Remove output_filepath logic
+            # output_filepath = os.path.join(cfg.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
+
             mel_spec = process_audio_file(filepath, cfg)
-            
+
             if mel_spec is not None:
+                # Store result in dictionary instead of saving
                 all_bird_data[samplename] = mel_spec
-            
+            else:
+                 # process_audio_file should print its own errors
+                 errors.append((filepath, "Processing returned None"))
+
         except Exception as e:
-            print(f"Error processing {row.filepath}: {e}")
-            errors.append((row.filepath, str(e)))
+            # Use original error reporting
+            print(f"Error processing {row.get('filepath', 'N/A')}: {e}")
+            errors.append((row.get('filepath', 'N/A'), str(e)))
 
     end_time = time.time()
+    # Use original success/fail counts based on dictionary and errors
     print(f"Processing completed in {end_time - start_time:.2f} seconds")
     print(f"Successfully processed {len(all_bird_data)} files out of {len(df)}")
     print(f"Failed to process {len(errors)} files")
     
+    # Return the dictionary
     return all_bird_data

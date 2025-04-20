@@ -14,7 +14,7 @@ class Config:
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
-    PREPROCESSED_DATA_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
+    PREPROCESSED_DATA_DIR = os.path.join(GCS_MOUNT_POINT, 'preprocessed')
     MODEL_INPUT_DIR = MODEL_OUTPUT_DIR
 
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')

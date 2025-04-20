@@ -520,78 +520,28 @@ def run_training(df, config): # Pass config object
     # Ensure model output directory exists
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
 
-    # Set seed for reproducibility within this function (e.g., for KFold)
-    # Seed is already set globally at script start
-    # set_seed(config.seed)
-
-    # --- Load Spectrograms --- #
+    # --- Restore Spectrogram Loading Logic --- #
     spectrograms = None
-    preprocessed_data_path_resolved = None # Variable to store the found path
+    # preprocessed_data_path_resolved = None # This variable was part of Kaggle specific logic, not needed here
 
     if config.LOAD_PREPROCESSED_DATA:
         print("\nAttempting to load pre-computed mel spectrograms...")
-        
-        # 1. Construct filenames for both full and potential sample versions
-        base_filename = config._PREPROCESSED_FILENAME_BASE # e.g., "spectrogram_m136_fft1024_hop64"
-        full_filename = f"{base_filename}_full.npy"
-        # Sample filename depends on current debug state (specifically N_MAX_PREPROCESS)
-        sample_filename = config.PREPROCESSED_FILENAME # This uses the current debug state
+        # Use the PREPROCESSED_FILEPATH directly
+        preprocessed_path = config.PREPROCESSED_FILEPATH
+        print(f"Looking for pre-computed data at: {preprocessed_path}")
+        if os.path.exists(preprocessed_path):
+             try:
+                 spectrograms = np.load(preprocessed_path, allow_pickle=True).item()
+                 print(f"Loaded {len(spectrograms)} pre-computed mel spectrograms.")
+             except Exception as e:
+                 print(f"Error loading file {preprocessed_path}: {e}")
+                 print("Cannot proceed without preprocessed data when LOAD_PREPROCESSED_DATA is True.")
+                 return 0.0 # Return 0.0 AUC for Optuna compatibility
+        else:
+             print(f"Error: Preprocessed data file not found at {preprocessed_path}")
+             print("Please run preprocessing first or set LOAD_PREPROCESSED_DATA to False.")
+             return 0.0 # Return 0.0 AUC for Optuna compatibility
 
-        # 2. Define search patterns (USE RECURSIVE GLOB **)
-        full_search_pattern = f"/kaggle/input/**/{full_filename}" # Search recursively
-        sample_search_pattern = f"/kaggle/input/**/{sample_filename}" # Search recursively
-
-        # 3. Search prioritized: Try FULL first
-        print(f"Searching for FULL dataset: {full_search_pattern}")
-        # Add recursive=True to glob call
-        possible_full_paths = glob.glob(full_search_pattern, recursive=True)
-
-        if len(possible_full_paths) == 1:
-            preprocessed_data_path_resolved = possible_full_paths[0]
-            print(f"Found pre-computed data at: {preprocessed_data_path_resolved}")
-            try:
-                spectrograms = np.load(preprocessed_data_path_resolved, allow_pickle=True).item()
-                print(f"Loaded {len(spectrograms)} pre-computed mel spectrograms.")
-            except Exception as e:
-                print(f"Error loading file {preprocessed_data_path_resolved}: {e}")
-                print("Cannot proceed without preprocessed data when LOAD_PREPROCESSED_DATA is True.")
-                return # Exit if loading fails
-        elif len(possible_full_paths) > 1:
-             print(f"Error: Found multiple FULL files matching '{full_filename}':")
-             for p in possible_full_paths:
-                 print(f"  - {p}")
-             print("Please ensure only one relevant dataset is added.")
-             return # Exit if ambiguous
-
-        # 4. If FULL not found, AND if debug mode is ON, try SAMPLE
-        elif config.debug and preprocessed_data_path_resolved is None:
-            print(f"FULL dataset not found. Debug mode is ON. Searching for SAMPLE dataset: {sample_search_pattern}")
-            # Avoid searching if sample filename is same as full (happens if debug=False)
-            if sample_filename != full_filename:
-                 # Add recursive=True to glob call
-                 possible_sample_paths = glob.glob(sample_search_pattern, recursive=True)
-                 if len(possible_sample_paths) == 1:
-                     preprocessed_data_path_resolved = possible_sample_paths[0]
-                     loaded_mode = 'sample' # Set loaded mode correctly
-                     print(f"Found SAMPLE pre-computed data at: {preprocessed_data_path_resolved}")
-                     # Loading logic moved to section 5
-                 elif len(possible_sample_paths) > 1:
-                      print(f"Error: Found multiple SAMPLE files matching '{sample_filename}':")
-                      for p in possible_sample_paths:
-                          print(f"  - {p}") # Corrected indentation
-                      print("Please ensure only one relevant dataset is added.")
-                      return # Exit if ambiguous
-                 # else: No sample file found, do nothing here, check preprocessed_data_path_resolved later
-
-        # 5. Load data if a path was resolved
-        if preprocessed_data_path_resolved:
-            try:
-                spectrograms = np.load(preprocessed_data_path_resolved, allow_pickle=True).item()
-                print(f"Loaded {len(spectrograms)} pre-computed mel spectrograms.")
-            except Exception as e:
-                print(f"Error loading file {preprocessed_data_path_resolved}: {e}")
-                print("Cannot proceed without preprocessed data when LOAD_PREPROCESSED_DATA is True.")
-                return # Exit if loading fails
     else:
         print("\nGenerating spectrograms on-the-fly.")
 
@@ -627,7 +577,7 @@ def run_training(df, config): # Pass config object
         print(f'Training set: {len(train_df_fold)} samples')
         print(f'Validation set: {len(val_df_fold)} samples')
 
-        # Create datasets for the current fold
+        # Create datasets for the current fold (PASS spectrograms dictionary)
         train_dataset = BirdCLEFDataset(train_df_fold, config, spectrograms=spectrograms, mode='train')
         val_dataset = BirdCLEFDataset(val_df_fold, config, spectrograms=spectrograms, mode='valid')
 

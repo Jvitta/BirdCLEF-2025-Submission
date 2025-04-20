@@ -51,7 +51,7 @@ def load_and_prepare_metadata(config):
     return working_df
 
 def generate_and_save_spectrograms(df, config):
-    """Generates spectrograms using utils function and saves them."""
+    """Generates spectrograms dictionary using utils function and saves it."""
     if df is None or df.empty:
         print("Working dataframe is empty, skipping spectrogram generation.")
         return {}

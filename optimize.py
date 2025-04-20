@@ -9,7 +9,7 @@ import plotly
 import shutil # Add shutil for file copying
 
 from config import config as base_config
-from birdclef_training import run_training, set_seed 
+from birdclef_training import run_training, set_seed, calculate_auc # Import calculate_auc
 
 # load data once for HPO
 print("Loading main training metadata for HPO...")
@@ -81,39 +81,25 @@ def objective(trial):
 
 if __name__ == "__main__":
     # --- Study Configuration ---
-    study_name = "BirdCLEF_HPO_OptimizeLR_WD_Mixup_Scheduler"
-    n_trials = 20
+    study_name = "BirdCLEF_HPO_GCP_OptimizeLR_WD_Mixup_Scheduler"
+    n_trials = 20 # Adjust as needed for GCP
 
-    # --- Define paths --- #
-    # Path to the *original* database in the input dataset
-    # *** IMPORTANT: Ensure 'hpo-results' matches your input dataset name ***
-    previous_output_slug = "hpo-results"
-    input_db_path = f"/kaggle/input/{previous_output_slug}/hpo_results.db"
+    # --- Define paths for GCP --- #
+    # Database will be stored in the OUTPUT_DIR defined in config.py
+    db_filename = "hpo_study_results.db"
+    db_filepath = os.path.join(base_config.OUTPUT_DIR, db_filename)
+    storage_path = f"sqlite:///{db_filepath}" # Use absolute path for Optuna
 
-    # Path to where we *will* work with the database (writable)
-    working_db_name = "hpo_results_writable.db"
-    storage_path_working = f"sqlite:////kaggle/working/{working_db_name}" # Absolute path for Optuna
-    working_db_file_path = f"/kaggle/working/{working_db_name}" # Filesystem path for copy
-
-    # --- Copy database from input to working directory --- #
-    storage_path_to_use = storage_path_working # Default to working path
-    if os.path.exists(input_db_path):
-        try:
-            print(f"Copying database from {input_db_path} to {working_db_file_path}...")
-            shutil.copy2(input_db_path, working_db_file_path)
-            print("Database copied successfully.")
-            # Use the copied path for the study
-            storage_path_to_use = storage_path_working
-        except Exception as e:
-            print(f"ERROR: Could not copy database file: {e}")
-            print(f"Optuna will attempt to use/create database at {storage_path_working}")
-            # Fallback to using/creating a new db in working dir if copy fails
-            storage_path_to_use = storage_path_working
+    # --- Database Handling (Simplified for GCP) --- #
+    # No need to copy from /kaggle/input. Optuna will load or create the db at the specified path.
+    storage_path_to_use = storage_path
+    print(f"Optuna database path: {db_filepath}")
+    if os.path.exists(db_filepath):
+        print("Existing database found. Optuna will load study if it exists.")
     else:
-        print(f"Warning: Input database file not found at {input_db_path}.")
-        print(f"Optuna will create a new database at {storage_path_working}")
-        # If the input db doesn't exist, create a new one in working dir
-        storage_path_to_use = storage_path_working
+        print("No existing database found. Optuna will create a new one.")
+        # Ensure the output directory exists for the new database
+        os.makedirs(base_config.OUTPUT_DIR, exist_ok=True)
 
     # Define HPO settings ...
     hpo_trial_epochs = 5
@@ -135,8 +121,8 @@ if __name__ == "__main__":
         study_name=study_name,
         sampler=optuna.samplers.TPESampler(seed=base_config.seed),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=1),
-        storage=storage_path_to_use, # Use the path in /kaggle/working/
-        load_if_exists=True # Load if the *copied* file exists
+        storage=storage_path_to_use, # Use the defined path
+        load_if_exists=True # Load if the db file exists and study_name matches
     )
 
     # Add base config parameters as user attributes for reference
