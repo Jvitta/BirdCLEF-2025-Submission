@@ -48,13 +48,12 @@ set_seed(config.seed)
 
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
-    Handles loading pre-computed spectrograms or generating them on-the-fly.
+    Handles loading individual pre-computed spectrograms or generating them on-the-fly.
     """
-    def __init__(self, df, config, spectrograms=None, mode="train"):
-        self.df = df.copy() # Work on a copy to avoid modifying original df
-        self.config = config # Use the imported config object
+    def __init__(self, df, config, mode="train"):
+        self.df = df.copy()
+        self.config = config
         self.mode = mode
-        self.spectrograms = spectrograms
 
         # Load taxonomy info once
         try:
@@ -79,15 +78,15 @@ class BirdCLEFDataset(Dataset):
             # Use split/join method consistent with preprocessing.py
             self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-        # Report on pre-computed spectrogram matching
-        if self.spectrograms:
-            sample_names = set(self.df['samplename'])
-            found_samples = sum(1 for name in sample_names if name in self.spectrograms)
-            print(f"Dataset mode '{self.mode}': Found {found_samples} matching pre-computed spectrograms for {len(self.df)} samples.")
-        elif not self.config.LOAD_PREPROCESSED_DATA:
+        # Update print statements for individual file loading
+        if not self.config.LOAD_PREPROCESSED_DATA:
              print(f"Dataset mode '{self.mode}': Configured to generate spectrograms on-the-fly.")
         else:
-             print(f"Dataset mode '{self.mode}': Configured to load pre-computed data from {self.config.PREPROCESSED_FILEPATH}, but no spectrogram dictionary provided to Dataset.")
+             # Check if the directory exists during init for early feedback
+             if not os.path.exists(self.config.PREPROCESSED_DATA_DIR):
+                 print(f"Warning: Preprocessed data directory {self.config.PREPROCESSED_DATA_DIR} not found. Dataset will likely fail to load files.")
+             else:
+                 print(f"Dataset mode '{self.mode}': Configured to load individual pre-computed spectrograms from {self.config.PREPROCESSED_DATA_DIR}")
 
     def __len__(self):
         return len(self.df)
@@ -97,21 +96,45 @@ class BirdCLEFDataset(Dataset):
         samplename = row['samplename']
         spec = None
 
-        # Try loading pre-computed first if configured and available
-        if self.config.LOAD_PREPROCESSED_DATA and self.spectrograms and samplename in self.spectrograms:
-            spec = self.spectrograms[samplename]
-        # Otherwise, generate on-the-fly if configured
-        elif not self.config.LOAD_PREPROCESSED_DATA:
-            # Use the utility function
-            spec = utils.process_audio_file(row['filepath'], self.config)
+        # Try loading pre-computed individual file first if configured
+        if self.config.LOAD_PREPROCESSED_DATA:
+            spec_path = os.path.join(self.config.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
+            try:
+                spec = np.load(spec_path)
+            except FileNotFoundError:
+                # Only print warning if we expected the file
+                if self.mode == "train": # Often only critical during training
+                    print(f"Warning: Precomputed spectrogram file not found for {samplename} at {spec_path}. Attempting on-the-fly generation or using zeros.")
+                # Fall through to potentially generate on-the-fly or use zeros
+                pass 
+            except Exception as e:
+                 print(f"Warning: Error loading precomputed spectrogram {spec_path}: {e}. Attempting generation or using zeros.")
+                 # Fall through
+                 pass
 
-        # Handle cases where spec is still None (missing pre-computed or error in generation)
+        # If spec wasn't loaded OR if on-the-fly generation is configured
+        if spec is None and not self.config.LOAD_PREPROCESSED_DATA:
+            print(f"Debug: Generating spec on-the-fly for {samplename}") # Optional debug
+            # Generate on-the-fly using the utility function (passing necessary args)
+            # Note: utils.process_audio_file expects intervals, but they are not loaded here.
+            # If on-the-fly generation is a primary use case, need to decide how to handle intervals.
+            # For now, assume intervals are only used when LOAD_PREPROCESSED_DATA is False during preprocessing.
+            # Or pass dummy empty dicts if the function requires them.
+            try:
+                spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {}) # Pass empty interval dicts
+            except Exception as e_gen:
+                 print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
+                 spec = None # Ensure spec is None if generation fails
+
+        # Handle cases where spec is still None (missing pre-computed AND generation failed/disabled)
         if spec is None:
+            # Use original logic for zero padding
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-            # Print warning only if generation was attempted or pre-computed was expected but missing
-            if not self.config.LOAD_PREPROCESSED_DATA or (self.config.LOAD_PREPROCESSED_DATA and self.spectrograms is not None):
-                 if self.mode == "train": # Often only critical during training
-                    print(f"Warning: Spectrogram for {samplename} ({row['filepath']}) could not be loaded/generated. Using zeros.")
+            # Modify warning condition as self.spectrograms is gone
+            if not self.config.LOAD_PREPROCESSED_DATA:
+                 if self.mode == "train": 
+                    print(f"Warning: On-the-fly generation failed for {samplename} ({row['filepath']}). Using zeros.")
+            # If LOAD_PREPROCESSED_DATA was True, the warning was printed during the load attempt
 
         # Ensure spec is float32 before converting to tensor
         spec = spec.astype(np.float32)
@@ -507,43 +530,32 @@ def validate(model, loader, criterion, device):
 # --- Main Training Orchestration --- #
 
 def run_training(df, config): # Pass config object
-    """Runs the cross-validation training loop (incorporating user logic)."""
+    """Runs the cross-validation training loop."""
     print("\n--- Starting Training Run ---")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
+
+    # Update messages and checks for individual file loading
     if config.LOAD_PREPROCESSED_DATA:
-         print(f"Preprocessed data path: {config.PREPROCESSED_FILEPATH}")
+        preprocessed_dir = config.PREPROCESSED_DATA_DIR
+        print(f"Checking for preprocessed data directory: {preprocessed_dir}")
+        if not os.path.exists(preprocessed_dir) or not os.listdir(preprocessed_dir):
+            print(f"Error: LOAD_PREPROCESSED_DATA is True, but directory {preprocessed_dir} does not exist or is empty.")
+            print("Please run preprocessing first or set LOAD_PREPROCESSED_DATA to False.")
+            return 0.0 # Return 0.0 AUC for Optuna compatibility (or raise error)
+        else:
+            # Count number of files for info, can be slow for huge dirs
+            # num_files = len([name for name in os.listdir(preprocessed_dir) if name.endswith('.npy')])
+            # print(f"Preprocessed data directory found with approx. {num_files} .npy files. Dataset will load files individually.")
+            print(f"Preprocessed data directory found. Dataset will load files individually from: {preprocessed_dir}")
     else:
-         print("Generating spectrograms on-the-fly.")
+        print("\nGenerating spectrograms on-the-fly.")
+        # Note: On-the-fly generation within the training loop might be slow
+        # and currently doesn't use VAD/Fabio intervals unless explicitly handled.
 
     # Ensure model output directory exists
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
-
-    # --- Restore Spectrogram Loading Logic --- #
-    spectrograms = None
-    # preprocessed_data_path_resolved = None # This variable was part of Kaggle specific logic, not needed here
-
-    if config.LOAD_PREPROCESSED_DATA:
-        print("\nAttempting to load pre-computed mel spectrograms...")
-        # Use the PREPROCESSED_FILEPATH directly
-        preprocessed_path = config.PREPROCESSED_FILEPATH
-        print(f"Looking for pre-computed data at: {preprocessed_path}")
-        if os.path.exists(preprocessed_path):
-             try:
-                 spectrograms = np.load(preprocessed_path, allow_pickle=True).item()
-                 print(f"Loaded {len(spectrograms)} pre-computed mel spectrograms.")
-             except Exception as e:
-                 print(f"Error loading file {preprocessed_path}: {e}")
-                 print("Cannot proceed without preprocessed data when LOAD_PREPROCESSED_DATA is True.")
-                 return 0.0 # Return 0.0 AUC for Optuna compatibility
-        else:
-             print(f"Error: Preprocessed data file not found at {preprocessed_path}")
-             print("Please run preprocessing first or set LOAD_PREPROCESSED_DATA to False.")
-             return 0.0 # Return 0.0 AUC for Optuna compatibility
-
-    else:
-        print("\nGenerating spectrograms on-the-fly.")
 
     # Create a working copy of the dataframe for modification
     working_df = df.copy()
@@ -551,18 +563,15 @@ def run_training(df, config): # Pass config object
     # Ensure required columns exist for on-the-fly generation if needed
     if not config.LOAD_PREPROCESSED_DATA:
         if 'filepath' not in working_df.columns:
-             # Use os.path.join
             working_df['filepath'] = working_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
         if 'samplename' not in working_df.columns:
-             # Use split/join method consistent with preprocessing.py
-             working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+            working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-    # --- Cross-validation Setup (User's version) ---
-    # Use primary_label for stratification
+    # --- Cross-validation Setup (keep this) ---
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
-    oof_scores = [] # Renamed from best_scores
+    oof_scores = []
 
-    # --- Fold Loop ---
+    # --- Fold Loop --- #
     for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
         if fold not in config.selected_folds:
             print(f"\nSkipping Fold {fold}...")
@@ -570,18 +579,18 @@ def run_training(df, config): # Pass config object
 
         print(f'\n{"="*30} Fold {fold} {"="*30}')
 
-        # --- Data Setup for Fold ---
+        # --- Data Setup for Fold --- #
         train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
         val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
 
         print(f'Training set: {len(train_df_fold)} samples')
         print(f'Validation set: {len(val_df_fold)} samples')
 
-        # Create datasets for the current fold (PASS spectrograms dictionary)
-        train_dataset = BirdCLEFDataset(train_df_fold, config, spectrograms=spectrograms, mode='train')
-        val_dataset = BirdCLEFDataset(val_df_fold, config, spectrograms=spectrograms, mode='valid')
+        # Create datasets for the current fold (REMOVE spectrograms argument)
+        train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train')
+        val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid')
 
-        # Create dataloaders
+        # Create dataloaders (keep this)
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.train_batch_size,
@@ -601,7 +610,7 @@ def run_training(df, config): # Pass config object
             drop_last=False
         )
 
-        # --- Model, Optimizer, Criterion, Scheduler Setup for Fold ---
+        # --- Model, Optimizer, Criterion, Scheduler Setup for Fold (keep this) --- #
         print("\nSetting up model, optimizer, criterion, scheduler...")
         model = BirdCLEFModel(config).to(config.device)
         optimizer = get_optimizer(model, config)
@@ -623,7 +632,7 @@ def run_training(df, config): # Pass config object
         best_epoch = 0
         # Removed patience counter / early stopping for simplicity, can be added back
 
-        # --- Epoch Loop ---
+        # --- Epoch Loop --- #
         for epoch in range(config.epochs):
             print(f"\nEpoch {epoch + 1}/{config.epochs}")
 
@@ -683,9 +692,9 @@ def run_training(df, config): # Pass config object
         print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
         oof_scores.append(best_val_auc)
 
-        # Clean up memory
+        # Clean up memory (keep this)
         del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
-        del train_df_fold, val_df_fold # Explicitly delete fold dataframes
+        del train_df_fold, val_df_fold 
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -693,14 +702,18 @@ def run_training(df, config): # Pass config object
     print("\n" + "="*60)
     print("Cross-Validation Training Summary:")
     if oof_scores:
+        mean_oof_auc = np.mean(oof_scores)
         for i, score in enumerate(oof_scores):
-            # Use config.selected_folds to report correct fold number
             fold_num = config.selected_folds[i]
             print(f"  Fold {fold_num}: Best Val AUC = {score:.4f}")
-        print(f"\nMean OOF AUC across {len(oof_scores)} trained folds: {np.mean(oof_scores):.4f}")
+        print(f"\nMean OOF AUC across {len(oof_scores)} trained folds: {mean_oof_auc:.4f}")
     else:
         print("No folds were trained.")
+        mean_oof_auc = 0.0 # Ensure a value is returned
     print("="*60)
+
+    # Return mean_oof_auc (might be used if called from elsewhere later)
+    return mean_oof_auc
 
 if __name__ == "__main__":
     # Config is imported from config.py

@@ -57,147 +57,105 @@ def generate_and_save_spectrograms(df, config):
         print("Working dataframe is empty, skipping spectrogram generation.")
         return {} 
         
-    # --- Define Paths for VAD/Fabio data on GCP --- #
-    # TODO: Move these path definitions to config.py later
-    voice_separation_dir = os.path.join(config.GCS_MOUNT_POINT, "BC25 voice separation")
-    fabio_csv_path = os.path.join(voice_separation_dir, "fabio.csv")
-    voice_data_pkl_path = os.path.join(voice_separation_dir, "voice_data.pkl")
-    # --- End Path Definitions --- #
-
-    # --- Load Precomputed Interval Data (adapted from previous version) --- #
     fabio_intervals = {}
     try:
-        fabio_df = pd.read_csv(fabio_csv_path)
-        # Use the relative filename as the key (assuming CSV has 'filename', 'start', 'stop')
+        fabio_df = pd.read_csv(config.FABIO_CSV_PATH)
         fabio_intervals = {row['filename']: (row['start'], row['stop']) for _, row in fabio_df.iterrows()}
-        print(f"Loaded Fabio intervals for {len(fabio_intervals)} files from {fabio_csv_path}")
+        print(f"Loaded Fabio intervals for {len(fabio_intervals)} files from {config.FABIO_CSV_PATH}")
     except FileNotFoundError:
-        print(f"Warning: Fabio CSV file not found at {fabio_csv_path}. Fabio-specific cropping will not be applied.")
+        print(f"Warning: Fabio CSV file not found at {config.FABIO_CSV_PATH}. Fabio-specific cropping will not be applied.")
     except Exception as e:
-        print(f"Warning: Error loading Fabio CSV from {fabio_csv_path}: {e}. Fabio-specific cropping will not be applied.")
+        print(f"Warning: Error loading Fabio CSV from {config.FABIO_CSV_PATH}: {e}. Fabio-specific cropping will not be applied.")
 
     vad_intervals = {}
     try:
-        with open(voice_data_pkl_path, 'rb') as f:
-            # Assuming the keys in the pkl file are full paths relative to DATA_ROOT or similar
-            # We need to ensure they match df['filepath'] keys
-            raw_vad_data = pickle.load(f)
-            # Store with full filepath as key, matching df['filepath']
-            vad_intervals = raw_vad_data
-            print(f"Loaded VAD intervals for {len(vad_intervals)} files from {voice_data_pkl_path}")
-            # --- VAD Key Check (from previous version) --- #
-            if vad_intervals and df is not None and not df.empty:
-                print("--- Checking VAD Key Format ---")
-                vad_keys_sample = list(vad_intervals.keys())[:3]
-                df_paths_sample = df['filepath'].iloc[:3].tolist()
-                print(f"First 3 VAD keys: {vad_keys_sample}")
-                print(f"First 3 df['filepath'] values: {df_paths_sample}")
-                # Basic check for one key
-                example_df_path = df_paths_sample[0]
-                if example_df_path in vad_intervals:
-                     print(f"Format Check: First df path ('{example_df_path}') found in VAD keys. Good.")
-                else:
-                     # Try checking with basename if full path fails
-                     example_df_basename = os.path.basename(example_df_path)
-                     # Be careful with list slicing if vad_keys_sample is short
-                     matching_keys = [k for k in vad_keys_sample if example_df_basename in k] 
-                     if matching_keys:
-                         print(f"Format Check WARNING: First df path ('{example_df_path}') NOT found directly, but basename matched key(s) like '{matching_keys[0]}'. Check key format consistency!")
-                     else:
-                         print(f"Format Check CRITICAL WARNING: First df path ('{example_df_path}') or its basename ('{example_df_basename}') NOT found in VAD keys sample: {vad_keys_sample}. Check paths in config.py and pkl file source.")
-                print("-------------------------------")
-            # --- End Key Check --- 
-
+        with open(config.TRANSFORMED_VOICE_DATA_PKL_PATH, 'rb') as f:
+            print(f"Loading TRANSFORMED VAD data from {config.TRANSFORMED_VOICE_DATA_PKL_PATH}...")
+            vad_intervals = pickle.load(f)
+            print(f"Loaded {len(vad_intervals)} VAD entries with corrected keys.")
     except FileNotFoundError:
-        print(f"Warning: VAD pickle file not found at {voice_data_pkl_path}. VAD-based cropping will not be applied.")
+        print(f"Warning: TRANSFORMED VAD pickle file not found at {config.TRANSFORMED_VOICE_DATA_PKL_PATH}. Please run transform_vad_keys.py first. VAD-based cropping will not be applied.")
     except Exception as e:
-        print(f"Warning: Error loading VAD pickle from {voice_data_pkl_path}: {e}. VAD-based cropping will not be applied.")
-    # --- End Load Precomputed Interval Data --- #
-        
-    print("\n--- 2. Generating Spectrograms ---")
+        print(f"Warning: Error loading TRANSFORMED VAD pickle from {config.TRANSFORMED_VOICE_DATA_PKL_PATH}: {e}. VAD-based cropping will not be applied.")
+
+    print("\n--- 2. Generating and Saving Spectrograms (Individual Files) ---")
     start_time = time.time()
-    all_bird_data = utils.generate_spectrograms(df, config, fabio_intervals, vad_intervals)
+    utils.generate_spectrograms(df, config, fabio_intervals, vad_intervals)
     end_time = time.time()
-    print(f"Spectrogram generation finished in {end_time - start_time:.2f} seconds.")
+    print(f"Spectrogram generation/saving process finished in {end_time - start_time:.2f} seconds.")
 
-    print("\n--- 3. Saving Processed Data ---")
-    if not all_bird_data:
-        print("No spectrograms were generated.")
-        return all_bird_data
-        
-    print(f"Saving processed data dictionary to: {config.PREPROCESSED_FILEPATH}")
-    try:
-        os.makedirs(os.path.dirname(config.PREPROCESSED_FILEPATH), exist_ok=True)
-        np.save(config.PREPROCESSED_FILEPATH, all_bird_data, allow_pickle=True)
-        print(f"Successfully saved data ({len(all_bird_data)} items).")
-    except Exception as e:
-        print(f"Error saving data to {config.PREPROCESSED_FILEPATH}: {e}")
-        
-    return all_bird_data
-
-def plot_examples(spectrogram_data, df, config):
-    """Plots and saves example spectrograms."""
-    print("\n--- 4. Plotting Example Spectrograms (Optional) ---")
-    if not spectrogram_data:
-        print("No spectrograms generated, skipping plotting.")
+def plot_examples(df, config):
+    """Plots and saves example spectrograms by loading individual files."""
+    print("\n--- 3. Plotting Example Spectrograms (Optional) ---")
+    
+    preprocessed_dir = config.PREPROCESSED_DATA_DIR
+    if not os.path.exists(preprocessed_dir) or not os.listdir(preprocessed_dir):
+        print(f"Preprocessed data directory ({preprocessed_dir}) is empty or does not exist. Skipping plotting.")
         return
         
     if df is None or df.empty:
         print("Metadata dataframe is missing, cannot plot examples with labels.")
         return
 
-    samples = []
-    available_samples_df = df[df['samplename'].isin(spectrogram_data.keys())]
-    max_plot_samples = min(4, len(available_samples_df))
-
-    if max_plot_samples > 0:
-        plot_df = available_samples_df.head(max_plot_samples)
-        for _, row in plot_df.iterrows():
-            if row['samplename'] in spectrogram_data:
-                 samples.append((row['samplename'], row['class'], row['primary_label']))
-            else:
-                 print(f"Warning: Samplename {row['samplename']} from dataframe not found in generated spectrograms.")
-
-    if samples:
-        plt.figure(figsize=(16, 12))
-        plot_count = 0
-        for i, (samplename, class_name, species) in enumerate(samples):
-            if i >= 4: 
-                break 
-            plt.subplot(2, 2, plot_count + 1)
-            plt.imshow(spectrogram_data[samplename], aspect='auto', origin='lower', cmap='viridis')
-            plt.title(f"{class_name}: {species} (Sample: {samplename})")
-            plt.colorbar(format='%+2.0f dB')
-            plot_count += 1
-
-        if plot_count > 0:
-            plt.tight_layout()
-            plot_filename = f"melspec_examples_{config._MODE_STR}.png" 
-            plot_filepath = os.path.join(config.OUTPUT_DIR, plot_filename) 
-            print(f"Saving example plot to: {plot_filepath}")
+    samples_to_plot = []
+    potential_samples_df = df[['samplename', 'class', 'primary_label']].drop_duplicates('samplename').head(20)
+    
+    found_count = 0
+    for _, row in potential_samples_df.iterrows():
+        if found_count >= 4:
+            break
+            
+        samplename = row['samplename']
+        expected_filepath = os.path.join(preprocessed_dir, f"{samplename}.npy")
+        
+        if os.path.exists(expected_filepath):
             try:
-                os.makedirs(os.path.dirname(plot_filepath), exist_ok=True)
-                plt.savefig(plot_filepath)
+                spectrogram_data = np.load(expected_filepath)
+                samples_to_plot.append((samplename, row['class'], row['primary_label'], spectrogram_data))
+                found_count += 1
             except Exception as e:
-                 print(f"Error saving plot to {plot_filepath}: {e}")
-            plt.close()  
-        else:
-            print("Could not prepare any valid samples for plotting.")
+                print(f"Warning: Error loading example spectrogram {expected_filepath}: {e}")
+        # else: # Optionally uncomment to see which potential samples were not found
+        #     print(f"Debug: Did not find expected file {expected_filepath} for plotting.")
+
+    if found_count < 4:
+         print(f"Found only {found_count} valid spectrogram examples to plot out of {len(potential_samples_df)} checked.")
+
+    if samples_to_plot:
+        plt.figure(figsize=(16, 12))
+        for i, (samplename, class_name, species, spec_data) in enumerate(samples_to_plot):
+            plt.subplot(2, 2, i + 1)
+            plt.imshow(spec_data, aspect='auto', origin='lower', cmap='viridis') 
+            plt.title(f"{class_name}: {species} (Sample: {samplename})", fontsize=10)
+            plt.colorbar(format='%+2.0f dB')
+        
+        plt.tight_layout()
+        plot_mode_str = "sample" if config.debug_preprocessing_mode and getattr(config, 'N_MAX_PREPROCESS', None) is not None else "full"
+        plot_filename = f"melspec_examples_{plot_mode_str}.png" 
+        plot_filepath = os.path.join(config.OUTPUT_DIR, plot_filename) 
+        print(f"Saving example plot to: {plot_filepath}")
+        try:
+            os.makedirs(os.path.dirname(plot_filepath), exist_ok=True)
+            plt.savefig(plot_filepath)
+            plt.close()
+        except Exception as e:
+             print(f"Error saving plot to {plot_filepath}: {e}")
             
     else:
-        print("No samples found in the generated data to plot.")
+        print("Could not find or load any valid spectrogram files to plot examples.")
 
 def main(config):
     """Main function to run the preprocessing pipeline."""
     print("Starting preprocessing pipeline...")
     print(f"Using device: {config.device}") 
     print(f"Debug mode: {'ON' if config.debug else 'OFF'}") 
+    print(f"Preprocessing Debug mode: {'ON' if config.debug_preprocessing_mode else 'OFF'}")
 
     working_df = load_and_prepare_metadata(config)
 
-    all_bird_data = generate_and_save_spectrograms(working_df, config) 
+    generate_and_save_spectrograms(working_df, config) 
 
-    plot_examples(all_bird_data, working_df, config)
+    plot_examples(working_df, config)
 
     print("\nPreprocessing script finished.")
 
