@@ -1,11 +1,12 @@
 import torch
 import os
+import multiprocessing
 
 class Config:
     seed = 42
     debug = False  # Master debug flag for limiting epochs, batches etc.
     debug_preprocessing_mode = False # Controls N_MAX_PREPROCESS and filename suffix
-    num_workers = 4 
+    num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     PROJECT_ROOT = "/home/jupyter/BirdCLEF-2025-Submission"

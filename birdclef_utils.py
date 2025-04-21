@@ -8,6 +8,8 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import IPython.display as ipd
+import multiprocessing
+import traceback
 
 import torch
 import warnings
@@ -170,7 +172,7 @@ def process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals):
             if len(selected_audio_chunk) < target_samples:
                  selected_audio_chunk = np.pad(selected_audio_chunk,
                                               (0, target_samples - len(selected_audio_chunk)),
-                                              mode='constant')
+                                 mode='constant')
         else:
             # Extract center target_samples if relevant_audio is long enough
             start_idx = max(0, int(len(relevant_audio) / 2 - target_samples / 2))
@@ -204,70 +206,81 @@ def process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals):
         print(f"Error processing {filepath}: {e}")
         return None
 
+# --- Worker Function for Multiprocessing (Modified) --- #
+def _process_row_worker(args):
+    """Worker function to process a single audio file (takes a single arg tuple)."""
+    # Unpack arguments
+    filepath, filename, samplename, cfg, fabio_intervals, vad_intervals = args
+    
+    try:
+        mel_spec = process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals)
+            
+        if mel_spec is not None:
+            output_filepath = os.path.join(cfg.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
+            np.save(output_filepath, mel_spec)
+            return (samplename, True, None) # Samplename, Success Status, Error Info
+        else:
+            # File was likely skipped due to duration or processing error in process_audio_file
+            return (samplename, False, "Skipped or failed in process_audio_file") 
+            
+    except Exception as e:
+        # Catch errors occurring during the worker execution itself (e.g., save error)
+        tb_str = traceback.format_exc()
+        print(f"Error in worker for {filepath}: {e}\n{tb_str}")
+        return (samplename, False, str(e)) # Samplename, Success Status, Error Info
+# --- End Worker Function --- #
+
 def generate_spectrograms(df, cfg, fabio_intervals, vad_intervals):
-    """Generate spectrograms from audio files using precomputed intervals and save individually."""
-    print("Generating mel spectrograms using precomputed intervals and saving individually...")
+    """Generate spectrograms using multiprocessing and save individually."""
+    print("Generating mel spectrograms using multiprocessing and saving individually...")
     start_time = time.time()
 
-    # Ensure the output directory exists
+    num_workers = cfg.num_workers
+    print(f"Using {num_workers} worker processes.")
+
     os.makedirs(cfg.PREPROCESSED_DATA_DIR, exist_ok=True)
     print(f"Saving individual spectrograms to: {cfg.PREPROCESSED_DATA_DIR}")
 
-    # Remove dictionary, track counts instead
-    # all_bird_data = {} 
+    # Prepare list of argument tuples for each task
+    tasks = []
+    for _, row in df.iterrows():
+        tasks.append((row['filepath'], row['filename'], row['samplename'], cfg, fabio_intervals, vad_intervals))
+    
+    print(f"Prepared {len(tasks)} tasks for processing.")
+
     successful_count = 0
-    errors = []
-    skipped_count = 0 # Count files skipped due to short duration
+    skipped_or_failed_count = 0
+    errors_info = []
 
-    # Restore N_MAX_PREPROCESS check if needed and uncommented in config
-    n_max_files = getattr(cfg, 'N_MAX_PREPROCESS', None)
-    if cfg.debug_preprocessing_mode and n_max_files is not None:
-         print(f"DEBUG: Will process a maximum of {n_max_files} files due to N_MAX_PREPROCESS.")
-
-    for i, row in tqdm(df.iterrows(), total=len(df), desc="Processing Audio"):
-        if cfg.debug_preprocessing_mode and n_max_files is not None and i >= n_max_files:
-             print(f"DEBUG: Stopping preprocessing early after {n_max_files} files.")
-             break
+    # --- Use multiprocessing Pool with imap_unordered --- #
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        # Use imap_unordered to get results as they complete
+        # Wrap the results iterator with tqdm for progress
+        results_iterator = pool.imap_unordered(_process_row_worker, tasks)
         
-        try:
-            samplename = row['samplename']
-            filepath = row['filepath']
-            filename = row['filename']
-            output_filepath = os.path.join(cfg.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
-            
-            # Skip if file already exists (optional, useful for resuming)
-            # if os.path.exists(output_filepath):
-            #     successful_count += 1 # Or a separate 'already_exist_count'
-            #     continue
-
-            mel_spec = process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals)
-
-            if mel_spec is not None:
-                # Save individual file instead of adding to dict
-                np.save(output_filepath, mel_spec)
+        print("Starting task processing...") # Add a print statement here
+        for samplename, success, error_msg in tqdm(results_iterator, total=len(tasks), desc="Preprocessing Audio"):
+            if success:
                 successful_count += 1
             else:
-                 # process_audio_file returns None if error or skipped (e.g., too short)
-                 # Check the log message from process_audio_file to differentiate
-                 skipped_count += 1 # Assume None means skipped or error
-                 errors.append((filepath, "Processing returned None (skipped or error)"))
-
-        except Exception as e:
-            print(f"Error processing row {i} ({row.get('filepath', 'N/A')}): {e}")
-            errors.append((row.get('filepath', 'N/A'), str(e)))
-            skipped_count += 1 # Count exceptions as skipped/failed
+                skipped_or_failed_count += 1
+                if error_msg: 
+                     errors_info.append((samplename, error_msg))
+    # --- End Pool --- #
 
     end_time = time.time()
-    total_processed = successful_count + skipped_count
     print(f"\nProcessing completed in {end_time - start_time:.2f} seconds")
-    print(f"Attempted to process {df.shape[0]} files.") # Use df.shape[0] for total requested
+    print(f"Attempted to process {len(tasks)} files.")
     print(f"Successfully saved {successful_count} spectrogram files.")
-    print(f"Skipped or failed: {skipped_count} files.") # Combined skipped/error count
-    # Optionally print more error details if needed
-    # if errors:
-    #    print("\nFiles with processing errors or skips:")
-    #    for err_file, reason in errors[:10]: # Print first 10 errors
-    #        print(f"- {err_file}: {reason}")
+    print(f"Skipped or failed: {skipped_or_failed_count} files.") 
     
-    # No longer returns the dictionary
-    # return all_bird_data
+    # Optionally print detailed errors
+    if errors_info:
+        print(f"\n--- Errors/Skipped File Details (First {min(10, len(errors_info))}) --- ")
+        for name, reason in errors_info[:10]:
+            print(f"  - {name}: {reason}")
+        if len(errors_info) > 10:
+             print("  ... (additional errors hidden)")
+        print("----------------------------------")
+    
+    # No return value needed as files are saved directly
