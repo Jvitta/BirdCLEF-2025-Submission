@@ -1,6 +1,7 @@
 import torch
 import os
 import multiprocessing
+from google.cloud import storage
 
 class Config:
     seed = 42
@@ -9,15 +10,28 @@ class Config:
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    IS_CUSTOM_JOB = os.getenv('AIP_JOB_NAME') is not None
+    if IS_CUSTOM_JOB:
+        print("INFO: Detected execution in Vertex AI Custom Job. Using direct GCS access.")
+    else:
+        print("INFO: Running in interactive mode (or non-Vertex AI job). Using gcsfuse mount paths.")
+
+    GCS_BUCKET_NAME = "birdclef-2025-data"
+    GCS_PREPROCESSED_PATH_PREFIX = "preprocessed/"
+    GCS_VOICE_SEP_PATH_PREFIX = "BC25 voice separation/"
+
+    # --- Workbench/Local Paths (using gcsfuse mount) --- #
     PROJECT_ROOT = "/home/jupyter/BirdCLEF-2025-Submission"
     GCS_MOUNT_POINT = "/home/jupyter/gcs_mount"
 
+    # These paths will be used primarily when IS_CUSTOM_JOB is False
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
-    PREPROCESSED_DATA_DIR = os.path.join(GCS_MOUNT_POINT, 'preprocessed')
+    PREPROCESSED_DATA_DIR = os.path.join(OUTPUT_DIR, 'preprocessed') 
     MODEL_INPUT_DIR = MODEL_OUTPUT_DIR
 
+    # These derived paths use the mount point when IS_CUSTOM_JOB is False
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
     unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes') 
@@ -25,12 +39,11 @@ class Config:
     sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
     taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
 
-    # --- Add Paths for Voice Separation Data --- #
+    # Paths for VAD/Fabio - used via mount point in interactive mode
     VOICE_SEPARATION_DIR = os.path.join(GCS_MOUNT_POINT, "BC25 voice separation")
     FABIO_CSV_PATH = os.path.join(VOICE_SEPARATION_DIR, "fabio.csv")
-    VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data.pkl")
-    TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl")
-    # --- End Voice Separation Paths --- #
+    VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data.pkl") # Original VAD data
+    TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
     FS = 32000 
     TARGET_DURATION = 5.0  
@@ -45,14 +58,6 @@ class Config:
     pretrained = True
     in_channels = 1
     num_classes = 206  
-
-
-    # Comment out single-file related variables
-    # N_MAX_PREPROCESS = 50 if debug_preprocessing_mode else None
-    # _PREPROCESSED_FILENAME_BASE = f"spectrogram_m{N_MELS}_fft{N_FFT}_hop{HOP_LENGTH}"
-    # _MODE_STR = f"sample{N_MAX_PREPROCESS}" if debug_preprocessing_mode else "full"
-    # PREPROCESSED_FILENAME = f"{_PREPROCESSED_FILENAME_BASE}_{_MODE_STR}.npy"
-    # PREPROCESSED_FILEPATH = os.path.join(PREPROCESSED_DATA_DIR, PREPROCESSED_FILENAME)
 
     LOAD_PREPROCESSED_DATA = True 
     epochs = 10

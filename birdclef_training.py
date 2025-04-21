@@ -8,6 +8,7 @@ import warnings
 from pathlib import Path
 import sys
 import glob
+import io
 
 import numpy as np
 import pandas as pd
@@ -27,9 +28,23 @@ import timm
 
 from config import config
 import birdclef_utils as utils
+from google.cloud import storage
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+# --- GCS Client Initialization (Optional global or within Dataset) --- #
+# Initialize client once if running in custom job to reuse connection
+# Handle potential initialization errors
+gcs_client = None
+if config.IS_CUSTOM_JOB:
+    try:
+        gcs_client = storage.Client()
+        print("INFO: Google Cloud Storage client initialized successfully.")
+    except Exception as e:
+        print(f"CRITICAL WARNING: Failed to initialize Google Cloud Storage client: {e}")
+        # Training will likely fail if client is needed and not initialized.
+# --- End GCS Client Init --- #
 
 def set_seed(seed=42):
     """
@@ -48,7 +63,8 @@ set_seed(config.seed)
 
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
-    Handles loading individual pre-computed spectrograms or generating them on-the-fly.
+    Handles loading individual pre-computed spectrograms or generating them on-the-fly,
+    adapting access method based on execution environment (Custom Job vs Interactive).
     """
     def __init__(self, df, config, mode="train"):
         self.df = df.copy()
@@ -82,11 +98,13 @@ class BirdCLEFDataset(Dataset):
         if not self.config.LOAD_PREPROCESSED_DATA:
              print(f"Dataset mode '{self.mode}': Configured to generate spectrograms on-the-fly.")
         else:
-             # Check if the directory exists during init for early feedback
-             if not os.path.exists(self.config.PREPROCESSED_DATA_DIR):
-                 print(f"Warning: Preprocessed data directory {self.config.PREPROCESSED_DATA_DIR} not found. Dataset will likely fail to load files.")
+             # Check local/mount path for interactive mode, GCS check happens during loading
+             if not self.config.IS_CUSTOM_JOB and not os.path.exists(self.config.PREPROCESSED_DATA_DIR):
+                 print(f"Warning (Interactive Mode): Preprocessed data directory {self.config.PREPROCESSED_DATA_DIR} not found.")
+             elif self.config.IS_CUSTOM_JOB:
+                 print(f"Dataset mode '{self.mode}': Configured to load individual pre-computed spectrograms directly from GCS bucket '{self.config.GCS_BUCKET_NAME}' prefix '{self.config.GCS_PREPROCESSED_PATH_PREFIX}'.")
              else:
-                 print(f"Dataset mode '{self.mode}': Configured to load individual pre-computed spectrograms from {self.config.PREPROCESSED_DATA_DIR}")
+                 print(f"Dataset mode '{self.mode}': Configured to load individual pre-computed spectrograms from mount path {self.config.PREPROCESSED_DATA_DIR}")
 
     def __len__(self):
         return len(self.df)
@@ -95,22 +113,50 @@ class BirdCLEFDataset(Dataset):
         row = self.df.iloc[idx]
         samplename = row['samplename']
         spec = None
+        load_error = None # Track loading errors
 
         # Try loading pre-computed individual file first if configured
         if self.config.LOAD_PREPROCESSED_DATA:
-            spec_path = os.path.join(self.config.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
-            try:
-                spec = np.load(spec_path)
-            except FileNotFoundError:
-                # Only print warning if we expected the file
-                if self.mode == "train": # Often only critical during training
-                    print(f"Warning: Precomputed spectrogram file not found for {samplename} at {spec_path}. Attempting on-the-fly generation or using zeros.")
-                # Fall through to potentially generate on-the-fly or use zeros
-                pass 
-            except Exception as e:
-                 print(f"Warning: Error loading precomputed spectrogram {spec_path}: {e}. Attempting generation or using zeros.")
-                 # Fall through
-                 pass
+            # --- Conditional Data Loading --- #
+            if self.config.IS_CUSTOM_JOB:
+                # --- Direct GCS Loading --- #
+                global gcs_client # Access the potentially global client
+                if gcs_client is None:
+                    load_error = "GCS client not initialized"
+                else:
+                    try:
+                        # Construct GCS blob path
+                        blob_path = os.path.join(self.config.GCS_PREPROCESSED_PATH_PREFIX, f"{samplename}.npy")
+                        # Remove leading slash if present (os.path.join might add one)
+                        blob_path = blob_path.lstrip('/') 
+                        
+                        bucket = gcs_client.bucket(self.config.GCS_BUCKET_NAME)
+                        blob = bucket.blob(blob_path)
+                        
+                        # Download as bytes and load with numpy
+                        npy_bytes = blob.download_as_bytes()
+                        spec = np.load(io.BytesIO(npy_bytes))
+                        
+                    except storage.exceptions.NotFound:
+                         load_error = f"GCS object not found: gs://{self.config.GCS_BUCKET_NAME}/{blob_path}"
+                    except Exception as e:
+                         load_error = f"Error loading from GCS (gs://{self.config.GCS_BUCKET_NAME}/{blob_path}): {e}"
+                # --- End GCS Loading --- #
+            else:
+                # --- Local Filesystem (gcsfuse mount) Loading --- #
+                spec_path = os.path.join(self.config.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
+                try:
+                    spec = np.load(spec_path)
+                except FileNotFoundError:
+                    load_error = f"Local file not found: {spec_path}"
+                except Exception as e:
+                    load_error = f"Error loading local file {spec_path}: {e}"
+                # --- End Local Loading --- #
+            # --- End Conditional Loading --- #
+
+            # Print warning if loading failed, only once maybe or based on mode
+            if load_error and self.mode == "train":
+                 print(f"Warning: Failed to load precomputed spec for {samplename}. Reason: {load_error}. Attempting generation or zeros.")
 
         # If spec wasn't loaded OR if on-the-fly generation is configured
         if spec is None and not self.config.LOAD_PREPROCESSED_DATA:
@@ -527,37 +573,32 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, auc
 
-# --- Main Training Orchestration --- #
-
-def run_training(df, config): # Pass config object
+def run_training(df, config): 
     """Runs the cross-validation training loop."""
     print("\n--- Starting Training Run ---")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
-    # Update messages and checks for individual file loading
+    # --- Check data source based on environment --- #
     if config.LOAD_PREPROCESSED_DATA:
-        preprocessed_dir = config.PREPROCESSED_DATA_DIR
-        print(f"Checking for preprocessed data directory: {preprocessed_dir}")
-        if not os.path.exists(preprocessed_dir) or not os.listdir(preprocessed_dir):
-            print(f"Error: LOAD_PREPROCESSED_DATA is True, but directory {preprocessed_dir} does not exist or is empty.")
-            print("Please run preprocessing first or set LOAD_PREPROCESSED_DATA to False.")
-            return 0.0 # Return 0.0 AUC for Optuna compatibility (or raise error)
+        if config.IS_CUSTOM_JOB:
+            print(f"Will attempt to load preprocessed data from GCS Bucket: gs://{config.GCS_BUCKET_NAME}/{config.GCS_PREPROCESSED_PATH_PREFIX}")
         else:
-            # Count number of files for info, can be slow for huge dirs
-            # num_files = len([name for name in os.listdir(preprocessed_dir) if name.endswith('.npy')])
-            # print(f"Preprocessed data directory found with approx. {num_files} .npy files. Dataset will load files individually.")
-            print(f"Preprocessed data directory found. Dataset will load files individually from: {preprocessed_dir}")
+            preprocessed_dir = config.PREPROCESSED_DATA_DIR 
+            print(f"Checking for preprocessed data directory (local/mount): {preprocessed_dir}")
+            if not os.path.exists(preprocessed_dir) or not os.listdir(preprocessed_dir):
+                print(f"Error: LOAD_PREPROCESSED_DATA is True, but directory {preprocessed_dir} does not exist or is empty.")
+                return 0.0
+            else:
+                print(f"Preprocessed data directory found. Dataset will load files individually from: {preprocessed_dir}")
     else:
         print("\nGenerating spectrograms on-the-fly.")
-        # Note: On-the-fly generation within the training loop might be slow
-        # and currently doesn't use VAD/Fabio intervals unless explicitly handled.
+        if config.IS_CUSTOM_JOB:
+            print("WARNING: On-the-fly generation in custom job requires direct GCS access for audio files.")
 
-    # Ensure model output directory exists
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
 
-    # Create a working copy of the dataframe for modification
     working_df = df.copy()
 
     # Ensure required columns exist for on-the-fly generation if needed
@@ -567,7 +608,7 @@ def run_training(df, config): # Pass config object
         if 'samplename' not in working_df.columns:
             working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-    # --- Cross-validation Setup (keep this) ---
+    # --- Cross-validation ---
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
     oof_scores = []
 
@@ -579,18 +620,15 @@ def run_training(df, config): # Pass config object
 
         print(f'\n{"="*30} Fold {fold} {"="*30}')
 
-        # --- Data Setup for Fold --- #
         train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
         val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
 
         print(f'Training set: {len(train_df_fold)} samples')
         print(f'Validation set: {len(val_df_fold)} samples')
 
-        # Create datasets for the current fold (REMOVE spectrograms argument)
         train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train')
         val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid')
 
-        # Create dataloaders (keep this)
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.train_batch_size,
@@ -610,13 +648,11 @@ def run_training(df, config): # Pass config object
             drop_last=False
         )
 
-        # --- Model, Optimizer, Criterion, Scheduler Setup for Fold (keep this) --- #
         print("\nSetting up model, optimizer, criterion, scheduler...")
         model = BirdCLEFModel(config).to(config.device)
         optimizer = get_optimizer(model, config)
         criterion = get_criterion(config)
 
-        # Handle OneCycleLR setup separately as per original logic
         if config.scheduler == 'OneCycleLR':
             scheduler = lr_scheduler.OneCycleLR(
                 optimizer,
@@ -626,7 +662,7 @@ def run_training(df, config): # Pass config object
                 pct_start=0.1 # Consider making pct_start configurable
             )
         else:
-            scheduler = get_scheduler(optimizer, config) # Get other schedulers (or None)
+            scheduler = get_scheduler(optimizer, config) 
 
         best_val_auc = 0.0
         best_epoch = 0
@@ -636,7 +672,6 @@ def run_training(df, config): # Pass config object
         for epoch in range(config.epochs):
             print(f"\nEpoch {epoch + 1}/{config.epochs}")
 
-            # Training step - use user's train_one_epoch signature
             train_loss, train_auc = train_one_epoch(
                 model,
                 train_loader,
@@ -646,7 +681,6 @@ def run_training(df, config): # Pass config object
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
             )
 
-            # Validation step - use user's validate signature
             val_loss, val_auc = validate(
                 model,
                 val_loader,
@@ -654,10 +688,8 @@ def run_training(df, config): # Pass config object
                 config.device
             )
 
-            # Step the scheduler (non-OneCycleLR)
             if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
                 if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
-                    # Step ReduceLROnPlateau based on validation loss (matching user version)
                     scheduler.step(val_loss)
                 else:
                     scheduler.step()
@@ -680,7 +712,6 @@ def run_training(df, config): # Pass config object
                     'val_auc': best_val_auc,
                     'train_auc': train_auc,
                 }
-                # Use config for output path and model name
                 save_path = os.path.join(config.MODEL_OUTPUT_DIR, f"{config.model_name}_fold{fold}_best.pth")
                 try:
                     torch.save(checkpoint, save_path)
@@ -688,17 +719,14 @@ def run_training(df, config): # Pass config object
                 except Exception as e:
                     print(f"  Error saving model checkpoint: {e}")
 
-        # --- End of Fold --- #
         print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
         oof_scores.append(best_val_auc)
 
-        # Clean up memory (keep this)
         del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
         del train_df_fold, val_df_fold 
         torch.cuda.empty_cache()
         gc.collect()
 
-    # --- End of Training --- #
     print("\n" + "="*60)
     print("Cross-Validation Training Summary:")
     if oof_scores:
@@ -709,17 +737,15 @@ def run_training(df, config): # Pass config object
         print(f"\nMean OOF AUC across {len(oof_scores)} trained folds: {mean_oof_auc:.4f}")
     else:
         print("No folds were trained.")
-        mean_oof_auc = 0.0 # Ensure a value is returned
+        mean_oof_auc = 0.0 
     print("="*60)
 
     # Return mean_oof_auc (might be used if called from elsewhere later)
     return mean_oof_auc
 
 if __name__ == "__main__":
-    # Config is imported from config.py
     print("\n--- Initializing Training Script ---")
 
-    # Load main training dataframe
     print("Loading main training metadata...")
     try:
         main_train_df = pd.read_csv(config.train_csv_path)
@@ -730,7 +756,6 @@ if __name__ == "__main__":
         print(f"Error loading main training CSV: {e}. Exiting.")
         sys.exit(1)
 
-    # Start the training process
-    run_training(main_train_df, config) # Pass the imported config
+    run_training(main_train_df, config) 
 
     print("\nTraining script finished!")
