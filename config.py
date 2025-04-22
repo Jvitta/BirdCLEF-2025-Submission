@@ -48,7 +48,7 @@ class Config:
     FS = 32000 
     TARGET_DURATION = 5.0  
     N_FFT = 1024
-    HOP_LENGTH = 64
+    HOP_LENGTH = 128
     N_MELS = 136
     FMIN = 20
     FMAX = 16000

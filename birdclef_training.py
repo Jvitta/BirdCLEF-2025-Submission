@@ -22,6 +22,7 @@ import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
+from torch.amp import GradScaler
 
 from tqdm.auto import tqdm
 
@@ -34,9 +35,6 @@ from google.cloud import storage
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-# --- GCS Client Initialization (Optional global or within Dataset) --- #
-# Initialize client once if running in custom job to reuse connection
-# Handle potential initialization errors
 gcs_client = None
 if config.IS_CUSTOM_JOB:
     try:
@@ -666,7 +664,7 @@ def run_training(df, config):
         scheduler = get_scheduler(optimizer, config)
 
         # --- AMP: Initialize GradScaler --- #
-        scaler = GradScaler(enabled=config.use_amp)
+        scaler = torch.amp.GradScaler(device='cuda', enabled=config.use_amp)
         print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
         # --- End AMP Init --- #
 
