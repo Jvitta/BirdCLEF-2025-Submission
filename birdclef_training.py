@@ -21,7 +21,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast
 
 from tqdm.auto import tqdm
 
@@ -486,7 +486,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
         optimizer.zero_grad()
 
         # --- AMP: autocast context --- #
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
             # Pass targets only if mixup is enabled
             outputs = model(inputs, targets if model.training and model.mixup_enabled else None)
 
@@ -558,7 +558,7 @@ def validate(model, loader, criterion, device):
                 continue
 
             # --- AMP: autocast context for validation --- #
-            with autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
             # --- End autocast --- #
