@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
 
 from tqdm.auto import tqdm
 
@@ -460,22 +461,21 @@ def calculate_auc(targets, outputs):
 
 # --- Training and Validation Loops (Using User's versions, simplified batch handling) --- #
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
-    """Runs one epoch of training (User's version, simplified)."""
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler, scheduler=None):
+    """Runs one epoch of training with optional mixed precision."""
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
+    use_amp = scaler.is_enabled() # Check if AMP is active via the scaler
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
 
     for step, batch in pbar:
-        # Handle None batches from collate_fn
         if batch is None:
             print(f"Warning: Skipping None batch at step {step}")
             continue
 
-        # Assume batch is a dictionary with tensor values
         try:
             inputs = batch['melspec'].to(device)
             targets = batch['target'].to(device)
@@ -484,20 +484,27 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
             continue
 
         optimizer.zero_grad()
-        # Pass targets only if mixup is enabled
-        outputs = model(inputs, targets if model.training and model.mixup_enabled else None)
 
-        # Handle model output (logits or logits, loss)
-        if isinstance(outputs, tuple):
-            logits, loss = outputs
-        else:
-            logits = outputs
-            loss = criterion(logits, targets)
+        # --- AMP: autocast context --- #
+        with autocast(enabled=use_amp):
+            # Pass targets only if mixup is enabled
+            outputs = model(inputs, targets if model.training and model.mixup_enabled else None)
 
-        loss.backward()
-        optimizer.step()
+            # Handle model output (logits or logits, loss)
+            if isinstance(outputs, tuple):
+                logits, loss = outputs # Assume loss is already calculated correctly (e.g., with mixup)
+            else:
+                logits = outputs
+                loss = criterion(logits, targets)
+        # --- End autocast --- #
 
-        outputs_np = logits.detach().cpu().numpy()
+        # --- AMP: Scale loss and step --- #
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # --- End AMP --- #
+
+        outputs_np = logits.detach().float().cpu().numpy() # Ensure float32 for numpy ops
         targets_np = targets.detach().cpu().numpy()
 
         # Scheduler step (only for OneCycleLR here, matching original)
@@ -530,11 +537,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None)
     return avg_loss, auc
 
 def validate(model, loader, criterion, device):
-    """Runs validation (User's version)."""
+    """Runs validation with optional mixed precision for inference."""
     model.eval()
     losses = []
     all_targets = []
     all_outputs = []
+    use_amp = config.use_amp # Check config directly for validation
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
@@ -549,10 +557,13 @@ def validate(model, loader, criterion, device):
                 print(f"Error: Skipping validation batch {step} due to unexpected format: {e}")
                 continue
 
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            # --- AMP: autocast context for validation --- #
+            with autocast(enabled=use_amp):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+            # --- End autocast --- #
 
-            all_outputs.append(outputs.cpu().numpy())
+            all_outputs.append(outputs.float().cpu().numpy()) # Ensure float32 for numpy ops
             all_targets.append(targets.cpu().numpy())
             losses.append(loss.item())
 
@@ -652,17 +663,12 @@ def run_training(df, config):
         model = BirdCLEFModel(config).to(config.device)
         optimizer = get_optimizer(model, config)
         criterion = get_criterion(config)
+        scheduler = get_scheduler(optimizer, config)
 
-        if config.scheduler == 'OneCycleLR':
-            scheduler = lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=config.lr,
-                steps_per_epoch=len(train_loader),
-                epochs=config.epochs,
-                pct_start=0.1 # Consider making pct_start configurable
-            )
-        else:
-            scheduler = get_scheduler(optimizer, config) 
+        # --- AMP: Initialize GradScaler --- #
+        scaler = GradScaler(enabled=config.use_amp)
+        print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
+        # --- End AMP Init --- #
 
         best_val_auc = 0.0
         best_epoch = 0
@@ -672,15 +678,18 @@ def run_training(df, config):
         for epoch in range(config.epochs):
             print(f"\nEpoch {epoch + 1}/{config.epochs}")
 
+            # Pass scaler to train_one_epoch
             train_loss, train_auc = train_one_epoch(
                 model,
                 train_loader,
                 optimizer,
                 criterion,
                 config.device,
+                scaler, # <-- Pass scaler
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
             )
 
+            # Validation uses autocast internally based on config
             val_loss, val_auc = validate(
                 model,
                 val_loader,

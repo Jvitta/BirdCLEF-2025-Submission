@@ -63,6 +63,7 @@ class Config:
     epochs = 10
     train_batch_size = 32
     val_batch_size = 64
+    use_amp = False
 
     criterion = 'BCEWithLogitsLoss'
     n_fold = 5
