@@ -70,73 +70,74 @@ def process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals):
             
         relevant_audio = None
         target_samples = int(cfg.TARGET_DURATION * cfg.FS)
-
-        if filename in fabio_intervals:
-            start_time, stop_time = fabio_intervals[filename]
-            start_idx = int(start_time * cfg.FS)
-            end_idx = int(stop_time * cfg.FS)
-            start_idx = max(0, start_idx)
-            end_idx = min(len(audio_data), end_idx)
-            if start_idx < end_idx:
-                relevant_audio = audio_data[start_idx:end_idx]
-            else:
-                print(f"Warning: Invalid Fabio interval for {filename} ({start_time}-{stop_time}s). Using full audio.")
-                relevant_audio = audio_data
-
-        elif filepath in vad_intervals: 
-            speech_timestamps = vad_intervals[filepath]
-            
-            if not speech_timestamps:
-                 print(f"Debug: VAD interval list is empty for {filepath}. Using full audio.")
-                 relevant_audio = audio_data
-            else:
-                non_speech_segments = []
-                current_pos_sec = 0.0
-                audio_duration_sec = len(audio_data) / cfg.FS
-                
-                try:
-                    speech_timestamps.sort(key=lambda x: x['start']) 
-                except KeyError:
-                    print(f"Warning: VAD timestamps for {filepath} lack 'start' key. Cannot sort/process. Using full audio.")
-                    relevant_audio = audio_data
-                    speech_timestamps = []
-
-                for segment in speech_timestamps:
-                    if not isinstance(segment, dict) or 'start' not in segment or 'end' not in segment:
-                        print(f"Warning: Invalid VAD segment format for {filepath}: {segment}. Skipping segment.")
-                        continue 
-
-                    start_speech_sec = segment['start']
-                    end_speech_sec = segment['end']
-                    
-                    if start_speech_sec > current_pos_sec:
-                        start_idx = int(current_pos_sec * cfg.FS)
-                        end_idx = int(start_speech_sec * cfg.FS)
-                        start_idx = max(0, start_idx)
-                        end_idx = min(len(audio_data), end_idx)
-                        if start_idx < end_idx:
-                             non_speech_segments.append(audio_data[start_idx:end_idx])
-                    
-                    current_pos_sec = max(current_pos_sec, end_speech_sec)
-                
-                if current_pos_sec < audio_duration_sec:
-                    start_idx = int(current_pos_sec * cfg.FS)
-                    start_idx = max(0, start_idx)
-                    if start_idx < len(audio_data):
-                         non_speech_segments.append(audio_data[start_idx:])
-                    
-                if non_speech_segments:
-                    non_speech_segments = [np.asarray(seg) for seg in non_speech_segments if seg is not None and len(seg) > 0]
-                    if non_speech_segments:
-                         relevant_audio = np.concatenate(non_speech_segments)
-                    else:
-                         print(f"Warning: VAD processing resulted in only empty segments for {filename}. Using full audio.")
-                         relevant_audio = audio_data
+        
+        if cfg.REMOVE_SPEECH_INTERVALS:
+            if filename in fabio_intervals:
+                start_time, stop_time = fabio_intervals[filename]
+                start_idx = int(start_time * cfg.FS)
+                end_idx = int(stop_time * cfg.FS)
+                start_idx = max(0, start_idx)
+                end_idx = min(len(audio_data), end_idx)
+                if start_idx < end_idx:
+                    relevant_audio = audio_data[start_idx:end_idx]
                 else:
-                     print(f"Warning: VAD removed all segments for {filename}. Using full audio as fallback.")
-                     relevant_audio = audio_data
+                    print(f"Warning: Invalid Fabio interval for {filename} ({start_time}-{stop_time}s). Using full audio.")
+                    relevant_audio = audio_data
 
-        else:
+            elif filepath in vad_intervals: 
+                speech_timestamps = vad_intervals[filepath]
+                
+                if not speech_timestamps:
+                    print(f"Debug: VAD interval list is empty for {filepath}. Using full audio.")
+                    relevant_audio = audio_data
+                else:
+                    non_speech_segments = []
+                    current_pos_sec = 0.0
+                    audio_duration_sec = len(audio_data) / cfg.FS
+                    
+                    try:
+                        speech_timestamps.sort(key=lambda x: x['start']) 
+                    except KeyError:
+                        print(f"Warning: VAD timestamps for {filepath} lack 'start' key. Cannot sort/process. Using full audio.")
+                        relevant_audio = audio_data
+                        speech_timestamps = []
+
+                    for segment in speech_timestamps:
+                        if not isinstance(segment, dict) or 'start' not in segment or 'end' not in segment:
+                            print(f"Warning: Invalid VAD segment format for {filepath}: {segment}. Skipping segment.")
+                            continue 
+
+                        start_speech_sec = segment['start']
+                        end_speech_sec = segment['end']
+                        
+                        if start_speech_sec > current_pos_sec:
+                            start_idx = int(current_pos_sec * cfg.FS)
+                            end_idx = int(start_speech_sec * cfg.FS)
+                            start_idx = max(0, start_idx)
+                            end_idx = min(len(audio_data), end_idx)
+                            if start_idx < end_idx:
+                                non_speech_segments.append(audio_data[start_idx:end_idx])
+                        
+                        current_pos_sec = max(current_pos_sec, end_speech_sec)
+                    
+                    if current_pos_sec < audio_duration_sec:
+                        start_idx = int(current_pos_sec * cfg.FS)
+                        start_idx = max(0, start_idx)
+                        if start_idx < len(audio_data):
+                            non_speech_segments.append(audio_data[start_idx:])
+                        
+                    if non_speech_segments:
+                        non_speech_segments = [np.asarray(seg) for seg in non_speech_segments if seg is not None and len(seg) > 0]
+                        if non_speech_segments:
+                            relevant_audio = np.concatenate(non_speech_segments)
+                        else:
+                            print(f"Warning: VAD processing resulted in only empty segments for {filename}. Using full audio.")
+                            relevant_audio = audio_data
+                    else:
+                        print(f"Warning: VAD removed all segments for {filename}. Using full audio as fallback.")
+                        relevant_audio = audio_data
+
+        if relevant_audio is None:
             relevant_audio = audio_data
             
         # Ensure relevant_audio is not empty before proceeding

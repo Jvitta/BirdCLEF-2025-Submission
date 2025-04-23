@@ -45,51 +45,20 @@ class Config:
     VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data.pkl") # Original VAD data
     TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
+    # --- Preprocessing Settings --- #
+    REMOVE_SPEECH_INTERVALS = False # Set to True to enable VAD/Fabio interval processing
+
     FS = 32000 
     TARGET_DURATION = 5.0  
     N_FFT = 1024
-    HOP_LENGTH = 128
-    N_MELS = 136
-    FMIN = 20
-    FMAX = 16000
-    TARGET_SHAPE = (256, 256) 
+    # ... rest of Config class ...
 
-    model_name = 'efficientnet_b0'
-    pretrained = True
-    in_channels = 1
-    num_classes = 206  
+# --- Paths --- #
+VOICE_SEPARATION_DIR = "path_to_your_voice_separation_directory"
+TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
-    LOAD_PREPROCESSED_DATA = True 
-    REMOVE_SPEECH_INTERVALS = False
-    epochs = 10
-    train_batch_size = 32
-    val_batch_size = 64
-    use_amp = False
+# --- Preprocessing Flags --- #
+REMOVE_SPEECH_INTERVALS = False # <<< NEW FLAG: Set to True to enable VAD/Fabio interval processing
 
-    criterion = 'BCEWithLogitsLoss'
-    n_fold = 5
-    selected_folds = [0, 1, 2, 3, 4]
-
-    optimizer = 'AdamW'
-    lr = 5e-4
-    weight_decay = 1e-5
-
-    scheduler = 'CosineAnnealingLR' 
-    min_lr = 1e-6
-    T_max = epochs 
-
-    aug_prob = 0.5
-    mixup_alpha = 0.5 
-
-    inference_batch_size = 16
-    use_tta = False
-    tta_count = 3
-    threshold = 0.7 
-
-    use_specific_folds_inference = False
-    inference_folds = [0, 1]
-
-    debug_limit_batches = 5 
-    debug_limit_files = 3 
-
-config = Config()
+FS = 32000 
+TARGET_DURATION = 5.0 
