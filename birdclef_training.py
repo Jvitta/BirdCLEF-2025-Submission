@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import glob
 import io
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -582,7 +583,7 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, auc
 
-def run_training(df, config): 
+def run_training(df, config, resume_fold=0):
     """Runs the cross-validation training loop."""
     print("\n--- Starting Training Run ---")
     print(f"Using Device: {config.device}")
@@ -623,8 +624,15 @@ def run_training(df, config):
 
     # --- Fold Loop --- #
     for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
+        # --- Resume Logic: Skip folds before the specified resume_fold --- #
+        if fold < resume_fold:
+            print(f"\nSkipping Fold {fold} as it is before the resume fold ({resume_fold})...")
+            continue
+        # --- End Resume Logic ---
+
+        # Keep the original check for selected folds as well
         if fold not in config.selected_folds:
-            print(f"\nSkipping Fold {fold}...")
+            print(f"\nSkipping Fold {fold} as it is not in selected_folds {config.selected_folds}...")
             continue
 
         print(f'\n{"="*30} Fold {fold} {"="*30}')
@@ -751,6 +759,18 @@ def run_training(df, config):
     return mean_oof_auc
 
 if __name__ == "__main__":
+    # --- Argument Parsing --- #
+    parser = argparse.ArgumentParser(description="BirdCLEF Training Script")
+    parser.add_argument(
+        '--resume_fold', 
+        type=int, 
+        default=0, 
+        help='Fold number to resume training from (0-indexed). Skips folds < resume_fold.'
+    )
+    args = parser.parse_args()
+    print(f"Resume Fold specified: {args.resume_fold}")
+    # --- End Argument Parsing --- #
+
     print("\n--- Initializing Training Script ---")
 
     print("Loading main training metadata...")
@@ -763,6 +783,7 @@ if __name__ == "__main__":
         print(f"Error loading main training CSV: {e}. Exiting.")
         sys.exit(1)
 
-    run_training(main_train_df, config) 
+    # Pass the resume_fold argument to run_training
+    run_training(main_train_df, config, args.resume_fold) 
 
     print("\nTraining script finished!")

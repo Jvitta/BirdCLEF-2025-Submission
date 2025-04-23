@@ -21,8 +21,8 @@ class Config:
     GCS_VOICE_SEP_PATH_PREFIX = "BC25 voice separation/"
 
     # --- Workbench/Local Paths (using gcsfuse mount) --- #
-    PROJECT_ROOT = "/home/jupyter/BirdCLEF-2025-Submission"
-    GCS_MOUNT_POINT = "/home/jupyter/gcs_mount"
+    PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
+    GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/gcs_mount"
 
     # These paths will be used primarily when IS_CUSTOM_JOB is False
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")

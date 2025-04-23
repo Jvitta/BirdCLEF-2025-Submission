@@ -1,7 +1,9 @@
 notes
 
 .ipynb_checkpoints
-
 __pycache__
 
 kaggle_training.py
+
+outputs/preprocessed/
+outputs/models/
