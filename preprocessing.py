@@ -52,11 +52,12 @@ def load_and_prepare_metadata(config):
     return working_df
 
 def generate_and_save_spectrograms(df, config):
-    """Generates spectrograms dictionary using utils function (with intervals) and saves it."""
+    """Generates spectrograms using utils function (with intervals) and saves as NPZ."""
     if df is None or df.empty:
         print("Working dataframe is empty, skipping spectrogram generation.")
-        return {} 
-        
+        return # Return nothing, as utils.generate_spectrograms handles saving
+
+    # --- Load Fabio Intervals --- #
     fabio_intervals = {}
     try:
         fabio_df = pd.read_csv(config.FABIO_CSV_PATH)
@@ -66,7 +67,9 @@ def generate_and_save_spectrograms(df, config):
         print(f"Warning: Fabio CSV file not found at {config.FABIO_CSV_PATH}. Fabio-specific cropping will not be applied.")
     except Exception as e:
         print(f"Warning: Error loading Fabio CSV from {config.FABIO_CSV_PATH}: {e}. Fabio-specific cropping will not be applied.")
+    # --- End Load Fabio Intervals ---
 
+    # --- Load VAD Intervals --- #
     vad_intervals = {}
     try:
         with open(config.TRANSFORMED_VOICE_DATA_PKL_PATH, 'rb') as f:
@@ -77,72 +80,92 @@ def generate_and_save_spectrograms(df, config):
         print(f"Warning: TRANSFORMED VAD pickle file not found at {config.TRANSFORMED_VOICE_DATA_PKL_PATH}. Please run transform_vad_keys.py first. VAD-based cropping will not be applied.")
     except Exception as e:
         print(f"Warning: Error loading TRANSFORMED VAD pickle from {config.TRANSFORMED_VOICE_DATA_PKL_PATH}: {e}. VAD-based cropping will not be applied.")
+    # --- End Load VAD Intervals ---
 
-    print("\n--- 2. Generating and Saving Spectrograms (Individual Files) ---")
+    print("\n--- 2. Generating and Saving Spectrograms (Single NPZ File) ---")
     start_time = time.time()
+    # Call the utility function which now saves the NPZ file directly
     utils.generate_spectrograms(df, config, fabio_intervals, vad_intervals)
     end_time = time.time()
     print(f"Spectrogram generation/saving process finished in {end_time - start_time:.2f} seconds.")
 
 def plot_examples(df, config):
-    """Plots and saves example spectrograms by loading individual files."""
+    """Plots and saves example spectrograms by loading from the single NPZ file."""
     print("\n--- 3. Plotting Example Spectrograms (Optional) ---")
-    
-    preprocessed_dir = config.PREPROCESSED_DATA_DIR
-    if not os.path.exists(preprocessed_dir) or not os.listdir(preprocessed_dir):
-        print(f"Preprocessed data directory ({preprocessed_dir}) is empty or does not exist. Skipping plotting.")
+
+    npz_filepath = config.PREPROCESSED_NPZ_PATH
+    if not os.path.exists(npz_filepath):
+        print(f"Preprocessed data file ({npz_filepath}) does not exist. Skipping plotting.")
         return
-        
+
     if df is None or df.empty:
         print("Metadata dataframe is missing, cannot plot examples with labels.")
         return
 
     samples_to_plot = []
-    potential_samples_df = df[['samplename', 'class', 'primary_label']].drop_duplicates('samplename').head(20)
-    
-    found_count = 0
-    for _, row in potential_samples_df.iterrows():
-        if found_count >= 4:
-            break
-            
-        samplename = row['samplename']
-        expected_filepath = os.path.join(preprocessed_dir, f"{samplename}.npy")
-        
-        if os.path.exists(expected_filepath):
+    data_archive = None
+    try:
+        print(f"Loading NPZ archive: {npz_filepath}")
+        # Load the archive. Allows reading individual arrays later.
+        data_archive = np.load(npz_filepath)
+        available_keys = set(data_archive.keys())
+        print(f"Loaded archive with {len(available_keys)} samples.")
+
+        # Try to find up to 4 samples present in the NPZ file
+        # Using head(50) to increase chances of finding matches if some failed processing
+        potential_samples_df = df[['samplename', 'class', 'primary_label']].drop_duplicates('samplename').head(50)
+
+        found_count = 0
+        for _, row in potential_samples_df.iterrows():
+            if found_count >= 4:
+                break
+
+            samplename = row['samplename']
+            if samplename in available_keys:
+                try:
+                    spectrogram_data = data_archive[samplename]
+                    samples_to_plot.append((samplename, row['class'], row['primary_label'], spectrogram_data))
+                    found_count += 1
+                except Exception as e:
+                    print(f"Warning: Error accessing/reading sample {samplename} from NPZ archive: {e}")
+            # else: # Optionally uncomment to see which potential samples were not found
+            #     print(f"Debug: Did not find key '{samplename}' in NPZ archive.")
+
+        if found_count < 4:
+            print(f"Found only {found_count} valid spectrogram examples to plot out of {len(potential_samples_df)} checked samples present in the NPZ.")
+
+        if samples_to_plot:
+            plt.figure(figsize=(16, 12))
+            for i, (samplename, class_name, species, spec_data) in enumerate(samples_to_plot):
+                plt.subplot(2, 2, i + 1)
+                plt.imshow(spec_data, aspect='auto', origin='lower', cmap='viridis')
+                plt.title(f"{class_name}: {species} (Sample: {samplename})", fontsize=10)
+                plt.colorbar(format='%+2.0f dB')
+
+            plt.tight_layout()
+            plot_mode_str = "sample" if config.debug_preprocessing_mode and getattr(config, 'N_MAX_PREPROCESS', None) is not None else "full"
+            plot_filename = f"melspec_examples_{plot_mode_str}.png"
+            plot_filepath = os.path.join(config.OUTPUT_DIR, plot_filename)
+            print(f"Saving example plot to: {plot_filepath}")
             try:
-                spectrogram_data = np.load(expected_filepath)
-                samples_to_plot.append((samplename, row['class'], row['primary_label'], spectrogram_data))
-                found_count += 1
+                os.makedirs(os.path.dirname(plot_filepath), exist_ok=True)
+                plt.savefig(plot_filepath)
+                plt.close()
             except Exception as e:
-                print(f"Warning: Error loading example spectrogram {expected_filepath}: {e}")
-        # else: # Optionally uncomment to see which potential samples were not found
-        #     print(f"Debug: Did not find expected file {expected_filepath} for plotting.")
+                 print(f"Error saving plot to {plot_filepath}: {e}")
 
-    if found_count < 4:
-         print(f"Found only {found_count} valid spectrogram examples to plot out of {len(potential_samples_df)} checked.")
+        else:
+            print("Could not find or load any valid spectrogram samples from the NPZ file to plot examples.")
 
-    if samples_to_plot:
-        plt.figure(figsize=(16, 12))
-        for i, (samplename, class_name, species, spec_data) in enumerate(samples_to_plot):
-            plt.subplot(2, 2, i + 1)
-            plt.imshow(spec_data, aspect='auto', origin='lower', cmap='viridis') 
-            plt.title(f"{class_name}: {species} (Sample: {samplename})", fontsize=10)
-            plt.colorbar(format='%+2.0f dB')
-        
-        plt.tight_layout()
-        plot_mode_str = "sample" if config.debug_preprocessing_mode and getattr(config, 'N_MAX_PREPROCESS', None) is not None else "full"
-        plot_filename = f"melspec_examples_{plot_mode_str}.png" 
-        plot_filepath = os.path.join(config.OUTPUT_DIR, plot_filename) 
-        print(f"Saving example plot to: {plot_filepath}")
-        try:
-            os.makedirs(os.path.dirname(plot_filepath), exist_ok=True)
-            plt.savefig(plot_filepath)
-            plt.close()
-        except Exception as e:
-             print(f"Error saving plot to {plot_filepath}: {e}")
-            
-    else:
-        print("Could not find or load any valid spectrogram files to plot examples.")
+    except Exception as e:
+        print(f"Error during NPZ loading or plotting: {e}")
+    finally:
+        # Ensure the archive file handle is closed if it was opened
+        if data_archive is not None:
+            try:
+                data_archive.close()
+            except Exception as e_close:
+                 print(f"Warning: Error closing NPZ archive: {e_close}")
 
 def main(config):
     """Main function to run the preprocessing pipeline."""

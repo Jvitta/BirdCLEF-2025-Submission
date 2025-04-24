@@ -209,79 +209,97 @@ def process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals):
 
 # --- Worker Function for Multiprocessing (Modified) --- #
 def _process_row_worker(args):
-    """Worker function to process a single audio file (takes a single arg tuple)."""
+    """Worker function to process a single audio file (takes a single arg tuple).
+       Returns (samplename, spectrogram_data) on success, (samplename, None) on failure/skip.
+    """
     # Unpack arguments
     filepath, filename, samplename, cfg, fabio_intervals, vad_intervals = args
-    
+
     try:
         mel_spec = process_audio_file(filepath, filename, cfg, fabio_intervals, vad_intervals)
-            
+
         if mel_spec is not None:
-            output_filepath = os.path.join(cfg.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
-            np.save(output_filepath, mel_spec)
-            return (samplename, True, None) # Samplename, Success Status, Error Info
+            # Instead of saving, return the data
+            return (samplename, mel_spec)
         else:
             # File was likely skipped due to duration or processing error in process_audio_file
-            return (samplename, False, "Skipped or failed in process_audio_file") 
-            
+            return (samplename, None)
+
     except Exception as e:
-        # Catch errors occurring during the worker execution itself (e.g., save error)
+        # Catch errors occurring during the worker execution itself
         tb_str = traceback.format_exc()
         print(f"Error in worker for {filepath}: {e}\n{tb_str}")
-        return (samplename, False, str(e)) # Samplename, Success Status, Error Info
+        return (samplename, None) # Return None on error
 # --- End Worker Function --- #
 
 def generate_spectrograms(df, cfg, fabio_intervals, vad_intervals):
-    """Generate spectrograms using multiprocessing and save individually."""
-    print("Generating mel spectrograms using multiprocessing and saving individually...")
+    """Generate spectrograms using multiprocessing and save to a single NPZ file."""
+    print("Generating mel spectrograms using multiprocessing...")
     start_time = time.time()
 
     num_workers = cfg.num_workers
     print(f"Using {num_workers} worker processes.")
 
-    os.makedirs(cfg.PREPROCESSED_DATA_DIR, exist_ok=True)
-    print(f"Saving individual spectrograms to: {cfg.PREPROCESSED_DATA_DIR}")
+    # Ensure the output directory exists
+    output_dir = os.path.dirname(cfg.PREPROCESSED_NPZ_PATH)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Will save spectrograms archive to: {cfg.PREPROCESSED_NPZ_PATH}")
 
     # Prepare list of argument tuples for each task
     tasks = []
     for _, row in df.iterrows():
         tasks.append((row['filepath'], row['filename'], row['samplename'], cfg, fabio_intervals, vad_intervals))
-    
+
     print(f"Prepared {len(tasks)} tasks for processing.")
 
+    all_spectrograms = {}
     successful_count = 0
     skipped_or_failed_count = 0
-    errors_info = []
+    errors_info = [] # Store samplenames of skipped/failed files
 
     # --- Use multiprocessing Pool with imap_unordered --- #
     with multiprocessing.Pool(processes=num_workers) as pool:
-        # Use imap_unordered to get results as they complete
-        # Wrap the results iterator with tqdm for progress
         results_iterator = pool.imap_unordered(_process_row_worker, tasks)
-        
-        print("Starting task processing...") # Add a print statement here
-        for samplename, success, error_msg in tqdm(results_iterator, total=len(tasks), desc="Preprocessing Audio"):
-            if success:
+
+        print("Starting task processing...")
+        for samplename, mel_spec in tqdm(results_iterator, total=len(tasks), desc="Preprocessing Audio"):
+            if mel_spec is not None:
+                all_spectrograms[samplename] = mel_spec
                 successful_count += 1
             else:
                 skipped_or_failed_count += 1
-                if error_msg: 
-                     errors_info.append((samplename, error_msg))
+                # Log which samplename failed/was skipped
+                errors_info.append(samplename)
     # --- End Pool --- #
+
+    print(f"\nFinished collecting {successful_count} spectrograms from workers.")
+
+    # Save all collected spectrograms to a single compressed NPZ file
+    if all_spectrograms:
+        print(f"Saving {len(all_spectrograms)} spectrograms to {cfg.PREPROCESSED_NPZ_PATH}...")
+        try:
+            np.savez_compressed(cfg.PREPROCESSED_NPZ_PATH, **all_spectrograms)
+            print("Successfully saved NPZ archive.")
+        except Exception as e:
+            print(f"CRITICAL Error saving NPZ archive: {e}")
+            # Depending on the workflow, you might want to raise the error
+            # raise e
+    else:
+        print("Warning: No spectrograms were successfully generated to save.")
 
     end_time = time.time()
     print(f"\nProcessing completed in {end_time - start_time:.2f} seconds")
     print(f"Attempted to process {len(tasks)} files.")
-    print(f"Successfully saved {successful_count} spectrogram files.")
-    print(f"Skipped or failed: {skipped_or_failed_count} files.") 
-    
-    # Optionally print detailed errors
+    print(f"Successfully generated {successful_count} spectrograms.")
+    print(f"Skipped or failed: {skipped_or_failed_count} files.")
+
+    # Optionally print skipped/failed sample names
     if errors_info:
-        print(f"\n--- Errors/Skipped File Details (First {min(10, len(errors_info))}) --- ")
-        for name, reason in errors_info[:10]:
-            print(f"  - {name}: {reason}")
+        print(f"\n--- Skipped/Failed Sample Names (First {min(10, len(errors_info))}) --- ")
+        for name in errors_info[:10]:
+            print(f"  - {name}")
         if len(errors_info) > 10:
-             print("  ... (additional errors hidden)")
+             print("  ... (additional names hidden)")
         print("----------------------------------")
-    
-    # No return value needed as files are saved directly
+
+    # No return value needed as the file is saved directly

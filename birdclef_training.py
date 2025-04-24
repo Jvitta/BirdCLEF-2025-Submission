@@ -61,15 +61,47 @@ def set_seed(seed=42):
 
 set_seed(config.seed)
 
+def _worker_init_fn(worker_id):
+    """Worker init function to load NPZ archive independently in each worker."""
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset  # the dataset copy in this worker process
+
+    # Only load if LOAD_PREPROCESSED_DATA is True
+    if dataset.config.LOAD_PREPROCESSED_DATA:
+        npz_path = dataset.npz_path # Get path from dataset instance
+        if npz_path and os.path.exists(npz_path):
+            try:
+                # Load the archive for this specific worker
+                dataset.data_archive = np.load(npz_path)
+                dataset.available_samples = set(dataset.data_archive.keys())
+                # Optional: Print only for the first worker to avoid spam
+                # if worker_id == 0:
+                #     print(f"Worker {worker_id}: Loaded NPZ with {len(dataset.available_samples)} keys.")
+            except Exception as e:
+                print(f"ERROR in worker {worker_id}: Failed to load NPZ {npz_path}: {e}")
+                dataset.data_archive = None # Ensure it's None on error
+                dataset.available_samples = set()
+        else:
+            # Path doesn't exist or wasn't set, ensure defaults
+            dataset.data_archive = None
+            dataset.available_samples = set()
+            # if worker_id == 0:
+            #     print(f"Worker {worker_id}: NPZ path not found or not set ({npz_path}).")
+
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
-    Handles loading individual pre-computed spectrograms or generating them on-the-fly,
-    adapting access method based on execution environment (Custom Job vs Interactive).
+    Handles loading pre-computed spectrograms from a single NPZ archive
+    or generating them on-the-fly.
+    NPZ loading is handled per-worker via worker_init_fn.
     """
     def __init__(self, df, config, mode="train"):
         self.df = df.copy()
         self.config = config
         self.mode = mode
+        # Initialize attributes - they will be populated by worker_init_fn or stay None
+        self.data_archive = None
+        self.available_samples = set()
+        self.npz_path = None # Store the path for the worker
 
         # Load taxonomy info once
         try:
@@ -86,25 +118,24 @@ class BirdCLEFDataset(Dataset):
             print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
             raise # Re-raise exception as this is critical
 
-        # Ensure necessary columns exist (filepath, samplename)
+        # Ensure necessary columns exist (filepath for on-the-fly, samplename for NPZ keys)
         if 'filepath' not in self.df.columns:
-            # Use os.path.join for consistency
             self.df['filepath'] = self.df['filename'].apply(lambda f: os.path.join(self.config.train_audio_dir, f))
         if 'samplename' not in self.df.columns:
-            # Use split/join method consistent with preprocessing.py
             self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-        # Update print statements for individual file loading
-        if not self.config.LOAD_PREPROCESSED_DATA:
-             print(f"Dataset mode '{self.mode}': Configured to generate spectrograms on-the-fly.")
+        # --- Check NPZ path and store it, DO NOT load here --- #
+        if self.config.LOAD_PREPROCESSED_DATA:
+            self.npz_path = self.config.PREPROCESSED_NPZ_PATH
+            print(f"Dataset mode '{self.mode}': Configured to load pre-computed spectrograms from NPZ: {self.npz_path}")
+            # Simple check for existence in main process for user feedback
+            if not os.path.exists(self.npz_path):
+                print(f"  WARNING (main process): Preprocessed NPZ file not found at {self.npz_path}. Workers will attempt on-the-fly generation.")
+            # else: # Add if more verbose confirmation is needed
+            #     print(f"  INFO (main process): NPZ file found. Workers will attempt to load it.")
         else:
-             # Check local/mount path for interactive mode, GCS check happens during loading
-             if not self.config.IS_CUSTOM_JOB and not os.path.exists(self.config.PREPROCESSED_DATA_DIR):
-                 print(f"Warning (Interactive Mode): Preprocessed data directory {self.config.PREPROCESSED_DATA_DIR} not found.")
-             elif self.config.IS_CUSTOM_JOB:
-                 print(f"Dataset mode '{self.mode}': Configured to load individual pre-computed spectrograms directly from GCS bucket '{self.config.GCS_BUCKET_NAME}' prefix '{self.config.GCS_PREPROCESSED_PATH_PREFIX}'.")
-             else:
-                 print(f"Dataset mode '{self.mode}': Configured to load individual pre-computed spectrograms from mount path {self.config.PREPROCESSED_DATA_DIR}")
+            print(f"Dataset mode '{self.mode}': Configured to generate spectrograms on-the-fly.")
+        # --- End NPZ Check --- #
 
     def __len__(self):
         return len(self.df)
@@ -115,72 +146,43 @@ class BirdCLEFDataset(Dataset):
         spec = None
         load_error = None # Track loading errors
 
-        # Try loading pre-computed individual file first if configured
-        if self.config.LOAD_PREPROCESSED_DATA:
-            # --- Conditional Data Loading --- #
-            if self.config.IS_CUSTOM_JOB:
-                # --- Direct GCS Loading --- #
-                global gcs_client # Access the potentially global client
-                if gcs_client is None:
-                    load_error = "GCS client not initialized"
-                else:
-                    try:
-                        # Construct GCS blob path
-                        blob_path = os.path.join(self.config.GCS_PREPROCESSED_PATH_PREFIX, f"{samplename}.npy")
-                        # Remove leading slash if present (os.path.join might add one)
-                        blob_path = blob_path.lstrip('/') 
-                        
-                        bucket = gcs_client.bucket(self.config.GCS_BUCKET_NAME)
-                        blob = bucket.blob(blob_path)
-                        
-                        # Download as bytes and load with numpy
-                        npy_bytes = blob.download_as_bytes()
-                        spec = np.load(io.BytesIO(npy_bytes))
-                        
-                    except storage.exceptions.NotFound:
-                         load_error = f"GCS object not found: gs://{self.config.GCS_BUCKET_NAME}/{blob_path}"
-                    except Exception as e:
-                         load_error = f"Error loading from GCS (gs://{self.config.GCS_BUCKET_NAME}/{blob_path}): {e}"
-                # --- End GCS Loading --- #
-            else:
-                # --- Local Filesystem (gcsfuse mount) Loading --- #
-                spec_path = os.path.join(self.config.PREPROCESSED_DATA_DIR, f"{samplename}.npy")
+        # 1. Try loading from NPZ archive if it was loaded successfully
+        if self.data_archive is not None:
+            if samplename in self.available_samples:
                 try:
-                    spec = np.load(spec_path)
-                except FileNotFoundError:
-                    load_error = f"Local file not found: {spec_path}"
+                    spec = self.data_archive[samplename]
                 except Exception as e:
-                    load_error = f"Error loading local file {spec_path}: {e}"
-                # --- End Local Loading --- #
-            # --- End Conditional Loading --- #
+                    load_error = f"Error reading '{samplename}' from NPZ archive: {e}"
+                    spec = None # Ensure spec is None if reading fails
+            else:
+                 # This case means the archive was loaded, but the specific sample isn't in it.
+                 load_error = f"Sample '{samplename}' not found in the loaded NPZ archive."
 
-            # Print warning if loading failed, only once maybe or based on mode
-            if load_error and self.mode == "train":
+        # Print warning if loading from NPZ failed or sample was missing
+        if spec is None and self.config.LOAD_PREPROCESSED_DATA and self.data_archive is not None:
+            if self.mode == "train": # Only warn verbosely during training
                  print(f"Warning: Failed to load precomputed spec for {samplename}. Reason: {load_error}. Attempting generation or zeros.")
 
-        # If spec wasn't loaded OR if on-the-fly generation is configured
-        if spec is None and not self.config.LOAD_PREPROCESSED_DATA:
-            print(f"Debug: Generating spec on-the-fly for {samplename}") # Optional debug
-            # Generate on-the-fly using the utility function (passing necessary args)
-            # Note: utils.process_audio_file expects intervals, but they are not loaded here.
-            # If on-the-fly generation is a primary use case, need to decide how to handle intervals.
-            # For now, assume intervals are only used when LOAD_PREPROCESSED_DATA is False during preprocessing.
-            # Or pass dummy empty dicts if the function requires them.
+        # 2. Attempt on-the-fly generation if spec is still None
+        #    (Either LOAD_PREPROCESSED_DATA was False, or NPZ loading failed/missed)
+        if spec is None:
+            if not self.config.LOAD_PREPROCESSED_DATA:
+                 if self.mode == "train": # Debug message only if configured for on-the-fly
+                     print(f"Debug: Generating spec on-the-fly for {samplename}")
+            # Generate on-the-fly using the utility function
             try:
+                # Assume fabio/vad intervals are not needed here as they are applied during preprocessing
                 spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {}) # Pass empty interval dicts
             except Exception as e_gen:
                  print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
                  spec = None # Ensure spec is None if generation fails
 
-        # Handle cases where spec is still None (missing pre-computed AND generation failed/disabled)
+        # 3. Handle cases where spec is still None (NPZ failed AND generation failed/disabled)
         if spec is None:
             # Use original logic for zero padding
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-            # Modify warning condition as self.spectrograms is gone
-            if not self.config.LOAD_PREPROCESSED_DATA:
-                 if self.mode == "train": 
-                    print(f"Warning: On-the-fly generation failed for {samplename} ({row['filepath']}). Using zeros.")
-            # If LOAD_PREPROCESSED_DATA was True, the warning was printed during the load attempt
+            if self.mode == "train":
+                print(f"Warning: Failed to load or generate spec for {samplename}. Using zeros.")
 
         # Ensure spec is float32 before converting to tensor
         spec = spec.astype(np.float32)
@@ -592,31 +594,31 @@ def run_training(df, config, resume_fold=0):
 
     # --- Check data source based on environment --- #
     if config.LOAD_PREPROCESSED_DATA:
-        if config.IS_CUSTOM_JOB:
-            print(f"Will attempt to load preprocessed data from GCS Bucket: gs://{config.GCS_BUCKET_NAME}/{config.GCS_PREPROCESSED_PATH_PREFIX}")
+        npz_path = config.PREPROCESSED_NPZ_PATH
+        print(f"Checking for preprocessed data NPZ file: {npz_path}")
+        if not os.path.exists(npz_path):
+             print(f"Error: LOAD_PREPROCESSED_DATA is True, but NPZ file {npz_path} does not exist.")
+             print("       Ensure preprocessing.py has been run successfully.")
+             # Decide if you want to exit or attempt on-the-fly generation
+             # For now, the dataset init will handle the fallback, just warn here.
+             # return 0.0 # Or sys.exit(1)
         else:
-            preprocessed_dir = config.PREPROCESSED_DATA_DIR 
-            print(f"Checking for preprocessed data directory (local/mount): {preprocessed_dir}")
-            if not os.path.exists(preprocessed_dir) or not os.listdir(preprocessed_dir):
-                print(f"Error: LOAD_PREPROCESSED_DATA is True, but directory {preprocessed_dir} does not exist or is empty.")
-                return 0.0
-            else:
-                print(f"Preprocessed data directory found. Dataset will load files individually from: {preprocessed_dir}")
+             print(f"Preprocessed NPZ file found. Dataset will attempt to load samples from: {npz_path}")
     else:
-        print("\nGenerating spectrograms on-the-fly.")
-        if config.IS_CUSTOM_JOB:
-            print("WARNING: On-the-fly generation in custom job requires direct GCS access for audio files.")
+        print("\nConfigured to generate spectrograms on-the-fly.")
+        # Note: On-the-fly generation requires audio files to be accessible
+        # Add checks for config.train_audio_dir if needed
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
 
     working_df = df.copy()
 
     # Ensure required columns exist for on-the-fly generation if needed
-    if not config.LOAD_PREPROCESSED_DATA:
-        if 'filepath' not in working_df.columns:
-            working_df['filepath'] = working_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
-        if 'samplename' not in working_df.columns:
-            working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+    # (Dataset __init__ already handles this, but keep for clarity if desired)
+    if 'filepath' not in working_df.columns:
+        working_df['filepath'] = working_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
+    if 'samplename' not in working_df.columns:
+        working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
     # --- Cross-validation ---
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
@@ -653,7 +655,8 @@ def run_training(df, config, resume_fold=0):
             num_workers=config.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
-            drop_last=True
+            drop_last=True,
+            worker_init_fn=_worker_init_fn # Add worker init fn
         )
         val_loader = DataLoader(
             val_dataset,
@@ -662,7 +665,8 @@ def run_training(df, config, resume_fold=0):
             num_workers=config.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
-            drop_last=False
+            drop_last=False,
+            worker_init_fn=_worker_init_fn # Add worker init fn
         )
 
         print("\nSetting up model, optimizer, criterion, scheduler...")

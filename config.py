@@ -28,7 +28,10 @@ class Config:
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
-    PREPROCESSED_DATA_DIR = os.path.join(OUTPUT_DIR, 'preprocessed') 
+    # Define the directory where preprocessing outputs go
+    _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
+    # Define the specific path for the single NPZ file
+    PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
     MODEL_INPUT_DIR = MODEL_OUTPUT_DIR
 
     # These derived paths use the mount point when IS_CUSTOM_JOB is False
@@ -64,7 +67,7 @@ class Config:
     epochs = 10
     train_batch_size = 32
     val_batch_size = 64
-    use_amp = False
+    use_amp = True
 
     criterion = 'BCEWithLogitsLoss'
     n_fold = 5
