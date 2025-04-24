@@ -4,7 +4,7 @@ import multiprocessing
 from google.cloud import storage
 
 class Config:
-    seed = 42
+    seed = 41
     debug = False  # Master debug flag for limiting epochs, batches etc.
     debug_preprocessing_mode = False # Controls N_MAX_PREPROCESS and filename suffix
     num_workers = max(1, multiprocessing.cpu_count() - 1)
@@ -65,7 +65,7 @@ class Config:
     LOAD_PREPROCESSED_DATA = True 
     REMOVE_SPEECH_INTERVALS = False
     epochs = 10
-    train_batch_size = 32
+    train_batch_size = 64
     val_batch_size = 64
     use_amp = True
 
@@ -74,7 +74,7 @@ class Config:
     selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
-    lr = 5e-4
+    lr = 1e-3
     weight_decay = 1e-5
 
     scheduler = 'CosineAnnealingLR' 

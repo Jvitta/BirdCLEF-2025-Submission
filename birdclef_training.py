@@ -28,6 +28,7 @@ from torch.amp import GradScaler
 from tqdm.auto import tqdm
 
 import timm
+import matplotlib.pyplot as plt
 
 from config import config
 import birdclef_utils as utils
@@ -61,53 +62,21 @@ def set_seed(seed=42):
 
 set_seed(config.seed)
 
-def _worker_init_fn(worker_id):
-    """Worker init function to load NPZ archive independently in each worker."""
-    worker_info = torch.utils.data.get_worker_info()
-    dataset = worker_info.dataset  # the dataset copy in this worker process
-
-    # Only load if LOAD_PREPROCESSED_DATA is True
-    if dataset.config.LOAD_PREPROCESSED_DATA:
-        npz_path = dataset.npz_path # Get path from dataset instance
-        if npz_path and os.path.exists(npz_path):
-            try:
-                # Load the archive for this specific worker
-                dataset.data_archive = np.load(npz_path)
-                dataset.available_samples = set(dataset.data_archive.keys())
-                # Optional: Print only for the first worker to avoid spam
-                # if worker_id == 0:
-                #     print(f"Worker {worker_id}: Loaded NPZ with {len(dataset.available_samples)} keys.")
-            except Exception as e:
-                print(f"ERROR in worker {worker_id}: Failed to load NPZ {npz_path}: {e}")
-                dataset.data_archive = None # Ensure it's None on error
-                dataset.available_samples = set()
-        else:
-            # Path doesn't exist or wasn't set, ensure defaults
-            dataset.data_archive = None
-            dataset.available_samples = set()
-            # if worker_id == 0:
-            #     print(f"Worker {worker_id}: NPZ path not found or not set ({npz_path}).")
-
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
-    Handles loading pre-computed spectrograms from a single NPZ archive
+    Handles loading pre-computed spectrograms from a pre-loaded dictionary
     or generating them on-the-fly.
-    NPZ loading is handled per-worker via worker_init_fn.
     """
-    def __init__(self, df, config, mode="train"):
+    def __init__(self, df, config, mode="train", all_spectrograms=None):
         self.df = df.copy()
         self.config = config
         self.mode = mode
-        # Initialize attributes - they will be populated by worker_init_fn or stay None
-        self.data_archive = None
-        self.available_samples = set()
-        self.npz_path = None # Store the path for the worker
+        self.all_spectrograms = all_spectrograms # Store the pre-loaded dictionary
 
         # Load taxonomy info once
         try:
             taxonomy_df = pd.read_csv(self.config.taxonomy_path)
             self.species_ids = taxonomy_df['primary_label'].tolist()
-            # Ensure num_classes in config matches taxonomy
             if len(self.species_ids) != self.config.num_classes:
                  print(f"Warning: Taxonomy file has {len(self.species_ids)} species, but config.num_classes is {self.config.num_classes}. Using value from taxonomy.")
                  self.num_classes = len(self.species_ids)
@@ -116,26 +85,21 @@ class BirdCLEFDataset(Dataset):
             self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
         except Exception as e:
             print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
-            raise # Re-raise exception as this is critical
+            raise
 
-        # Ensure necessary columns exist (filepath for on-the-fly, samplename for NPZ keys)
+        # Ensure necessary columns exist
         if 'filepath' not in self.df.columns:
             self.df['filepath'] = self.df['filename'].apply(lambda f: os.path.join(self.config.train_audio_dir, f))
         if 'samplename' not in self.df.columns:
             self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-        # --- Check NPZ path and store it, DO NOT load here --- #
-        if self.config.LOAD_PREPROCESSED_DATA:
-            self.npz_path = self.config.PREPROCESSED_NPZ_PATH
-            print(f"Dataset mode '{self.mode}': Configured to load pre-computed spectrograms from NPZ: {self.npz_path}")
-            # Simple check for existence in main process for user feedback
-            if not os.path.exists(self.npz_path):
-                print(f"  WARNING (main process): Preprocessed NPZ file not found at {self.npz_path}. Workers will attempt on-the-fly generation.")
-            # else: # Add if more verbose confirmation is needed
-            #     print(f"  INFO (main process): NPZ file found. Workers will attempt to load it.")
+        # Print status based on whether spectrograms were pre-loaded
+        if self.all_spectrograms is not None:
+            print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary with {len(self.all_spectrograms)} samples.")
+        elif self.config.LOAD_PREPROCESSED_DATA:
+            print(f"Dataset mode '{self.mode}': WARNING - Configured to load preprocessed data, but no dictionary provided. Will attempt on-the-fly.")
         else:
             print(f"Dataset mode '{self.mode}': Configured to generate spectrograms on-the-fly.")
-        # --- End NPZ Check --- #
 
     def __len__(self):
         return len(self.df)
@@ -144,42 +108,30 @@ class BirdCLEFDataset(Dataset):
         row = self.df.iloc[idx]
         samplename = row['samplename']
         spec = None
-        load_error = None # Track loading errors
 
-        # 1. Try loading from NPZ archive if it was loaded successfully
-        if self.data_archive is not None:
-            if samplename in self.available_samples:
-                try:
-                    spec = self.data_archive[samplename]
-                except Exception as e:
-                    load_error = f"Error reading '{samplename}' from NPZ archive: {e}"
-                    spec = None # Ensure spec is None if reading fails
+        # 1. Try loading from the pre-loaded dictionary
+        if self.all_spectrograms is not None:
+            if samplename in self.all_spectrograms:
+                spec = self.all_spectrograms[samplename]
             else:
-                 # This case means the archive was loaded, but the specific sample isn't in it.
-                 load_error = f"Sample '{samplename}' not found in the loaded NPZ archive."
+                # If using pre-loaded, missing sample is an issue
+                print(f"ERROR: Sample '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
+                # Fallback to zeros, or could raise an error
+                spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
 
-        # Print warning if loading from NPZ failed or sample was missing
-        if spec is None and self.config.LOAD_PREPROCESSED_DATA and self.data_archive is not None:
-            if self.mode == "train": # Only warn verbosely during training
-                 print(f"Warning: Failed to load precomputed spec for {samplename}. Reason: {load_error}. Attempting generation or zeros.")
-
-        # 2. Attempt on-the-fly generation if spec is still None
-        #    (Either LOAD_PREPROCESSED_DATA was False, or NPZ loading failed/missed)
-        if spec is None:
-            if not self.config.LOAD_PREPROCESSED_DATA:
-                 if self.mode == "train": # Debug message only if configured for on-the-fly
-                     print(f"Debug: Generating spec on-the-fly for {samplename}")
-            # Generate on-the-fly using the utility function
+        # 2. Attempt on-the-fly generation ONLY if not using pre-loaded data
+        #    (or if pre-loading failed and all_spectrograms is None, handled in __init__ print)
+        if spec is None and not self.config.LOAD_PREPROCESSED_DATA:
+            if self.mode == "train":
+                print(f"Debug: Generating spec on-the-fly for {samplename}")
             try:
-                # Assume fabio/vad intervals are not needed here as they are applied during preprocessing
-                spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {}) # Pass empty interval dicts
+                spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {})
             except Exception as e_gen:
                  print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
-                 spec = None # Ensure spec is None if generation fails
+                 spec = None
 
-        # 3. Handle cases where spec is still None (NPZ failed AND generation failed/disabled)
+        # 3. Handle cases where spec is still None (generation failed or pre-load error)
         if spec is None:
-            # Use original logic for zero padding
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
             if self.mode == "train":
                 print(f"Warning: Failed to load or generate spec for {samplename}. Using zeros.")
@@ -194,28 +146,21 @@ class BirdCLEFDataset(Dataset):
 
         # Encode primary and secondary labels
         target = self.encode_label(row['primary_label'])
-        # Use the original logic for secondary labels from the user's version
         if 'secondary_labels' in row and row['secondary_labels'] not in [[''], None, np.nan]:
             if isinstance(row['secondary_labels'], str):
                 try:
-                    # Safely evaluate string representation
                     secondary_labels = eval(row['secondary_labels'])
-                    if not isinstance(secondary_labels, list):
-                         secondary_labels = [] # Ensure it's a list
-                except:
-                    secondary_labels = [] # Handle eval errors
-            else:
-                secondary_labels = row['secondary_labels'] # Assume it's already a list
-
-            if isinstance(secondary_labels, list): # Check if it's a list before iterating
+                    if not isinstance(secondary_labels, list): secondary_labels = []
+                except: secondary_labels = []
+            else: secondary_labels = row['secondary_labels']
+            if isinstance(secondary_labels, list):
                  for label in secondary_labels:
-                     if label in self.label_to_idx:
-                         target[self.label_to_idx[label]] = 1.0
+                     if label in self.label_to_idx: target[self.label_to_idx[label]] = 1.0
 
         return {
             'melspec': spec,
             'target': torch.tensor(target, dtype=torch.float32),
-            'filename': row['filename'] # Keep filename
+            'filename': row['filename']
         }
 
     def apply_spec_augmentations(self, spec):
@@ -592,52 +537,61 @@ def run_training(df, config, resume_fold=0):
     print(f"Debug Mode: {config.debug}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
-    # --- Check data source based on environment --- #
+    all_spectrograms = None # Initialize
+    # --- Pre-load NPZ if configured --- #
     if config.LOAD_PREPROCESSED_DATA:
         npz_path = config.PREPROCESSED_NPZ_PATH
-        print(f"Checking for preprocessed data NPZ file: {npz_path}")
+        print(f"Attempting to pre-load NPZ file into RAM: {npz_path}")
         if not os.path.exists(npz_path):
              print(f"Error: LOAD_PREPROCESSED_DATA is True, but NPZ file {npz_path} does not exist.")
-             print("       Ensure preprocessing.py has been run successfully.")
-             # Decide if you want to exit or attempt on-the-fly generation
-             # For now, the dataset init will handle the fallback, just warn here.
-             # return 0.0 # Or sys.exit(1)
+             print("       Please run preprocessing.py first.")
+             sys.exit(1) # Exit if preprocessed data is required but missing
         else:
-             print(f"Preprocessed NPZ file found. Dataset will attempt to load samples from: {npz_path}")
+            try:
+                print("Loading... (This might take a moment for large files)")
+                start_load_time = time.time()
+                # Load the entire NPZ into a dictionary in RAM
+                # Note: np.load returns a lazy NpzFile object, explicitly convert to dict
+                with np.load(npz_path) as data_archive:
+                    all_spectrograms = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading NPZ into RAM")}
+                end_load_time = time.time()
+                print(f"Successfully pre-loaded {len(all_spectrograms)} samples into RAM in {end_load_time - start_load_time:.2f} seconds.")
+            except Exception as e:
+                print(f"Error loading NPZ file into RAM: {e}")
+                print("Cannot continue without preloaded data when LOAD_PREPROCESSED_DATA is True.")
+                sys.exit(1)
     else:
-        print("\nConfigured to generate spectrograms on-the-fly.")
-        # Note: On-the-fly generation requires audio files to be accessible
-        # Add checks for config.train_audio_dir if needed
+        print("\nConfigured to generate spectrograms on-the-fly (no pre-loading).")
+    # --- End Pre-loading --- #
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
     working_df = df.copy()
 
-    # Ensure required columns exist for on-the-fly generation if needed
-    # (Dataset __init__ already handles this, but keep for clarity if desired)
     if 'filepath' not in working_df.columns:
         working_df['filepath'] = working_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
     if 'samplename' not in working_df.columns:
         working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-    # --- Cross-validation ---
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
     oof_scores = []
+    # --- Modify History Tracking --- #
+    all_folds_history = [] # Store history dict from each fold
+    # --- End Modify History Tracking --- #
 
-    # --- Fold Loop --- #
     for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
-        # --- Resume Logic: Skip folds before the specified resume_fold --- #
-        if fold < resume_fold:
-            print(f"\nSkipping Fold {fold} as it is before the resume fold ({resume_fold})...")
-            continue
-        # --- End Resume Logic ---
-
-        # Keep the original check for selected folds as well
-        if fold not in config.selected_folds:
-            print(f"\nSkipping Fold {fold} as it is not in selected_folds {config.selected_folds}...")
-            continue
+        if fold < resume_fold: continue
+        if fold not in config.selected_folds: continue
 
         print(f'\n{"="*30} Fold {fold} {"="*30}')
+        # --- Initialize history for the CURRENT fold --- #
+        fold_history = {
+            'epochs': [],
+            'train_loss': [], 'val_loss': [],
+            'train_auc': [], 'val_auc': []
+        }
+        # --- End History Init --- #
 
         train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
         val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
@@ -645,28 +599,29 @@ def run_training(df, config, resume_fold=0):
         print(f'Training set: {len(train_df_fold)} samples')
         print(f'Validation set: {len(val_df_fold)} samples')
 
-        train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train')
-        val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid')
+        # Pass the pre-loaded dictionary (or None) to the Dataset
+        train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
+        val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms)
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.train_batch_size,
             shuffle=True,
-            num_workers=config.num_workers,
+            num_workers=config.num_workers, # Can still use workers for CPU tasks
             pin_memory=True,
             collate_fn=collate_fn,
-            drop_last=True,
-            worker_init_fn=_worker_init_fn # Add worker init fn
+            drop_last=True
+            # REMOVED worker_init_fn
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=config.val_batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
+            num_workers=config.num_workers, # Can still use workers for CPU tasks
             pin_memory=True,
             collate_fn=collate_fn,
-            drop_last=False,
-            worker_init_fn=_worker_init_fn # Add worker init fn
+            drop_last=False
+            # REMOVED worker_init_fn
         )
 
         print("\nSetting up model, optimizer, criterion, scheduler...")
@@ -717,6 +672,14 @@ def run_training(df, config, resume_fold=0):
             print(f"  Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
             print(f"  Val Loss:   {val_loss:.4f}, Val AUC:   {val_auc:.4f}")
 
+            # --- Append metrics for the CURRENT fold's history --- #
+            fold_history['epochs'].append(epoch + 1)
+            fold_history['train_loss'].append(train_loss)
+            fold_history['val_loss'].append(val_loss)
+            fold_history['train_auc'].append(train_auc)
+            fold_history['val_auc'].append(val_auc)
+            # --- End Appending --- #
+
             # --- Model Checkpointing ---
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
@@ -741,10 +704,84 @@ def run_training(df, config, resume_fold=0):
         print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
         oof_scores.append(best_val_auc)
 
+        # --- Store history for this fold --- #
+        all_folds_history.append(fold_history)
+        # --- End Store History --- #
+
         del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
         del train_df_fold, val_df_fold 
         torch.cuda.empty_cache()
         gc.collect()
+
+    # --- Plotting Average Metrics Across Folds --- #
+    if all_folds_history:
+        print("\n--- Generating Average Training History Plot Across Folds ---")
+
+        # Calculate average metrics per epoch
+        num_epochs = config.epochs
+        avg_train_loss = np.zeros(num_epochs)
+        avg_val_loss = np.zeros(num_epochs)
+        avg_train_auc = np.zeros(num_epochs)
+        avg_val_auc = np.zeros(num_epochs)
+        counts_per_epoch = np.zeros(num_epochs, dtype=int)
+
+        for fold_hist in all_folds_history:
+            # Use the actual number of epochs recorded in the history for this fold
+            epochs_ran = len(fold_hist['epochs'])
+            for i in range(epochs_ran):
+                epoch_idx = i # 0-based index for arrays
+                if epoch_idx < num_epochs: # Safety check
+                    avg_train_loss[epoch_idx] += fold_hist['train_loss'][i]
+                    avg_val_loss[epoch_idx] += fold_hist['val_loss'][i]
+                    avg_train_auc[epoch_idx] += fold_hist['train_auc'][i]
+                    avg_val_auc[epoch_idx] += fold_hist['val_auc'][i]
+                    counts_per_epoch[epoch_idx] += 1
+
+        # Avoid division by zero if no folds ran or epochs were skipped
+        valid_counts_mask = counts_per_epoch > 0
+        avg_train_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+        avg_val_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+        avg_train_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+        avg_val_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+
+        epochs_axis = list(range(1, num_epochs + 1))
+
+        # Generate Plot
+        fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+
+        # Loss Plot
+        ax[0].plot(epochs_axis, avg_train_loss, label='Avg Train Loss')
+        ax[0].plot(epochs_axis, avg_val_loss, label='Avg Validation Loss')
+        ax[0].set_title('Average Loss vs. Epochs Across Folds')
+        ax[0].set_xlabel('Epoch')
+        ax[0].set_ylabel('Loss')
+        ax[0].legend()
+        ax[0].grid(True)
+
+        # AUC Plot
+        ax[1].plot(epochs_axis, avg_train_auc, label='Avg Train AUC')
+        ax[1].plot(epochs_axis, avg_val_auc, label='Avg Validation AUC')
+        ax[1].set_title('Average AUC vs. Epochs Across Folds')
+        ax[1].set_xlabel('Epoch')
+        ax[1].set_ylabel('AUC')
+        ax[1].legend()
+        ax[1].grid(True)
+
+        plt.tight_layout()
+
+        plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
+        os.makedirs(plot_dir, exist_ok=True) # Ensure the directory exists
+        plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
+
+        try:
+            plt.savefig(plot_save_path)
+            print(f"Saved average plot to: {plot_save_path}")
+        except Exception as e:
+            print(f"Error saving average plot to {plot_save_path}: {e}")
+        plt.close(fig) # Close the figure to free memory
+    else:
+        print("\nNo fold histories recorded, skipping average plot generation.")
+    # --- End Plotting --- #
 
     print("\n" + "="*60)
     print("Cross-Validation Training Summary:")
