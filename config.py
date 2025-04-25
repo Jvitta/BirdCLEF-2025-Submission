@@ -66,8 +66,13 @@ class Config:
     in_channels = 1
     num_classes = 206  
 
-    LOAD_PREPROCESSED_DATA = True 
+    LOAD_PREPROCESSED_DATA = False
     REMOVE_SPEECH_INTERVALS = False
+    USE_RARE_DATA = False
+
+    # --- On-the-fly Preloading Configuration ---
+    PRELOAD_CHUNK_DURATION_SEC = 15.0 # Set to None or 0 to load full files
+
     epochs = 10
     train_batch_size = 32
     val_batch_size = 64

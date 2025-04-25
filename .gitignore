@@ -7,3 +7,4 @@ kaggle_training.py
 
 outputs/preprocessed/
 outputs/training_curves/
+outputs/visualizations/

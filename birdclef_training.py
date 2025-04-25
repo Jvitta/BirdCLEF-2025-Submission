@@ -29,10 +29,15 @@ from tqdm.auto import tqdm
 
 import timm
 import matplotlib.pyplot as plt
+import cv2
 
 from config import config
 import birdclef_utils as utils
 from google.cloud import storage
+import librosa
+
+import multiprocessing
+import traceback
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -67,11 +72,12 @@ class BirdCLEFDataset(Dataset):
     Handles loading pre-computed spectrograms from a pre-loaded dictionary
     or generating them on-the-fly.
     """
-    def __init__(self, df, config, mode="train", all_spectrograms=None):
+    def __init__(self, df, config, mode="train", all_spectrograms=None, all_train_audio=None):
         self.df = df.copy()
         self.config = config
         self.mode = mode
         self.all_spectrograms = all_spectrograms # Store the pre-loaded dictionary
+        self.all_train_audio = all_train_audio   # Store the pre-loaded audio data
 
         # Load taxonomy info once
         try:
@@ -108,39 +114,63 @@ class BirdCLEFDataset(Dataset):
         row = self.df.iloc[idx]
         samplename = row['samplename']
         spec = None
+        target_samples = int(self.config.TARGET_DURATION * self.config.FS)
 
-        # 1. Try loading from the pre-loaded dictionary
-        if self.all_spectrograms is not None:
-            if samplename in self.all_spectrograms:
-                spec = self.all_spectrograms[samplename]
+        # --- On-the-fly Spectrogram Generation --- # 
+        if self.all_train_audio is not None and samplename in self.all_train_audio:
+            audio_data = self.all_train_audio[samplename]
+            
+            # Ensure audio data is not empty
+            if audio_data is None or len(audio_data) == 0:
+                 print(f"Warning: Empty audio data retrieved for {samplename}. Using zeros.")
+                 spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
             else:
-                # If using pre-loaded, missing sample is an issue
-                print(f"ERROR: Sample '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
-                # Fallback to zeros, or could raise an error
-                spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+                # --- Random Crop Logic --- #
+                if len(audio_data) < target_samples:
+                    # Pad or repeat if shorter than target duration
+                    n_copy = math.ceil(target_samples / len(audio_data))
+                    selected_audio_chunk = np.concatenate([audio_data] * n_copy)
+                    selected_audio_chunk = selected_audio_chunk[:target_samples]
+                    # Final check for padding if somehow still short
+                    if len(selected_audio_chunk) < target_samples:
+                         selected_audio_chunk = np.pad(selected_audio_chunk,
+                                                  (0, target_samples - len(selected_audio_chunk)),
+                                                  mode='constant')
+                else:
+                    # Randomly select start index if longer than target duration
+                    max_start_idx = len(audio_data) - target_samples
+                    start_idx = random.randint(0, max_start_idx)
+                    selected_audio_chunk = audio_data[start_idx : start_idx + target_samples]
+                # --- End Random Crop --- #
 
-        # 2. Attempt on-the-fly generation ONLY if not using pre-loaded data
-        #    (or if pre-loading failed and all_spectrograms is None, handled in __init__ print)
-        if spec is None and not self.config.LOAD_PREPROCESSED_DATA:
-            if self.mode == "train":
-                print(f"Debug: Generating spec on-the-fly for {samplename}")
-            try:
-                spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {})
-            except Exception as e_gen:
-                 print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
-                 spec = None
+                try:
+                    # Use utils.audio2melspec for spectrogram generation
+                    # Assuming utils is imported and available
+                    spec = utils.audio2melspec(selected_audio_chunk, self.config)
+                    # Resize if needed (audio2melspec handles normalization)
+                    if spec.shape != tuple(self.config.TARGET_SHAPE):
+                         spec = cv2.resize(spec, tuple(self.config.TARGET_SHAPE), interpolation=cv2.INTER_LINEAR)
 
-        # 3. Handle cases where spec is still None (generation failed or pre-load error)
+                except Exception as e_gen:
+                    print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
+                    spec = None # Fallback on error
+        else:
+            # Handle cases where audio data wasn't pre-loaded or samplename not found
+            print(f"Warning: Audio data not found for {samplename} in pre-loaded dictionary. Using zeros.")
+            spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+
+        # Fallback if spec is still None
         if spec is None:
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-            if self.mode == "train":
-                print(f"Warning: Failed to load or generate spec for {samplename}. Using zeros.")
+            if self.mode == "train": # Only warn during training
+                print(f"Warning: Failed to generate spec for {samplename}. Using zeros.")
+        # --- End On-the-fly Generation --- #
 
         # Ensure spec is float32 before converting to tensor
         spec = spec.astype(np.float32)
         spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
 
-        # Apply augmentations only in training mode
+        # Apply standard spec augmentations only in training mode
         if self.mode == "train" and random.random() < self.config.aug_prob:
             spec = self.apply_spec_augmentations(spec)
 
@@ -405,6 +435,35 @@ def calculate_auc(targets, outputs):
 
     return np.mean(aucs) if aucs else 0.0
 
+# --- Worker Function for Multiprocessing Audio Loading --- #
+def _load_audio_worker(args):
+    """Worker function to load a single audio file, potentially a middle chunk."""
+    filepath, samplename, target_sr, chunk_duration = args # <-- Added chunk_duration
+    try:
+        if not os.path.exists(filepath):
+            return (samplename, None, f"File not found: {filepath}")
+        
+        # --- Load only the middle chunk if duration is specified --- #
+        if chunk_duration is not None and chunk_duration > 0:
+            original_duration = librosa.get_duration(filename=filepath)
+            # Calculate offset for the middle chunk
+            offset = max(0, (original_duration / 2.0) - (chunk_duration / 2.0))
+            # Ensure offset + duration doesn't exceed original duration (librosa handles this, but good check)
+            # Load the specified chunk
+            audio_data, sr = librosa.load(filepath, sr=target_sr, mono=True, 
+                                        duration=chunk_duration, offset=offset)
+        else:
+            # Load the full file if no chunk duration specified
+            audio_data, sr = librosa.load(filepath, sr=target_sr, mono=True)
+        # --- End Chunk Loading Logic --- #
+
+        # Librosa handles resampling if sr != target_sr
+        return (samplename, audio_data, None) # Return None for error string on success
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        return (samplename, None, f"Error loading {filepath}: {e}\n{tb_str}")
+# --- End Worker Function --- #
+
 # --- Training and Validation Loops (Using User's versions, simplified batch handling) --- #
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler, scheduler=None):
@@ -538,7 +597,9 @@ def run_training(df, config, resume_fold=0):
     print(f"Using Seed: {config.seed}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
-    all_spectrograms = None # Initialize
+    all_spectrograms = None # Initialize for preprocessed path
+    all_train_audio_data = {} # Initialize for on-the-fly path
+
     # --- Pre-load NPZ if configured --- #
     if config.LOAD_PREPROCESSED_DATA:
         npz_path = config.PREPROCESSED_NPZ_PATH
@@ -562,18 +623,74 @@ def run_training(df, config, resume_fold=0):
                 print("Cannot continue without preloaded data when LOAD_PREPROCESSED_DATA is True.")
                 sys.exit(1)
     else:
-        print("\nConfigured to generate spectrograms on-the-fly (no pre-loading).")
+        print("\n--- Pre-loading Raw Audio Files into RAM (using multiprocessing) ---") # Modified print
+        start_load_time = time.time()
+        # Ensure necessary columns exist in the input dataframe 'df'
+        if 'filepath' not in df.columns:
+             df['filepath'] = df['filename'].apply(lambda f: os.path.join(config.train_audio_dir if f.split('/')[0] in main_train_df['primary_label'].unique() else config.train_audio_rare_dir, f)) # Heuristic path reconstruction if missing
+             print("Warning: 'filepath' column missing from input dataframe, attempted reconstruction.")
+        if 'samplename' not in df.columns:
+             df['samplename'] = df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+             print("Warning: 'samplename' column missing from input dataframe, reconstructed.")
+
+        # --- Prepare tasks for multiprocessing --- #
+        files_to_load = df[['filepath', 'samplename']].drop_duplicates().to_dict('records')
+        # Include the chunk duration in the arguments passed to the worker
+        tasks = [(item['filepath'], item['samplename'], config.FS, config.PRELOAD_CHUNK_DURATION_SEC) 
+                 for item in files_to_load]
+        print(f"Found {len(tasks)} unique audio file tasks to process.")
+        # --- End Task Preparation ---
+
+        loaded_count = 0
+        failed_count = 0
+        error_messages = [] # Store unique error messages
+
+        # --- Use multiprocessing Pool --- # 
+        print(f"Using {config.num_workers} workers for audio loading...")
+        with multiprocessing.Pool(processes=config.num_workers) as pool:
+            results_iterator = pool.imap_unordered(_load_audio_worker, tasks)
+            
+            for samplename, audio_data, error_msg in tqdm(results_iterator, total=len(tasks), desc="Loading Audio"):
+                if audio_data is not None:
+                    all_train_audio_data[samplename] = audio_data
+                    loaded_count += 1
+                else:
+                    failed_count += 1
+                    if error_msg not in error_messages:
+                         error_messages.append(error_msg) # Store unique errors
+        # --- End Pool --- #
+
+        end_load_time = time.time()
+        print(f"Successfully loaded {loaded_count} audio files into RAM.")
+        if failed_count > 0:
+             print(f"Failed to load {failed_count} audio files.")
+             # Print unique error messages if any occurred
+             if error_messages:
+                 print("--- Sample Error Messages During Loading ---")
+                 for i, msg in enumerate(error_messages[:5]): # Limit to first 5 unique errors
+                     print(f"  Error {i+1}: {msg.splitlines()[0]}...") # Show first line
+                 if len(error_messages) > 5:
+                     print("  ... (additional unique errors hidden)")
+                 print("-----------------------------------------")
+
+        print(f"Audio pre-loading finished in {end_load_time - start_load_time:.2f} seconds.")
+
+        # Check if loading failed critically
+        if loaded_count == 0 and len(files_to_load) > 0:
+             print("CRITICAL ERROR: Failed to load any audio files. Cannot proceed with on-the-fly generation.")
+             sys.exit(1)
     # --- End Pre-loading --- #
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-    working_df = df.copy()
+    working_df = df.copy() # Use the potentially modified df
 
+    # Ensure columns exist in working_df for splitting (should be fine if handled above)
     if 'filepath' not in working_df.columns:
-        working_df['filepath'] = working_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
+         working_df['filepath'] = working_df['filename'].apply(lambda f: "RECONSTRUCTION_NEEDED") # Placeholder if still missing
     if 'samplename' not in working_df.columns:
-        working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+         working_df['samplename'] = working_df.filename.map(lambda x: "RECONSTRUCTION_NEEDED") # Placeholder if still missing
 
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
     oof_scores = []
@@ -600,9 +717,15 @@ def run_training(df, config, resume_fold=0):
         print(f'Training set: {len(train_df_fold)} samples')
         print(f'Validation set: {len(val_df_fold)} samples')
 
-        # Pass the pre-loaded dictionary (or None) to the Dataset
-        train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
-        val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms)
+        # --- Modify Dataset Initialization ---
+        # Pass the correct data source based on config.LOAD_PREPROCESSED_DATA
+        if config.LOAD_PREPROCESSED_DATA:
+             train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
+             val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms)
+        else:
+             train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_train_audio=all_train_audio_data) # Pass audio dict
+             val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_train_audio=all_train_audio_data) # Pass audio dict
+        # --- End Modify Dataset Initialization ---
 
         train_loader = DataLoader(
             train_dataset,
@@ -818,6 +941,8 @@ if __name__ == "__main__":
     print("Loading main training metadata...")
     try:
         main_train_df = pd.read_csv(config.train_csv_path)
+        print(f"Loaded {len(main_train_df)} samples from main dataset.")
+
     except FileNotFoundError:
         print(f"Error: Main training CSV not found at {config.train_csv_path}. Exiting.")
         sys.exit(1)
@@ -825,7 +950,39 @@ if __name__ == "__main__":
         print(f"Error loading main training CSV: {e}. Exiting.")
         sys.exit(1)
 
-    # Pass the resume_fold argument to run_training
-    run_training(main_train_df, config, args.resume_fold) 
+    # --- Conditionally Load and process rare data --- #
+    combined_train_df = main_train_df # Start with main data
+    if config.USE_RARE_DATA:
+        print("Loading rare species metadata (USE_RARE_DATA=True)...")
+        try:
+            # Load rare data
+            rare_train_df = pd.read_csv(config.train_rare_csv_path, sep=';')
+            # Add filepath column using the correct directory
+            rare_train_df['filepath'] = rare_train_df['filename'].apply(
+                lambda f: os.path.join(config.train_audio_rare_dir, f)
+            )
+            # Add samplename column consistent with preprocessing
+            rare_train_df['samplename'] = rare_train_df['filename'].map(
+                 lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0]
+            )
+            print(f"Loaded {len(rare_train_df)} samples from rare dataset.")
+
+            # Concatenate the dataframes
+            print("Combining main and rare datasets for training...")
+            combined_train_df = pd.concat([main_train_df, rare_train_df], ignore_index=True)
+            print(f"Total training samples after combining: {len(combined_train_df)}")
+
+        except FileNotFoundError:
+            print(f"Warning: Rare training CSV not found at {config.train_rare_csv_path}. Proceeding without rare data even though USE_RARE_DATA=True.")
+            # combined_train_df remains main_train_df
+        except Exception as e:
+            print(f"Error loading or processing rare training CSV: {e}. Proceeding without rare data even though USE_RARE_DATA=True.")
+            # combined_train_df remains main_train_df
+    else:
+        print("Skipping rare species metadata for training (USE_RARE_DATA=False).")
+    # --- End Load Rare Data --- #
+
+    # Pass the potentially combined dataframe to training
+    run_training(combined_train_df, config, args.resume_fold)
 
     print("\nTraining script finished!")
