@@ -4,7 +4,7 @@ import multiprocessing
 from google.cloud import storage
 
 class Config:
-    seed = 41
+    seed = 40
     debug = False  # Master debug flag for limiting epochs, batches etc.
     debug_preprocessing_mode = False # Controls N_MAX_PREPROCESS and filename suffix
     num_workers = max(1, multiprocessing.cpu_count() - 1)
@@ -37,10 +37,14 @@ class Config:
     # These derived paths use the mount point when IS_CUSTOM_JOB is False
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
-    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes') 
-    test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes') 
+    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
+    test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
     sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
     taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
+    # --- Add paths for rare species data ---
+    train_rare_csv_path = os.path.join(DATA_ROOT, 'train_rare.csv')
+    train_audio_rare_dir = os.path.join(DATA_ROOT, 'train_audio_rare')
+    # --- End rare species data paths ---
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
     VOICE_SEPARATION_DIR = os.path.join(GCS_MOUNT_POINT, "BC25 voice separation")
@@ -65,16 +69,16 @@ class Config:
     LOAD_PREPROCESSED_DATA = True 
     REMOVE_SPEECH_INTERVALS = False
     epochs = 10
-    train_batch_size = 64
+    train_batch_size = 32
     val_batch_size = 64
-    use_amp = True
+    use_amp = False
 
     criterion = 'BCEWithLogitsLoss'
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
-    lr = 1e-3
+    lr = 5e-4
     weight_decay = 1e-5
 
     scheduler = 'CosineAnnealingLR' 

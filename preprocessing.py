@@ -35,16 +35,50 @@ def load_and_prepare_metadata(config):
         print(f"Error loading training metadata: {e}")
         return None
 
-    print(f'Found {len(train_df["primary_label"].unique())} unique species initially.')
+    print(f'Found {len(train_df["primary_label"].unique())} unique species in main dataset initially.')
 
-    working_df = train_df[['primary_label', 'rating', 'filename']].copy()
-    working_df['filepath'] = config.train_audio_dir + '/' + working_df.filename
-    working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
-    working_df['class'] = working_df.primary_label.map(lambda x: species_class_map.get(x, 'Unknown'))
+    # Prepare main dataframe
+    main_working_df = train_df[['primary_label', 'filename']].copy()
+    main_working_df['filepath'] = config.train_audio_dir + '/' + main_working_df.filename
+    main_working_df['samplename'] = main_working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+    main_working_df['class'] = main_working_df.primary_label.map(lambda x: species_class_map.get(x, 'Unknown'))
+    print(f"Processed {len(main_working_df)} samples from main dataset.")
 
+    # --- Load and process rare data --- #
+    print("Loading rare species metadata...")
+    rare_working_df = None
+    try:
+        rare_train_df = pd.read_csv(config.train_rare_csv_path, sep=';')
+        print(f'Found {len(rare_train_df["primary_label"].unique())} unique species in rare dataset initially.')
+
+        # Prepare rare dataframe
+        rare_working_df = rare_train_df[['primary_label', 'filename']].copy()
+        # Use the correct directory for rare audio files
+        rare_working_df['filepath'] = config.train_audio_rare_dir + '/' + rare_working_df.filename
+        # Ensure samplename generation is consistent
+        rare_working_df['samplename'] = rare_working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+        rare_working_df['class'] = rare_working_df.primary_label.map(lambda x: species_class_map.get(x, 'Unknown'))
+        print(f"Processed {len(rare_working_df)} samples from rare dataset.")
+
+    except FileNotFoundError:
+        print(f"Warning: Rare training CSV not found at {config.train_rare_csv_path}. Proceeding without rare data.")
+    except Exception as e:
+        print(f"Error loading or processing rare training CSV: {e}. Proceeding without rare data.")
+    # --- End Load Rare Data --- #
+
+    # --- Combine DataFrames --- #
+    if rare_working_df is not None:
+        print("Combining main and rare datasets...")
+        working_df = pd.concat([main_working_df, rare_working_df], ignore_index=True)
+    else:
+        print("Using only main dataset.")
+        working_df = main_working_df
+    # --- End Combine DataFrames --- #
+
+    # Original debug limiting logic applied AFTER combining
     if config.debug and config.N_MAX_PREPROCESS is not None:
-        print(f"DEBUG: Limiting processing to {config.N_MAX_PREPROCESS} samples.")
-        working_df = working_df.head(config.N_MAX_PREPROCESS).copy() 
+        print(f"DEBUG: Limiting processing to {config.N_MAX_PREPROCESS} samples from the combined dataset.")
+        working_df = working_df.head(config.N_MAX_PREPROCESS).copy()
 
     print(f'Total samples to process: {len(working_df)}')
     print(f'Samples by class:')

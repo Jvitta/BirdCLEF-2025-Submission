@@ -535,6 +535,7 @@ def run_training(df, config, resume_fold=0):
     print("\n--- Starting Training Run ---")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
+    print(f"Using Seed: {config.seed}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
     all_spectrograms = None # Initialize
