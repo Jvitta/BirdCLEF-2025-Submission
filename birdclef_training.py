@@ -71,12 +71,12 @@ class BirdCLEFDataset(Dataset):
         self.df = df.copy()
         self.config = config
         self.mode = mode
-        self.all_spectrograms = all_spectrograms # Store the pre-loaded dictionary
+        self.all_spectrograms = all_spectrograms # Store the pre-loaded dictionary {samplename: [spec1, spec2, ...]}
 
-        # Load taxonomy info once
+        # Load taxonomy to map labels to indices
         try:
             taxonomy_df = pd.read_csv(self.config.taxonomy_path)
-            self.species_ids = taxonomy_df['primary_label'].tolist()
+            self.species_ids = taxonomy_df['primary_label'].tolist() # Revert to potential duplicates if intended by original code
             if len(self.species_ids) != self.config.num_classes:
                  print(f"Warning: Taxonomy file has {len(self.species_ids)} species, but config.num_classes is {self.config.num_classes}. Using value from taxonomy.")
                  self.num_classes = len(self.species_ids)
@@ -93,13 +93,21 @@ class BirdCLEFDataset(Dataset):
         if 'samplename' not in self.df.columns:
             self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
-        # Print status based on whether spectrograms were pre-loaded
+        # Print status
         if self.all_spectrograms is not None:
-            print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary with {len(self.all_spectrograms)} samples.")
+            print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
+            print(f"  Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
+            # Optional: Add check if all df samplenames are in all_spectrograms keys
+            missing_keys = set(self.df['samplename']) - set(self.all_spectrograms.keys())
+            if missing_keys:
+                 print(f"  Warning: {len(missing_keys)} samplenames from the dataframe are missing in the loaded spectrograms dictionary.")
+                 print(f"    Examples: {list(missing_keys)[:5]}")
+                 # Filter dataframe to only include available spectrograms? Or handle in getitem?
+                 # For now, getitem will handle missing keys.
         elif self.config.LOAD_PREPROCESSED_DATA:
-            print(f"Dataset mode '{self.mode}': WARNING - Configured to load preprocessed data, but no dictionary provided. Will attempt on-the-fly.")
+            print(f"Dataset mode '{self.mode}': ERROR - Configured to load preprocessed data, but none provided. Dataset will be empty.")
         else:
-            print(f"Dataset mode '{self.mode}': Configured to generate spectrograms on-the-fly.")
+             print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files.")
 
     def __len__(self):
         return len(self.df)
@@ -107,34 +115,42 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         samplename = row['samplename']
+        primary_label = row['primary_label']
+        secondary_labels = row.get('secondary_labels', [])
+        filename_for_error = row.get('filename', samplename) # Use filename if available
         spec = None
 
-        # 1. Try loading from the pre-loaded dictionary
+        # --- Load preprocessed data and select a random chunk --- # 
         if self.all_spectrograms is not None:
             if samplename in self.all_spectrograms:
-                spec = self.all_spectrograms[samplename]
+                spec_list = self.all_spectrograms[samplename]
+                if isinstance(spec_list, (list, np.ndarray)) and len(spec_list) > 0:
+                     # Select one random spectrogram chunk from the list/array
+                     spec = random.choice(spec_list)
+                else:
+                     print(f"Warning: Entry for '{samplename}' in spectrogram dictionary is empty or not a list/array. Using zeros.")
+                     spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
             else:
-                # If using pre-loaded, missing sample is an issue
-                print(f"ERROR: Sample '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
-                # Fallback to zeros, or could raise an error
+                # Samplename from df not found in pre-loaded dict
+                print(f"ERROR: Samplename '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
                 spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-
-        # 2. Attempt on-the-fly generation ONLY if not using pre-loaded data
-        #    (or if pre-loading failed and all_spectrograms is None, handled in __init__ print)
-        if spec is None and not self.config.LOAD_PREPROCESSED_DATA:
-            if self.mode == "train":
-                print(f"Debug: Generating spec on-the-fly for {samplename}")
-            try:
-                spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {})
-            except Exception as e_gen:
-                 print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
-                 spec = None
-
-        # 3. Handle cases where spec is still None (generation failed or pre-load error)
+        
+        # --- On-the-fly generation (If not using preprocessed) --- #
+        elif not self.config.LOAD_PREPROCESSED_DATA:
+             if self.mode == "train":
+                 # This case should ideally not be hit if preprocessing is the primary path
+                 print(f"Debug: Generating spec on-the-fly for {samplename}") 
+             try:
+                 # Assuming fabio/vad intervals are not needed/passed for on-the-fly here
+                 spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {})
+             except Exception as e_gen:
+                  print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
+                  spec = None
+        
+        # --- Handle cases where spec is still None --- # 
         if spec is None:
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-            if self.mode == "train":
-                print(f"Warning: Failed to load or generate spec for {samplename}. Using zeros.")
+            print(f"Warning: Failed to load or generate spec for {filename_for_error}. Using zeros.")
 
         # Ensure spec is float32 before converting to tensor
         spec = spec.astype(np.float32)
@@ -144,23 +160,26 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train" and random.random() < self.config.aug_prob:
             spec = self.apply_spec_augmentations(spec)
 
-        # Encode primary and secondary labels
-        target = self.encode_label(row['primary_label'])
-        if 'secondary_labels' in row and row['secondary_labels'] not in [[''], None, np.nan]:
-            if isinstance(row['secondary_labels'], str):
-                try:
-                    secondary_labels = eval(row['secondary_labels'])
-                    if not isinstance(secondary_labels, list): secondary_labels = []
-                except: secondary_labels = []
-            else: secondary_labels = row['secondary_labels']
-            if isinstance(secondary_labels, list):
-                 for label in secondary_labels:
-                     if label in self.label_to_idx: target[self.label_to_idx[label]] = 1.0
+        # Encode labels retrieved from the dataframe row
+        target = self.encode_label(primary_label) 
+        if secondary_labels and secondary_labels not in [[''], None, np.nan]:
+             # Ensure secondary_labels is a list 
+             if isinstance(secondary_labels, str):
+                 try: 
+                     eval_labels = eval(secondary_labels) 
+                     if isinstance(eval_labels, list): secondary_labels = eval_labels
+                     else: secondary_labels = []
+                 except: secondary_labels = []
+             elif not isinstance(secondary_labels, list): secondary_labels = []
+             
+             # Apply valid secondary labels
+             for label in secondary_labels:
+                  if label in self.label_to_idx: target[self.label_to_idx[label]] = 1.0
 
         return {
             'melspec': spec,
             'target': torch.tensor(target, dtype=torch.float32),
-            'filename': row['filename']
+            'filename': filename_for_error 
         }
 
     def apply_spec_augmentations(self, spec):

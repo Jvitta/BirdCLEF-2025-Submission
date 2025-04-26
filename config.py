@@ -38,6 +38,7 @@ class Config:
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
     unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
+    unlabeled_audio_dir_chunked = os.path.join(DATA_ROOT, 'train_soundscapes_chunked')
     test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
     sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
     taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
@@ -67,7 +68,14 @@ class Config:
     num_classes = 206  
 
     LOAD_PREPROCESSED_DATA = True 
-    REMOVE_SPEECH_INTERVALS = False
+    REMOVE_SPEECH_INTERVALS = True
+    USE_RARE_DATA = False
+
+    # --- On-the-fly Preloading Configuration ---
+    # PRELOAD_CHUNK_DURATION_SEC = 7.0 # Set to None or 0 to load full files
+    PRECOMPUTE_MIXED_VERSIONS = 3 # Number of noise-mixed versions per primary file
+    MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
+
     epochs = 10
     train_batch_size = 32
     val_batch_size = 64
