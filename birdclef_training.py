@@ -29,6 +29,7 @@ from tqdm.auto import tqdm
 
 import timm
 import matplotlib.pyplot as plt
+import optuna
 
 from config import config
 import birdclef_utils as utils
@@ -547,30 +548,43 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, auc
 
-def run_training(df, config, resume_fold=0):
-    """Runs the cross-validation training loop."""
-    print("\n--- Starting Training Run ---")
+def run_training(df, config, resume_fold=0, trial=None, all_spectrograms=None):
+    """Runs the training loop. 
+    
+    Accepts pre-loaded spectrograms via the all_spectrograms argument.
+
+    If trial is provided (from Optuna), runs only the single fold specified 
+    in config.selected_folds, enables pruning, and returns the best validation 
+    AUC for that fold.
+    
+    If trial is None, runs the folds specified in config.selected_folds 
+    (can be multiple) without pruning and returns the mean OOF AUC.
+    """
+    is_hpo_trial = trial is not None
+    if is_hpo_trial:
+        print("\n--- Starting HPO Training Trial --- (Pruning Enabled)")
+    else:
+        print("\n--- Starting Standard Training Run --- (No Pruning)")
+        
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
-    all_spectrograms = None # Initialize
-    # --- Pre-load NPZ if configured --- #
-    if config.LOAD_PREPROCESSED_DATA:
+    # --- NPZ Data Loading (Only if not provided externally and configured) --- #
+    if all_spectrograms is None and config.LOAD_PREPROCESSED_DATA:
         npz_path = config.PREPROCESSED_NPZ_PATH
-        print(f"Attempting to pre-load NPZ file into RAM: {npz_path}")
+        print(f"Attempting to pre-load NPZ file into RAM (run_training): {npz_path}")
         if not os.path.exists(npz_path):
              print(f"Error: LOAD_PREPROCESSED_DATA is True, but NPZ file {npz_path} does not exist.")
              print("       Please run preprocessing.py first.")
-             sys.exit(1) # Exit if preprocessed data is required but missing
+             sys.exit(1)
         else:
             try:
                 print("Loading... (This might take a moment for large files)")
                 start_load_time = time.time()
-                # Load the entire NPZ into a dictionary in RAM
-                # Note: np.load returns a lazy NpzFile object, explicitly convert to dict
                 with np.load(npz_path) as data_archive:
+                    # Load into the function's all_spectrograms variable
                     all_spectrograms = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading NPZ into RAM")}
                 end_load_time = time.time()
                 print(f"Successfully pre-loaded {len(all_spectrograms)} samples into RAM in {end_load_time - start_load_time:.2f} seconds.")
@@ -578,9 +592,11 @@ def run_training(df, config, resume_fold=0):
                 print(f"Error loading NPZ file into RAM: {e}")
                 print("Cannot continue without preloaded data when LOAD_PREPROCESSED_DATA is True.")
                 sys.exit(1)
-    else:
-        print("\nConfigured to generate spectrograms on-the-fly (no pre-loading).")
-    # --- End Pre-loading --- #
+    elif all_spectrograms is not None:
+        print("Using pre-loaded spectrograms passed as argument.")
+    else: # Not loading and none provided
+         print("\nConfigured to generate spectrograms on-the-fly.")
+    # --- End NPZ Data Loading --- #
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
@@ -593,11 +609,15 @@ def run_training(df, config, resume_fold=0):
         working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
-    oof_scores = []
     # --- Modify History Tracking --- #
     all_folds_history = [] # Store history dict from each fold
     # --- End Modify History Tracking --- #
 
+    # --- Single Fold Best AUC (for HPO return) ---
+    # Initialize in case no folds are selected/run
+    single_fold_best_auc = 0.0 
+    # --- End Single Fold Best AUC ---
+    
     for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
         if fold < resume_fold: continue
         if fold not in config.selected_folds: continue
@@ -696,8 +716,16 @@ def run_training(df, config, resume_fold=0):
             fold_history['val_loss'].append(val_loss)
             fold_history['train_auc'].append(train_auc)
             fold_history['val_auc'].append(val_auc)
-            # --- End Appending --- #
+            # --- End Appending ---
 
+            # --- HPO Pruning --- #
+            if is_hpo_trial:
+                trial.report(val_auc, epoch) # Report intermediate val_auc
+                if trial.should_prune():
+                    print(f"  Pruning trial based on intermediate value at epoch {epoch+1}.")
+                    raise optuna.TrialPruned() # Raise exception to stop training
+            # --- End HPO Pruning ---
+            
             # --- Model Checkpointing ---
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
@@ -720,9 +748,10 @@ def run_training(df, config, resume_fold=0):
                     print(f"  Error saving model checkpoint: {e}")
 
         print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
-        oof_scores.append(best_val_auc)
+        # Store the best AUC for this fold (will be the only one if is_hpo_trial)
+        single_fold_best_auc = best_val_auc 
 
-        # --- Store history for this fold --- #
+        # --- Store history for this fold (only relevant if not HPO or if analyzing HPO runs later) --- #
         all_folds_history.append(fold_history)
         # --- End Store History --- #
 
@@ -731,91 +760,121 @@ def run_training(df, config, resume_fold=0):
         torch.cuda.empty_cache()
         gc.collect()
 
-    # --- Plotting Average Metrics Across Folds --- #
-    if all_folds_history:
-        print("\n--- Generating Average Training History Plot Across Folds ---")
+    # --- Plotting & Summary (Only for Non-HPO Runs) --- #
+    if not is_hpo_trial:
+        if all_folds_history:
+            print("\n--- Generating Average Training History Plot Across Folds ---")
 
-        # Calculate average metrics per epoch
-        num_epochs = config.epochs
-        avg_train_loss = np.zeros(num_epochs)
-        avg_val_loss = np.zeros(num_epochs)
-        avg_train_auc = np.zeros(num_epochs)
-        avg_val_auc = np.zeros(num_epochs)
-        counts_per_epoch = np.zeros(num_epochs, dtype=int)
+            # Calculate average metrics per epoch
+            num_epochs = config.epochs
+            avg_train_loss = np.zeros(num_epochs)
+            avg_val_loss = np.zeros(num_epochs)
+            avg_train_auc = np.zeros(num_epochs)
+            avg_val_auc = np.zeros(num_epochs)
+            counts_per_epoch = np.zeros(num_epochs, dtype=int)
 
-        for fold_hist in all_folds_history:
-            # Use the actual number of epochs recorded in the history for this fold
-            epochs_ran = len(fold_hist['epochs'])
-            for i in range(epochs_ran):
-                epoch_idx = i # 0-based index for arrays
-                if epoch_idx < num_epochs: # Safety check
-                    avg_train_loss[epoch_idx] += fold_hist['train_loss'][i]
-                    avg_val_loss[epoch_idx] += fold_hist['val_loss'][i]
-                    avg_train_auc[epoch_idx] += fold_hist['train_auc'][i]
-                    avg_val_auc[epoch_idx] += fold_hist['val_auc'][i]
-                    counts_per_epoch[epoch_idx] += 1
+            for fold_hist in all_folds_history:
+                # Use the actual number of epochs recorded in the history for this fold
+                epochs_ran = len(fold_hist['epochs'])
+                for i in range(epochs_ran):
+                    epoch_idx = i # 0-based index for arrays
+                    if epoch_idx < num_epochs: # Safety check
+                        avg_train_loss[epoch_idx] += fold_hist['train_loss'][i]
+                        avg_val_loss[epoch_idx] += fold_hist['val_loss'][i]
+                        avg_train_auc[epoch_idx] += fold_hist['train_auc'][i]
+                        avg_val_auc[epoch_idx] += fold_hist['val_auc'][i]
+                        counts_per_epoch[epoch_idx] += 1
 
-        # Avoid division by zero if no folds ran or epochs were skipped
-        valid_counts_mask = counts_per_epoch > 0
-        avg_train_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
-        avg_val_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
-        avg_train_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
-        avg_val_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+            # Avoid division by zero if no folds ran or epochs were skipped
+            valid_counts_mask = counts_per_epoch > 0
+            avg_train_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+            avg_val_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+            avg_train_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+            avg_val_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
 
-        epochs_axis = list(range(1, num_epochs + 1))
+            epochs_axis = list(range(1, num_epochs + 1))
 
-        # Generate Plot
-        fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+            # Generate Plot
+            fig, ax = plt.subplots(1, 2, figsize=(15, 5))
 
-        # Loss Plot
-        ax[0].plot(epochs_axis, avg_train_loss, label='Avg Train Loss')
-        ax[0].plot(epochs_axis, avg_val_loss, label='Avg Validation Loss')
-        ax[0].set_title('Average Loss vs. Epochs Across Folds')
-        ax[0].set_xlabel('Epoch')
-        ax[0].set_ylabel('Loss')
-        ax[0].legend()
-        ax[0].grid(True)
+            # Loss Plot
+            ax[0].plot(epochs_axis, avg_train_loss, label='Avg Train Loss')
+            ax[0].plot(epochs_axis, avg_val_loss, label='Avg Validation Loss')
+            ax[0].set_title('Average Loss vs. Epochs Across Folds')
+            ax[0].set_xlabel('Epoch')
+            ax[0].set_ylabel('Loss')
+            ax[0].legend()
+            ax[0].grid(True)
 
-        # AUC Plot
-        ax[1].plot(epochs_axis, avg_train_auc, label='Avg Train AUC')
-        ax[1].plot(epochs_axis, avg_val_auc, label='Avg Validation AUC')
-        ax[1].set_title('Average AUC vs. Epochs Across Folds')
-        ax[1].set_xlabel('Epoch')
-        ax[1].set_ylabel('AUC')
-        ax[1].legend()
-        ax[1].grid(True)
+            # AUC Plot
+            ax[1].plot(epochs_axis, avg_train_auc, label='Avg Train AUC')
+            ax[1].plot(epochs_axis, avg_val_auc, label='Avg Validation AUC')
+            ax[1].set_title('Average AUC vs. Epochs Across Folds')
+            ax[1].set_xlabel('Epoch')
+            ax[1].set_ylabel('AUC')
+            ax[1].legend()
+            ax[1].grid(True)
 
-        plt.tight_layout()
+            plt.tight_layout()
 
-        plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
-        os.makedirs(plot_dir, exist_ok=True) # Ensure the directory exists
-        plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
+            plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
+            os.makedirs(plot_dir, exist_ok=True) # Ensure the directory exists
+            plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
 
-        try:
-            plt.savefig(plot_save_path)
-            print(f"Saved average plot to: {plot_save_path}")
-        except Exception as e:
-            print(f"Error saving average plot to {plot_save_path}: {e}")
-        plt.close(fig) # Close the figure to free memory
+            try:
+                plt.savefig(plot_save_path)
+                print(f"Saved average plot to: {plot_save_path}")
+            except Exception as e:
+                print(f"Error saving average plot to {plot_save_path}: {e}")
+            plt.close(fig) # Close the figure to free memory
+        else:
+            print("\nNo fold histories recorded, skipping average plot generation.")
+        # --- End Plotting --- #
+        
+        # --- Non-HPO Summary --- #
+        if all_folds_history:
+            oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] # Get best AUC from each fold history
+            mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
+            print("\n" + "="*60)
+            print("Cross-Validation Training Summary:")
+            # Use actual selected folds list length for iteration, assuming it matches history order for non-hpo
+            num_folds_run = len(all_folds_history) 
+            for i in range(num_folds_run):
+                 fold_num = config.selected_folds[i] # Index based on number of folds actually run
+                 best_fold_auc = max(all_folds_history[i]['val_auc']) if all_folds_history[i]['val_auc'] else 0.0
+                 print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
+            print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
+            print("="*60)
+        else:
+            print("\nNo folds were trained.")
+            print("="*60)
+        # --- End Non-HPO Summary ---
+
+    # --- Final Return Value --- #
+    if is_hpo_trial:
+        # For HPO, return the best AUC achieved in the single fold run
+        print(f"\nReturning best AUC for HPO Trial (Fold {config.selected_folds[0]}): {single_fold_best_auc:.4f}")
+        return single_fold_best_auc
     else:
-        print("\nNo fold histories recorded, skipping average plot generation.")
-    # --- End Plotting --- #
-
-    print("\n" + "="*60)
-    print("Cross-Validation Training Summary:")
-    if oof_scores:
-        mean_oof_auc = np.mean(oof_scores)
-        for i, score in enumerate(oof_scores):
-            fold_num = config.selected_folds[i]
-            print(f"  Fold {fold_num}: Best Val AUC = {score:.4f}")
-        print(f"\nMean OOF AUC across {len(oof_scores)} trained folds: {mean_oof_auc:.4f}")
-    else:
-        print("No folds were trained.")
-        mean_oof_auc = 0.0 
-    print("="*60)
-
-    # Return mean_oof_auc (might be used if called from elsewhere later)
-    return mean_oof_auc
+        # For standard runs, calculate and return the mean OOF AUC if multiple folds ran
+        if all_folds_history:
+            # Recalculate mean OOF from the best scores recorded in histories if needed
+            oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] # Get best AUC from each fold history
+            mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
+            print("\n" + "="*60)
+            print("Cross-Validation Training Summary:")
+            for i, fold_hist in enumerate(all_folds_history):
+                 fold_num = config.selected_folds[i] # Assumes selected_folds matches history order
+                 best_fold_auc = max(fold_hist['val_auc']) if fold_hist['val_auc'] else 0.0
+                 print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
+            print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
+            print("="*60)
+            return mean_oof_auc
+        else:
+            print("No folds were trained.")
+            print("="*60)
+            return 0.0
+    # --- End Final Return Value --- #
 
 if __name__ == "__main__":
     # --- Argument Parsing --- #
@@ -843,6 +902,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Pass the resume_fold argument to run_training
-    run_training(main_train_df, config, args.resume_fold) 
+    # Note: For standard run, data loading happens inside run_training if configured
+    run_training(main_train_df, config, args.resume_fold)
 
     print("\nTraining script finished!")
