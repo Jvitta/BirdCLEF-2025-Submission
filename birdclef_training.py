@@ -127,7 +127,10 @@ class BirdCLEFDataset(Dataset):
                 spec_list = self.all_spectrograms[samplename]
                 if isinstance(spec_list, (list, np.ndarray)) and len(spec_list) > 0:
                      # Select one random spectrogram chunk from the list/array
-                     spec = random.choice(spec_list)
+                     if self.mode == 'train':
+                         spec = random.choice(spec_list)
+                     else: # For validation or test mode, always take the first chunk
+                         spec = spec_list[0]
                 else:
                      print(f"Warning: Entry for '{samplename}' in spectrogram dictionary is empty or not a list/array. Using zeros.")
                      spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
