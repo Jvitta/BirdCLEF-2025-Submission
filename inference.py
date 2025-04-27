@@ -375,10 +375,14 @@ class BirdCLEF2025Pipeline:
             
             if predictions.shape[0] > 1:
                 # Smooth the predictions using neighboring segments
-                new_predictions[0] = (predictions[0] * 0.8) + (predictions[1] * 0.2)
-                new_predictions[-1] = (predictions[-1] * 0.8) + (predictions[-2] * 0.2)
+                neighbor_weight = self.config.smoothing_neighbor_weight
+                center_weight = 1.0 - (2 * neighbor_weight)
+                edge_weight = 1.0 - neighbor_weight
+
+                new_predictions[0] = (predictions[0] * edge_weight) + (predictions[1] * neighbor_weight)
+                new_predictions[-1] = (predictions[-1] * edge_weight) + (predictions[-2] * neighbor_weight)
                 for i in range(1, predictions.shape[0]-1):
-                    new_predictions[i] = (predictions[i-1] * 0.2) + (predictions[i] * 0.6) + (predictions[i+1] * 0.2)
+                    new_predictions[i] = (predictions[i-1] * neighbor_weight) + (predictions[i] * center_weight) + (predictions[i+1] * neighbor_weight)
             # Replace the smoothed values in the submission dataframe
             sub.iloc[idx, 1:] = new_predictions
         
