@@ -157,7 +157,7 @@ class BirdCLEFDataset(Dataset):
         spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
 
         # Apply augmentations only in training mode
-        if self.mode == "train" and random.random() < self.config.aug_prob:
+        if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
         # Encode labels retrieved from the dataframe row
@@ -185,29 +185,27 @@ class BirdCLEFDataset(Dataset):
     def apply_spec_augmentations(self, spec):
         """Apply augmentations to spectrogram (User's version)."""
         # Time masking (horizontal stripes)
-        if random.random() < 0.5:
+        if random.random() < self.config.time_mask_prob:
             num_masks = random.randint(1, 3)
-            # Using fixed width from user version
             for _ in range(num_masks):
-                width = random.randint(5, 20)
+                width = random.randint(5, self.config.max_time_mask_width) 
                 start = random.randint(0, max(0, spec.shape[2] - width))
                 spec[0, :, start:start+width] = 0
 
         # Frequency masking (vertical stripes)
-        if random.random() < 0.5:
+        if random.random() < self.config.freq_mask_prob: 
             num_masks = random.randint(1, 3)
-            # Using fixed height from user version
             for _ in range(num_masks):
-                height = random.randint(5, 20)
+                height = random.randint(5, self.config.max_freq_mask_height) 
                 start = random.randint(0, max(0, spec.shape[1] - height))
                 spec[0, start:start+height, :] = 0
 
-        # Random brightness/contrast (User's version)
-        if random.random() < 0.5:
+        # Random brightness/contrast
+        if random.random() < self.config.contrast_prob:
             gain = random.uniform(0.8, 1.2)
             bias = random.uniform(-0.1, 0.1)
             spec = spec * gain + bias
-            spec = torch.clamp(spec, 0, 1)
+            spec = torch.clamp(spec, 0, 1) 
 
         return spec
 

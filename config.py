@@ -91,8 +91,20 @@ class Config:
     min_lr = 1e-6
     T_max = epochs 
 
-    aug_prob = 0.5
-    mixup_alpha = 0.5 
+    # --- Augmentation Parameters ---
+    # Mixup alpha (0 = no mixup)
+    mixup_alpha = 0.5
+    # Time masking probability (used if > 0)
+    time_mask_prob = 0.25
+    # Frequency masking probability (used if > 0)
+    freq_mask_prob = 0.25
+    # Contrast augmentation probability (used if > 0)
+    contrast_prob = 0.25
+    # Maximum width (time axis) for time masking
+    max_time_mask_width = 20
+    # Maximum height (frequency axis) for frequency masking
+    max_freq_mask_height = 20
+    # --- End Augmentation Parameters ---
 
     inference_batch_size = 16
     use_tta = False
