@@ -105,4 +105,6 @@ class Config:
     debug_limit_batches = 5 
     debug_limit_files = 3 
 
+    # --- New: Smoothing Parameter ---
+    smoothing_neighbor_weight = 0.2 # Weight for neighboring segments in post-processing smoothing
 config = Config()
