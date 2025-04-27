@@ -71,10 +71,8 @@ class Config:
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
 
-    # --- On-the-fly Preloading Configuration ---
-    # PRELOAD_CHUNK_DURATION_SEC = 7.0 # Set to None or 0 to load full files
-    PRECOMPUTE_MIXED_VERSIONS = 3 # Number of noise-mixed versions per primary file
-    MIXING_RATIO_PRIMARY = 0.8 # Weight of primary audio in mix (background = 1.0 - this)
+    PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
+    MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
     epochs = 10
     train_batch_size = 32
