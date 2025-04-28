@@ -59,7 +59,7 @@ def objective(trial, preloaded_data):
     # --- End Hyperparameter Suggestions ---
 
     # --- Trial Configuration ---
-    cfg.epochs = 15 # Set epochs to 15 for HPO trials
+    cfg.epochs = 25 # Set epochs to 25 for HPO trials
     print(f"INFO: Running HPO trial with {cfg.epochs} epochs.")
 
     cfg.n_fold = 5 # Use full 5 folds for HPO evaluation
@@ -103,6 +103,7 @@ def objective(trial, preloaded_data):
 
     except optuna.TrialPruned:
         print(f"--- Optuna Trial {trial.number} (Fold {fold_to_run}) was pruned ---")
+        raise # Re-raise the exception to signal pruning to Optuna
 
     except Exception as e:
         print(f"\n--- Non-pruning Exception occurred during Optuna trial {trial.number} ---")
@@ -141,7 +142,7 @@ if __name__ == "__main__":
         os.makedirs(base_config.OUTPUT_DIR, exist_ok=True)
 
     # Define HPO settings for clarity
-    hpo_trial_epochs = 15 # Updated HPO epochs
+    hpo_trial_epochs = 25 # Updated HPO epochs
     hpo_trial_folds = [0, 1, 2, 3, 4] # Updated HPO folds
 
     print(f"\n--- Starting Optuna Optimization ---")
