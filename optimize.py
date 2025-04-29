@@ -94,13 +94,6 @@ def objective(trial, preloaded_data):
         else:
              print(f"\n--- Finished Optuna Trial {trial.number} (Fold {fold_to_run}) | Best Val AUC for Fold: {single_fold_best_auc:.4f} ---")
 
-        # --- Optuna Pruning Check (REMOVED) ---
-        # Pruning should now be handled *inside* run_training during the epoch loop
-        # trial.report(mean_oof_auc, step=cfg.epochs) # No longer report final here
-        # if trial.should_prune(): # No longer check here
-        #     raise optuna.TrialPruned()
-        # --- End Optuna Pruning Check ---
-
     except optuna.TrialPruned:
         print(f"--- Optuna Trial {trial.number} (Fold {fold_to_run}) was pruned ---")
         raise # Re-raise the exception to signal pruning to Optuna
@@ -112,18 +105,19 @@ def objective(trial, preloaded_data):
         print(f"--- End of traceback for trial {trial.number} ---")
         single_fold_best_auc = 0.0 # Report 0.0 AUC for failed trials
 
-    # Clean up trial-specific model directory (optional)
-    # try:
-    #     shutil.rmtree(trial_model_dir)
-    # except OSError as e:
-    #     print(f"Warning: Could not remove trial directory {trial_model_dir}: {e}")
+    # Clean up trial-specific model directory (Uncommented to save space)
+    try:
+        shutil.rmtree(trial_model_dir)
+        print(f"Removed trial directory: {trial_model_dir}")
+    except OSError as e:
+        print(f"Warning: Could not remove trial directory {trial_model_dir}: {e}")
 
     return single_fold_best_auc
 
 if __name__ == "__main__":
     # --- Study Configuration ---
     study_name = "BirdCLEF_HPO_GCP_Augmentation_LR_WD" # Updated study name
-    n_trials = 100 # Increased trials due to single-fold evaluation
+    n_trials = 300 # Increased trials due to single-fold evaluation
 
     # --- Define paths for GCP --- #
     # Database will be stored in the OUTPUT_DIR defined in config.py

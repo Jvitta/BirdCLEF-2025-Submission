@@ -24,6 +24,7 @@ from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
 from torch.amp import GradScaler
+from losses import FocalLossBCE
 
 from tqdm.auto import tqdm
 
@@ -299,14 +300,7 @@ class BirdCLEFModel(nn.Module):
             self.mixup_alpha = config.mixup_alpha
             print(f"Mixup enabled with alpha={self.mixup_alpha}")
 
-    def forward(self, x, targets=None):
-        # Use original forward logic
-        if self.training and self.mixup_enabled and targets is not None:
-            mixed_x, targets_a, targets_b, lam = self.mixup_data(x, targets)
-            x = mixed_x
-        else:
-            targets_a, targets_b, lam = None, None, None
-
+    def forward(self, x):
         features = self.backbone(x)
 
         if isinstance(features, dict):
@@ -317,28 +311,20 @@ class BirdCLEFModel(nn.Module):
             features = features.view(features.size(0), -1)
 
         logits = self.classifier(features)
-
-        if self.training and self.mixup_enabled and targets is not None:
-            loss = self.mixup_criterion(F.binary_cross_entropy_with_logits,
-                                       logits, targets_a, targets_b, lam)
-            return logits, loss
-
         return logits
 
-    def mixup_data(self, x, targets):
-        """Applies mixup augmentation (User's version)."""
-        batch_size = x.size(0)
-        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-        indices = torch.randperm(batch_size, device=x.device)
-        mixed_x = lam * x + (1 - lam) * x[indices]
-        return mixed_x, targets, targets[indices], lam
-
-    def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
-        """Applies mixup to the loss function (User's version)."""
-        # Assuming criterion is like BCEWithLogitsLoss which handles reduction internally
-        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
 # --- Helper Functions --- #
+
+def mixup_data(x, targets, alpha, device):
+    """Applies mixup augmentation.
+    Returns mixed inputs, targets_a, targets_b, and lambda.
+    """
+    batch_size = x.size(0)
+    lam = np.random.beta(alpha, alpha)
+    indices = torch.randperm(batch_size, device=device)
+    mixed_x = lam * x + (1 - lam) * x[indices]
+    targets_a, targets_b = targets, targets[indices]
+    return mixed_x, targets_a, targets_b, lam
 
 def get_optimizer(model, config): # Pass config object
     """Creates optimizer based on config settings."""
@@ -401,6 +387,11 @@ def get_criterion(config): # Pass config object
     """Creates loss criterion based on config settings."""
     if config.criterion == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss()
+    elif config.criterion == 'FocalLossBCE':
+        # Uses hardcoded defaults in losses.py (alpha=0.25, gamma=2, bce_w=0.6, focal_w=1.4) 
+        # as per user preference
+        print("INFO: Using FocalLossBCE with parameters hardcoded in losses.py")
+        criterion = FocalLossBCE()
     else:
         raise NotImplementedError(f"Criterion '{config.criterion}' not implemented")
     return criterion
@@ -419,10 +410,7 @@ def calculate_auc(targets, outputs):
                 class_auc = roc_auc_score(targets[:, i], probs[:, i])
                 aucs.append(class_auc)
             except ValueError as e:
-                # This can happen if only one class is present in targets for this class
-                # print(f"Warning: AUC calculation error for class {i}: {e}")
-                # Don't append anything if calculation fails
-                pass # Suppress warning for cleaner logs
+                pass
 
     return np.mean(aucs) if aucs else 0.0
 
@@ -435,6 +423,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
     all_targets = []
     all_outputs = []
     use_amp = scaler.is_enabled() # Check if AMP is active via the scaler
+    mixup_active = model.mixup_enabled # Check if model has mixup enabled
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
 
@@ -444,8 +433,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
             continue
 
         try:
-            inputs = batch['melspec'].to(device)
-            targets = batch['target'].to(device)
+            inputs_orig = batch['melspec'].to(device)
+            targets_orig = batch['target'].to(device)
         except (AttributeError, TypeError) as e:
             print(f"Error: Skipping batch {step} due to unexpected format: {e}")
             continue
@@ -454,15 +443,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
 
         # --- AMP: autocast context --- #
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            # Pass targets only if mixup is enabled
-            outputs = model(inputs, targets if model.training and model.mixup_enabled else None)
-
-            # Handle model output (logits or logits, loss)
-            if isinstance(outputs, tuple):
-                logits, loss = outputs # Assume loss is already calculated correctly (e.g., with mixup)
+            # Apply mixup BEFORE model if enabled
+            if mixup_active:
+                inputs, targets_a, targets_b, lam = mixup_data(
+                    inputs_orig, targets_orig, model.mixup_alpha, device
+                )
             else:
-                logits = outputs
-                loss = criterion(logits, targets)
+                inputs = inputs_orig
+            
+            # Model only returns logits now
+            logits = model(inputs)
+
+            # Calculate loss AFTER model, potentially using mixup targets
+            if mixup_active:
+                loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
+            else:
+                loss = criterion(logits, targets_orig)
         # --- End autocast --- #
 
         # --- AMP: Scale loss and step --- #
@@ -471,8 +467,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
         scaler.update()
         # --- End AMP --- #
 
+        # Use original targets for AUC calculation
         outputs_np = logits.detach().float().cpu().numpy() # Ensure float32 for numpy ops
-        targets_np = targets.detach().cpu().numpy()
+        targets_np = targets_orig.detach().cpu().numpy()
 
         # Scheduler step (only for OneCycleLR here, matching original)
         if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
