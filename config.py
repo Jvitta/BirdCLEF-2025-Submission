@@ -37,7 +37,6 @@ class Config:
     # These derived paths use the mount point when IS_CUSTOM_JOB is False
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
-    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
     test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
     sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
     taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
@@ -45,7 +44,7 @@ class Config:
     train_audio_rare_dir = os.path.join(DATA_ROOT, 'train_audio_rare')
     train_rare_csv_path = os.path.join(DATA_ROOT, 'train_rare.csv')
     # Pseudo-label paths
-    train_audio_pseudo_dir = os.path.join(DATA_ROOT, 'train_audio_pseudo')
+    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
     train_pseudo_csv_path = os.path.join(DATA_ROOT, 'train_pseudo.csv')
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
