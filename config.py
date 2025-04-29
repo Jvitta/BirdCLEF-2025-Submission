@@ -80,7 +80,7 @@ class Config:
     val_batch_size = 64
     use_amp = False
 
-    criterion = 'BCEWithLogitsLoss'
+    criterion = 'FocalLossBCE'
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 

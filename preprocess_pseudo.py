@@ -29,7 +29,7 @@ def _process_pseudo_label_row(args):
     audio_path = os.path.join(config.unlabeled_audio_dir, filename)
 
     # Unique key for this specific segment
-    segment_key = f"{filename}_{int(start_time)}_{int(end_time)}_{primary_label}"
+    segment_key = f"{filename}_{int(start_time)}_{int(end_time)}"
     
     try:
         if not os.path.exists(audio_path):

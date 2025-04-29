@@ -122,19 +122,40 @@ class BirdCLEFDataset(Dataset):
         filename_for_error = row.get('filename', samplename) # Use filename if available
         spec = None
 
-        # --- Load preprocessed data and select a random chunk --- # 
+        # --- Load preprocessed data and select a random chunk --- #
         if self.all_spectrograms is not None:
             if samplename in self.all_spectrograms:
-                spec_list = self.all_spectrograms[samplename]
-                if isinstance(spec_list, (list, np.ndarray)) and len(spec_list) > 0:
-                     # Select one random spectrogram chunk from the list/array
-                     if self.mode == 'train':
-                         spec = random.choice(spec_list)
-                     else: # For validation or test mode, always take the first chunk
-                         spec = spec_list[0]
+                # spec_list = self.all_spectrograms[samplename]
+                # if isinstance(spec_list, (list, np.ndarray)) and len(spec_list) > 0:
+                #      # Select one random spectrogram chunk from the list/array
+                #      if self.mode == 'train':
+                #          spec = random.choice(spec_list)
+                #      else: # For validation or test mode, always take the first chunk
+                #          spec = spec_list[0]
+                # else:
+                #      print(f"Warning: Entry for '{samplename}' in spectrogram dictionary is empty or not a list/array. Using zeros.")
+                #      spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+                
+                spec_data = self.all_spectrograms[samplename] # Can be list or single array
+
+                # Check if it's list-like (primary data) or a single array (pseudo data)
+                # Added check to ensure list elements aren't single numbers if spec_data happens to be a numpy array incorrectly interpreted as list-like
+                if isinstance(spec_data, list) or (isinstance(spec_data, np.ndarray) and spec_data.ndim > 1 and not np.isscalar(spec_data[0])):
+                    if len(spec_data) > 0:
+                        # Original data: Select one random spectrogram chunk from the list/array
+                        if self.mode == 'train':
+                            spec = random.choice(spec_data)
+                        else: # For validation or test mode, always take the first chunk
+                            spec = spec_data[0]
+                    else:
+                        print(f"Warning: Entry for '{samplename}' (list-like) in spectrogram dictionary is empty. Using zeros.")
+                        spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+                elif isinstance(spec_data, np.ndarray) and spec_data.ndim >= 2: # Check if it's a single numpy array (pseudo)
+                    # Pseudo data: Use the single spectrogram directly
+                    spec = spec_data
                 else:
-                     print(f"Warning: Entry for '{samplename}' in spectrogram dictionary is empty or not a list/array. Using zeros.")
-                     spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+                    print(f"Warning: Entry for '{samplename}' has unexpected format: {type(spec_data)}. Using zeros.")
+                    spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
             else:
                 # Samplename from df not found in pre-loaded dict
                 print(f"ERROR: Samplename '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
@@ -571,52 +592,33 @@ def run_training(df, config, resume_fold=0, trial=None, all_spectrograms=None):
     print(f"Using Seed: {config.seed}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
-    # --- NPZ Data Loading (Only if not provided externally and configured) --- #
-    if all_spectrograms is None and config.LOAD_PREPROCESSED_DATA:
-        npz_path = config.PREPROCESSED_NPZ_PATH
-        print(f"Attempting to pre-load NPZ file into RAM (run_training): {npz_path}")
-        if not os.path.exists(npz_path):
-             print(f"Error: LOAD_PREPROCESSED_DATA is True, but NPZ file {npz_path} does not exist.")
-             print("       Please run preprocessing.py first.")
-             sys.exit(1)
-        else:
-            try:
-                print("Loading... (This might take a moment for large files)")
-                start_load_time = time.time()
-                with np.load(npz_path) as data_archive:
-                    # Load into the function's all_spectrograms variable
-                    all_spectrograms = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading NPZ into RAM")}
-                end_load_time = time.time()
-                print(f"Successfully pre-loaded {len(all_spectrograms)} samples into RAM in {end_load_time - start_load_time:.2f} seconds.")
-            except Exception as e:
-                print(f"Error loading NPZ file into RAM: {e}")
-                print("Cannot continue without preloaded data when LOAD_PREPROCESSED_DATA is True.")
-                sys.exit(1)
-    elif all_spectrograms is not None:
-        print("Using pre-loaded spectrograms passed as argument.")
-    else: # Not loading and none provided
-         print("\nConfigured to generate spectrograms on-the-fly.")
-    # --- End NPZ Data Loading --- #
+    # --- NPZ Data Loading moved to the main script block --- #
+    # Removed the NPZ loading logic from here. 
+    # `all_spectrograms` is now expected as an argument.
+    if all_spectrograms is not None:
+        print(f"run_training received {len(all_spectrograms)} pre-loaded samples.")
+    elif config.LOAD_PREPROCESSED_DATA:
+        print("Warning: run_training received no pre-loaded samples, but LOAD_PREPROCESSED_DATA is True.")
+    else:
+        print("run_training configured for on-the-fly generation (all_spectrograms is None).")
+    # --- End NPZ Data Loading Removal --- #
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
     working_df = df.copy()
 
-    if 'filepath' not in working_df.columns:
-        working_df['filepath'] = working_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
+    # --- Samplename generation moved to the main script block --- #
+    # Removed samplename generation logic
     if 'samplename' not in working_df.columns:
-        working_df['samplename'] = working_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+        print("CRITICAL ERROR: 'samplename' column missing from DataFrame passed to run_training. Exiting.")
+        sys.exit(1)
+    # --- End Samplename Generation Removal --- #
 
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
-    # --- Modify History Tracking --- #
-    all_folds_history = [] # Store history dict from each fold
-    # --- End Modify History Tracking --- #
-
-    # --- Single Fold Best AUC (for HPO return) ---
-    # Initialize in case no folds are selected/run
+   
+    all_folds_history = []
     single_fold_best_auc = 0.0 
-    # --- End Single Fold Best AUC ---
     
     for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
         if fold < resume_fold: continue
@@ -874,10 +876,8 @@ def run_training(df, config, resume_fold=0, trial=None, all_spectrograms=None):
             print("No folds were trained.")
             print("="*60)
             return 0.0
-    # --- End Final Return Value --- #
 
 if __name__ == "__main__":
-    # --- Argument Parsing --- #
     parser = argparse.ArgumentParser(description="BirdCLEF Training Script")
     parser.add_argument(
         '--resume_fold', 
@@ -887,22 +887,119 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     print(f"Resume Fold specified: {args.resume_fold}")
-    # --- End Argument Parsing --- #
 
     print("\n--- Initializing Training Script ---")
+    print(f"Using configuration: LOAD_PREPROCESSED_DATA={config.LOAD_PREPROCESSED_DATA}, USE_PSEUDO_LABELS={config.USE_PSEUDO_LABELS}")
 
+    all_spectrograms = None # Initialize as None
+
+    # --- Load Main Training Data --- 
     print("Loading main training metadata...")
     try:
         main_train_df = pd.read_csv(config.train_csv_path)
-    except FileNotFoundError:
-        print(f"Error: Main training CSV not found at {config.train_csv_path}. Exiting.")
-        sys.exit(1)
+        # Ensure filepath exists for potential on-the-fly generation or checks
+        main_train_df['filepath'] = main_train_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
+        # Create samplename for main data
+        main_train_df['samplename'] = main_train_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+        print(f"Loaded {len(main_train_df)} main training samples.")
     except Exception as e:
-        print(f"Error loading main training CSV: {e}. Exiting.")
+        print(f"CRITICAL ERROR loading main training CSV {config.train_csv_path}: {e}. Exiting.")
         sys.exit(1)
 
-    # Pass the resume_fold argument to run_training
-    # Note: For standard run, data loading happens inside run_training if configured
-    run_training(main_train_df, config, args.resume_fold)
+    training_df = main_train_df # Start with main data
+
+    # --- Load Preprocessed Spectrograms (if configured) --- #
+    if config.LOAD_PREPROCESSED_DATA:
+        all_spectrograms = {} # Initialize as empty dict if loading
+        
+        # Load PRIMARY spectrograms
+        primary_npz_path = config.PREPROCESSED_NPZ_PATH
+        print(f"Attempting to load primary spectrograms from: {primary_npz_path}")
+        if os.path.exists(primary_npz_path):
+            try:
+                start_load_time = time.time()
+                with np.load(primary_npz_path) as data_archive:
+                    primary_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Primary Specs")}
+                end_load_time = time.time()
+                all_spectrograms.update(primary_specs)
+                print(f"Successfully loaded {len(primary_specs)} primary samples in {end_load_time - start_load_time:.2f} seconds.")
+                del primary_specs; gc.collect()
+            except Exception as e:
+                print(f"ERROR loading primary NPZ file {primary_npz_path}: {e}")
+                # Decide if this is critical - maybe continue without preloaded?
+                print("Cannot continue without primary preloaded data. Exiting.")
+                sys.exit(1)
+        else:
+            print(f"ERROR: Primary NPZ file {primary_npz_path} not found, but LOAD_PREPROCESSED_DATA is True. Exiting.")
+            sys.exit(1)
+
+        # --- Conditionally Load PSEUDO-LABEL Data & Spectrograms --- #
+        if config.USE_PSEUDO_LABELS:
+            print("\n--- Loading Pseudo-Label Data (USE_PSEUDO_LABELS=True) ---")
+            
+            # Load pseudo metadata
+            try:
+                pseudo_labels_df = pd.read_csv(config.train_pseudo_csv_path)
+                if not pseudo_labels_df.empty:
+                    # Create samplename for pseudo data (matches preprocess_pseudo.py key)
+                    pseudo_labels_df['samplename'] = pseudo_labels_df.apply(
+                        lambda row: f"{row['filename']}_{int(row['start_time'])}_{int(row['end_time'])}", axis=1
+                    )
+                     # Add filepath for pseudo data (points to unlabeled audio)
+                    pseudo_labels_df['filepath'] = pseudo_labels_df['filename'].apply(lambda f: os.path.join(config.unlabeled_audio_dir, f))
+                    print(f"Loaded {len(pseudo_labels_df)} pseudo labels.")
+                    
+                    # Load pseudo spectrograms
+                    pseudo_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, 'pseudo_spectrograms.npz')
+                    print(f"Attempting to load pseudo spectrograms from: {pseudo_npz_path}")
+                    if os.path.exists(pseudo_npz_path):
+                        try:
+                            start_load_time = time.time()
+                            with np.load(pseudo_npz_path) as data_archive:
+                                pseudo_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Pseudo Specs")}
+                            end_load_time = time.time()
+                            all_spectrograms.update(pseudo_specs) # Merge into the main dictionary
+                            print(f"Successfully loaded and merged {len(pseudo_specs)} pseudo samples in {end_load_time - start_load_time:.2f} seconds.")
+                            del pseudo_specs; gc.collect()
+                            
+                            # Concatenate DataFrames only AFTER successfully loading specs
+                            training_df = pd.concat([training_df, pseudo_labels_df], ignore_index=True)
+                            print(f"Combined DataFrame size: {len(training_df)} samples.")
+                            
+                        except Exception as e:
+                             print(f"ERROR loading pseudo NPZ file {pseudo_npz_path}: {e}")
+                             print("Continuing training without pseudo-labels due to NPZ loading error.")
+                    else:
+                        print(f"WARNING: Pseudo NPZ file {pseudo_npz_path} not found. Skipping pseudo-label data.")
+                else:
+                    print("Pseudo labels CSV found but is empty. Skipping.")
+
+            except FileNotFoundError:
+                print(f"WARNING: Pseudo labels CSV {config.train_pseudo_csv_path} not found. Skipping pseudo-label data.")
+            except Exception as e:
+                print(f"ERROR loading pseudo labels CSV {config.train_pseudo_csv_path}: {e}")
+                print("Continuing training without pseudo-labels due to CSV loading error.")
+        else:
+            print("\nSkipping pseudo-label data (USE_PSEUDO_LABELS=False).")
+
+    else: 
+        print("\nSkipping preprocessed data loading (LOAD_PREPROCESSED_DATA=False). Will generate on-the-fly.")
+        # Ensure samplename exists even for on-the-fly
+        if 'samplename' not in training_df.columns: # Should have been created above
+            training_df['samplename'] = training_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+
+    # Final check on combined dataframe and spectrograms
+    print(f"\nFinal training dataframe size: {len(training_df)} samples.")
+    if all_spectrograms is not None:
+         print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
+         # Optional: Check for missing keys between final df and loaded specs
+         missing_keys = set(training_df['samplename']) - set(all_spectrograms.keys())
+         if missing_keys:
+              print(f"  WARNING: {len(missing_keys)} samplenames in the final dataframe are missing from the loaded spectrograms!")
+              print(f"    Examples: {list(missing_keys)[:10]}")
+              # Potentially filter df: training_df = training_df[training_df['samplename'].isin(all_spectrograms.keys())]
+
+    # --- Run Training --- #
+    run_training(training_df, config, args.resume_fold, all_spectrograms=all_spectrograms)
 
     print("\nTraining script finished!")
