@@ -38,14 +38,15 @@ class Config:
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
     unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
-    unlabeled_audio_dir_chunked = os.path.join(DATA_ROOT, 'train_soundscapes_chunked')
     test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
     sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
     taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
-    # --- Add paths for rare species data ---
-    train_rare_csv_path = os.path.join(DATA_ROOT, 'train_rare.csv')
+    # Rare species data paths
     train_audio_rare_dir = os.path.join(DATA_ROOT, 'train_audio_rare')
-    # --- End rare species data paths ---
+    train_rare_csv_path = os.path.join(DATA_ROOT, 'train_rare.csv')
+    # Pseudo-label paths
+    train_audio_pseudo_dir = os.path.join(DATA_ROOT, 'train_audio_pseudo')
+    train_pseudo_csv_path = os.path.join(DATA_ROOT, 'train_pseudo.csv')
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
     VOICE_SEPARATION_DIR = os.path.join(GCS_MOUNT_POINT, "BC25 voice separation")
@@ -70,11 +71,12 @@ class Config:
     LOAD_PREPROCESSED_DATA = True 
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
+    USE_PSEUDO_LABELS = False
 
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
-    epochs = 12
+    epochs = 10
     train_batch_size = 32
     val_batch_size = 64
     use_amp = False
@@ -84,20 +86,25 @@ class Config:
     selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
-    lr = 5e-4
-    weight_decay = 1e-5
+    lr = 0.0005759790964526907
+    min_lr = 1e-6
+    weight_decay = 1.3461944764663799e-05
 
     scheduler = 'CosineAnnealingLR' 
-    min_lr = 1e-6
     T_max = epochs 
 
-    aug_prob = 0.5
-    mixup_alpha = 0.5 
+    # --- Augmentation Parameters ---
+    mixup_alpha = 0.3901120986458487
+    time_mask_prob = 0.446875227279031
+    freq_mask_prob = 0.263834841662896
+    contrast_prob = 0.445985839941462
+    max_time_mask_width = 30
+    max_freq_mask_height = 26
 
     inference_batch_size = 16
     use_tta = False
     tta_count = 3
-    threshold = 0.7 
+    threshold = 0.90
 
     use_specific_folds_inference = False
     inference_folds = [0, 1]
@@ -106,5 +113,5 @@ class Config:
     debug_limit_files = 3 
 
     # --- New: Smoothing Parameter ---
-    smoothing_neighbor_weight = 0.2 # Weight for neighboring segments in post-processing smoothing
+    smoothing_neighbor_weight = 0.125
 config = Config()
