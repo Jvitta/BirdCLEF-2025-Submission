@@ -70,7 +70,7 @@ class Config:
     LOAD_PREPROCESSED_DATA = True 
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
-    USE_PSEUDO_LABELS = False
+    USE_PSEUDO_LABELS = True
 
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)

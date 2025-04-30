@@ -412,7 +412,7 @@ def get_criterion(config): # Pass config object
         # Uses hardcoded defaults in losses.py (alpha=0.25, gamma=2, bce_w=0.6, focal_w=1.4) 
         # as per user preference
         print("INFO: Using FocalLossBCE with parameters hardcoded in losses.py")
-        criterion = FocalLossBCE()
+        criterion = FocalLossBCE(config=config)
     else:
         raise NotImplementedError(f"Criterion '{config.criterion}' not implemented")
     return criterion
@@ -896,12 +896,17 @@ if __name__ == "__main__":
     # --- Load Main Training Data --- 
     print("Loading main training metadata...")
     try:
-        main_train_df = pd.read_csv(config.train_csv_path)
-        # Ensure filepath exists for potential on-the-fly generation or checks
-        main_train_df['filepath'] = main_train_df['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
-        # Create samplename for main data
-        main_train_df['samplename'] = main_train_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
-        print(f"Loaded {len(main_train_df)} main training samples.")
+        main_train_df_full = pd.read_csv(config.train_csv_path)
+        # Create required derived columns
+        main_train_df_full['filepath'] = main_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
+        main_train_df_full['samplename'] = main_train_df_full.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
+        
+        # Select only necessary columns for training
+        required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename']
+        main_train_df = main_train_df_full[required_cols_main].copy()
+        print(f"Loaded and selected columns for {len(main_train_df)} main training samples.")
+        del main_train_df_full; gc.collect()
+
     except Exception as e:
         print(f"CRITICAL ERROR loading main training CSV {config.train_csv_path}: {e}. Exiting.")
         sys.exit(1)
@@ -939,17 +944,21 @@ if __name__ == "__main__":
             
             # Load pseudo metadata
             try:
-                pseudo_labels_df = pd.read_csv(config.train_pseudo_csv_path)
-                if not pseudo_labels_df.empty:
-                    # Create samplename for pseudo data (matches preprocess_pseudo.py key)
-                    pseudo_labels_df['samplename'] = pseudo_labels_df.apply(
+                pseudo_labels_df_full = pd.read_csv(config.train_pseudo_csv_path)
+                if not pseudo_labels_df_full.empty:
+                    # Create required derived columns
+                    pseudo_labels_df_full['samplename'] = pseudo_labels_df_full.apply(
                         lambda row: f"{row['filename']}_{int(row['start_time'])}_{int(row['end_time'])}", axis=1
                     )
-                     # Add filepath for pseudo data (points to unlabeled audio)
-                    pseudo_labels_df['filepath'] = pseudo_labels_df['filename'].apply(lambda f: os.path.join(config.unlabeled_audio_dir, f))
-                    print(f"Loaded {len(pseudo_labels_df)} pseudo labels.")
+                    pseudo_labels_df_full['filepath'] = pseudo_labels_df_full['filename'].apply(lambda f: os.path.join(config.unlabeled_audio_dir, f))
                     
-                    # Load pseudo spectrograms
+                    # Select only necessary columns for training (note: secondary_labels will be NaN)
+                    required_cols_pseudo = ['samplename', 'primary_label', 'filepath', 'filename'] # Intentionally omit secondary_labels
+                    pseudo_labels_df = pseudo_labels_df_full[required_cols_pseudo].copy()
+                    print(f"Loaded and selected columns for {len(pseudo_labels_df)} pseudo labels.")
+                    del pseudo_labels_df_full; gc.collect()
+
+                    # Load pseudo spectrograms (check path exists first)
                     pseudo_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, 'pseudo_spectrograms.npz')
                     print(f"Attempting to load pseudo spectrograms from: {pseudo_npz_path}")
                     if os.path.exists(pseudo_npz_path):
@@ -970,23 +979,25 @@ if __name__ == "__main__":
                              print(f"ERROR loading pseudo NPZ file {pseudo_npz_path}: {e}")
                              print("Continuing training without pseudo-labels due to NPZ loading error.")
                     else:
-                        print(f"WARNING: Pseudo NPZ file {pseudo_npz_path} not found. Skipping pseudo-label data.")
+                        # Critical Error if NPZ is missing but was expected
+                        print(f"CRITICAL ERROR: Pseudo NPZ file {pseudo_npz_path} not found, but USE_PSEUDO_LABELS is True. Exiting.")
+                        sys.exit(1)
                 else:
                     print("Pseudo labels CSV found but is empty. Skipping.")
 
             except FileNotFoundError:
-                print(f"WARNING: Pseudo labels CSV {config.train_pseudo_csv_path} not found. Skipping pseudo-label data.")
+                 # Critical Error if CSV is missing but was expected
+                print(f"CRITICAL ERROR: Pseudo labels CSV {config.train_pseudo_csv_path} not found, but USE_PSEUDO_LABELS is True. Exiting.")
+                sys.exit(1)
             except Exception as e:
-                print(f"ERROR loading pseudo labels CSV {config.train_pseudo_csv_path}: {e}")
-                print("Continuing training without pseudo-labels due to CSV loading error.")
+                print(f"CRITICAL ERROR loading or processing pseudo labels CSV {config.train_pseudo_csv_path}: {e}")
+                print("Exiting due to pseudo-label loading error.")
+                sys.exit(1)
         else:
             print("\nSkipping pseudo-label data (USE_PSEUDO_LABELS=False).")
 
     else: 
         print("\nSkipping preprocessed data loading (LOAD_PREPROCESSED_DATA=False). Will generate on-the-fly.")
-        # Ensure samplename exists even for on-the-fly
-        if 'samplename' not in training_df.columns: # Should have been created above
-            training_df['samplename'] = training_df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
 
     # Final check on combined dataframe and spectrograms
     print(f"\nFinal training dataframe size: {len(training_df)} samples.")
