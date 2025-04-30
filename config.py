@@ -85,6 +85,10 @@ class Config:
     focal_loss_gamma = 2.0
     focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
+    # --- Label Smoothing --- 
+    label_smoothing_factor = 0.0 # Set to > 0 (e.g., 0.1) to enable
+    # --- End Label Smoothing ---
+
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 

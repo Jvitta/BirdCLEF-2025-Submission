@@ -35,7 +35,6 @@ import optuna
 from config import config
 import birdclef_utils as utils
 from google.cloud import storage
-import cv2
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -74,15 +73,15 @@ class BirdCLEFDataset(Dataset):
         self.df = df.copy()
         self.config = config
         self.mode = mode
-        self.all_spectrograms = all_spectrograms # Store the pre-loaded dictionary {samplename: [spec1, spec2, ...]}
+        self.all_spectrograms = all_spectrograms
 
         # Load taxonomy to map labels to indices
         try:
             taxonomy_df = pd.read_csv(self.config.taxonomy_path)
-            self.species_ids = taxonomy_df['primary_label'].tolist() # Revert to potential duplicates if intended by original code
+            self.species_ids = taxonomy_df['primary_label'].tolist()
             if len(self.species_ids) != self.config.num_classes:
-                 print(f"Warning: Taxonomy file has {len(self.species_ids)} species, but config.num_classes is {self.config.num_classes}. Using value from taxonomy.")
-                 self.num_classes = len(self.species_ids)
+                print(f"Warning: Taxonomy file has {len(self.species_ids)} species, but config.num_classes is {self.config.num_classes}. Using value from taxonomy.")
+                self.num_classes = len(self.species_ids)
             else:
                 self.num_classes = self.config.num_classes
             self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
@@ -90,27 +89,18 @@ class BirdCLEFDataset(Dataset):
             print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
             raise
 
-        # Ensure necessary columns exist
-        if 'filepath' not in self.df.columns:
-            self.df['filepath'] = self.df['filename'].apply(lambda f: os.path.join(self.config.train_audio_dir, f))
-        if 'samplename' not in self.df.columns:
-            self.df['samplename'] = self.df.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
-
-        # Print status
         if self.all_spectrograms is not None:
             print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
-            print(f"  Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
+            print(f"Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
             # Optional: Add check if all df samplenames are in all_spectrograms keys
             missing_keys = set(self.df['samplename']) - set(self.all_spectrograms.keys())
             if missing_keys:
-                 print(f"  Warning: {len(missing_keys)} samplenames from the dataframe are missing in the loaded spectrograms dictionary.")
-                 print(f"    Examples: {list(missing_keys)[:5]}")
-                 # Filter dataframe to only include available spectrograms? Or handle in getitem?
-                 # For now, getitem will handle missing keys.
+                 print(f"Warning: {len(missing_keys)} samplenames from the dataframe are missing in the loaded spectrograms dictionary.")
+                 print(f"Examples: {list(missing_keys)[:5]}")
         elif self.config.LOAD_PREPROCESSED_DATA:
             print(f"Dataset mode '{self.mode}': ERROR - Configured to load preprocessed data, but none provided. Dataset will be empty.")
         else:
-             print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files.")
+            print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files.")
 
     def __len__(self):
         return len(self.df)
@@ -124,111 +114,59 @@ class BirdCLEFDataset(Dataset):
         spec = None
 
         # --- Load preprocessed data --- #
-        if self.all_spectrograms is not None:
-            if samplename in self.all_spectrograms:
-                spec_data = self.all_spectrograms[samplename] # Can be (3, 256, 256) or (256, 256) or potentially list (if old format)
-                selected_spec_np = None # To hold the final (256, 256) numpy array
-                expected_shape_2d = tuple(self.config.TARGET_SHAPE)
+        if self.all_spectrograms is None:
+            print(f"CRITICAL ERROR: all_spectrograms is None in __getitem__ for {samplename}! Cannot proceed.")
+            raise ValueError("BirdCLEFDataset received None for all_spectrograms, but preprocessed data is required.")
+            
+        if samplename in self.all_spectrograms:
+            spec_data = self.all_spectrograms[samplename] # Can be (3, 256, 256) or (256, 256)
+            selected_spec_np = None # To hold the final (256, 256) numpy array
+            expected_shape_2d = tuple(self.config.TARGET_SHAPE)
 
-                # --- Handle based on retrieved data type/shape --- 
-                if isinstance(spec_data, np.ndarray):
-                    # Case 1: Primary Data (Multiple Chunks stacked) - Shape (3, 256, 256)
-                    if spec_data.ndim == 3 and spec_data.shape[1:] == expected_shape_2d:
-                        num_chunks = spec_data.shape[0]
-                        if self.mode == 'train':
-                            # Randomly select one chunk (np array iterates over first dim)
-                            selected_spec_np = random.choice(spec_data) 
-                            # print(f"DEBUG: Train mode selected chunk shape: {selected_spec_np.shape}") # Optional debug
-                        else:
-                            # Validation/Test: Take the first chunk
-                            selected_spec_np = spec_data[0]
-                            
-                    # Case 2: Pseudo Data (Single Chunk) - Shape (256, 256)
-                    elif spec_data.ndim == 2 and spec_data.shape == expected_shape_2d:
-                        selected_spec_np = spec_data
-                    
-                    # Case 3: Unexpected ndarray shape
+            # --- Handle based on retrieved data type/shape --- 
+            if isinstance(spec_data, np.ndarray):
+                # Case 1: Primary Data (Multiple Chunks stacked) - Shape (3, 256, 256)
+                if spec_data.ndim == 3 and spec_data.shape[1:] == expected_shape_2d:
+                    if self.mode == 'train':
+                        # Randomly select one chunk (np array iterates over first dim)
+                        selected_spec_np = random.choice(spec_data) 
                     else:
-                        print(f"WARNING: Ndarray '{samplename}' has unexpected shape {spec_data.shape}. Attempting reshape or using zeros.")
-                        try:
-                            selected_spec_np = spec_data.reshape(expected_shape_2d)
-                            print(f"  Successfully reshaped '{samplename}' to {selected_spec_np.shape}")
-                        except:
-                            print(f"  Reshape failed for '{samplename}'. Using zeros.")
-                            selected_spec_np = None # Fallback to zeros
-
-                # Case 4: Handle old list format defensively (should not happen with current preprocessing)
-                elif isinstance(spec_data, list):
-                    print(f"WARNING: Data for '{samplename}' is in list format (expected ndarray). Handling list.")
-                    if len(spec_data) > 0:
-                        chunk = random.choice(spec_data) if self.mode == 'train' else spec_data[0]
-                        if isinstance(chunk, np.ndarray) and chunk.shape == expected_shape_2d:
-                            selected_spec_np = chunk
-                        # Add handling for 3-channel list items if necessary
-                        elif isinstance(chunk, np.ndarray) and chunk.ndim == 3 and chunk.shape[1:] == expected_shape_2d:
-                            selected_spec_np = chunk[0]
-                        else: print(f"  List item for '{samplename}' has bad shape/type: {chunk.shape if isinstance(chunk, np.ndarray) else type(chunk)}. Using zeros.")
-                    else: print(f"  List for '{samplename}' is empty. Using zeros.")
+                        # Validation/Test: Take the first chunk
+                        selected_spec_np = spec_data[0]
+                    
+                # Case 2: Pseudo Data (Single Chunk) - Shape (256, 256)
+                elif spec_data.ndim == 2 and spec_data.shape == expected_shape_2d:
+                    selected_spec_np = spec_data
                 
-                # Case 5: Other unexpected format
+                # Case 3: Unexpected ndarray shape
                 else:
-                     print(f"Warning: Entry for '{samplename}' has unexpected format: {type(spec_data)}. Using zeros.")
+                    print(f"WARNING: Ndarray '{samplename}' has unexpected shape {spec_data.shape}. Attempting reshape or using zeros.")
+                    try:
+                        selected_spec_np = spec_data.reshape(expected_shape_2d)
+                        print(f"  Successfully reshaped '{samplename}' to {selected_spec_np.shape}")
+                    except:
+                        print(f"  Reshape failed for '{samplename}'. Using zeros.")
 
-                # --- Assign final spec or zeros --- 
-                if selected_spec_np is not None and selected_spec_np.shape == expected_shape_2d:
-                    spec = selected_spec_np
-                else:
-                    spec = np.zeros(expected_shape_2d, dtype=np.float32)
-                    if samplename in self.all_spectrograms: # Avoid double warning if key was missing
-                         # Provide more context if selected_spec_np was not None but had wrong shape
-                        shape_info = selected_spec_np.shape if isinstance(selected_spec_np, np.ndarray) else type(selected_spec_np)
-                        print(f"  Fallback: Using zeros for '{samplename}' due to processing issues (Final shape before fallback: {shape_info}).")
-
+            if selected_spec_np is not None and selected_spec_np.shape == expected_shape_2d:
+                spec = selected_spec_np
             else:
-                # Samplename from df not found in pre-loaded dict
-                print(f"ERROR: Samplename '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
-                spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-        
-        # --- On-the-fly generation (If not using preprocessed) --- #
-        elif not self.config.LOAD_PREPROCESSED_DATA:
-             if self.mode == "train":
-                 # This case should ideally not be hit if preprocessing is the primary path
-                 print(f"Debug: Generating spec on-the-fly for {samplename}") 
-             try:
-                 # Assuming fabio/vad intervals are not needed/passed for on-the-fly here
-                 spec = utils.process_audio_file(row['filepath'], row['filename'], self.config, {}, {})
-             except Exception as e_gen:
-                  print(f"Error generating spectrogram on-the-fly for {samplename}: {e_gen}")
-                  spec = None
-             # Make sure on-the-fly also produces single channel (256, 256)
-             if spec is not None and spec.ndim == 3:
-                 print(f"INFO: On-the-fly spec for '{samplename}' has shape {spec.shape}. Taking first channel.")
-                 spec = spec[0]
-             elif spec is not None and spec.shape != tuple(self.config.TARGET_SHAPE):
-                 print(f"WARNING: On-the-fly spec for '{samplename}' has shape {spec.shape}. Attempting resize.")
-                 try:
-                     spec = cv2.resize(spec, tuple(self.config.TARGET_SHAPE)[::-1], interpolation=cv2.INTER_LINEAR)
-                 except Exception as resize_err:
-                     print(f"  Resize failed: {resize_err}. Using zeros.")
-                     spec = None # Fallback to zeros
-
-        # --- Handle cases where spec is still None --- # 
-        if spec is None:
+                spec = np.zeros(expected_shape_2d, dtype=np.float32)
+                shape_info = selected_spec_np.shape if isinstance(selected_spec_np, np.ndarray) else type(selected_spec_np)
+                print(f"Fallback: Using zeros for '{samplename}' due to processing issues (Final shape before fallback: {shape_info}).")
+        else:
+            print(f"ERROR: Samplename '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
-            print(f"Warning: Failed to load or generate spec for {filename_for_error}. Using zeros.")
 
         # --- Final Shape Guarantee --- 
         expected_shape = tuple(self.config.TARGET_SHAPE)
         if not isinstance(spec, np.ndarray) or spec.shape != expected_shape:
              print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
              spec = np.zeros(expected_shape, dtype=np.float32)
-        # --- End Final Shape Guarantee --- 
 
         # Ensure spec is float32 before converting to tensor
         spec = spec.astype(np.float32)
-        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension (now expects (256, 256))
+        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
 
-        # Apply augmentations only in training mode
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
@@ -246,7 +184,8 @@ class BirdCLEFDataset(Dataset):
              
              # Apply valid secondary labels
              for label in secondary_labels:
-                  if label in self.label_to_idx: target[self.label_to_idx[label]] = 1.0
+                  if label in self.label_to_idx:
+                       target[self.label_to_idx[label]] = 1.0 - self.config.label_smoothing_factor
 
         return {
             'melspec': spec,
@@ -255,7 +194,7 @@ class BirdCLEFDataset(Dataset):
         }
 
     def apply_spec_augmentations(self, spec):
-        """Apply augmentations to spectrogram (User's version)."""
+        """Apply augmentations to spectrogram."""
         # Time masking (horizontal stripes)
         if random.random() < self.config.time_mask_prob:
             num_masks = random.randint(1, 3)
@@ -285,11 +224,11 @@ class BirdCLEFDataset(Dataset):
         """Encode primary label to one-hot vector."""
         target = np.zeros(self.num_classes, dtype=np.float32)
         if label in self.label_to_idx:
-            target[self.label_to_idx[label]] = 1.0
+            target[self.label_to_idx[label]] = 1.0 - self.config.label_smoothing_factor
         return target
 
 def collate_fn(batch):
-    """Custom collate function (User's version)."""
+    """Custom collate function."""
     batch = [item for item in batch if item is not None]
     if len(batch) == 0:
         # Return None for empty batch, handled in train/val loops
@@ -615,7 +554,7 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, auc
 
-def run_training(df, config, resume_fold=0, trial=None, all_spectrograms=None):
+def run_training(df, config, trial=None, all_spectrograms=None):
     """Runs the training loop. 
     
     Accepts pre-loaded spectrograms via the all_spectrograms argument.
@@ -667,7 +606,6 @@ def run_training(df, config, resume_fold=0, trial=None, all_spectrograms=None):
     single_fold_best_auc = 0.0 
     
     for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
-        if fold < resume_fold: continue
         if fold not in config.selected_folds: continue
 
         print(f'\n{"="*30} Fold {fold} {"="*30}')
@@ -934,40 +872,28 @@ def run_training(df, config, resume_fold=0, trial=None, all_spectrograms=None):
             return 0.0
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BirdCLEF Training Script")
-    parser.add_argument(
-        '--resume_fold', 
-        type=int, 
-        default=0, 
-        help='Fold number to resume training from (0-indexed). Skips folds < resume_fold.'
-    )
-    args = parser.parse_args()
-    print(f"Resume Fold specified: {args.resume_fold}")
-
     print("\n--- Initializing Training Script ---")
     print(f"Using configuration: LOAD_PREPROCESSED_DATA={config.LOAD_PREPROCESSED_DATA}, USE_PSEUDO_LABELS={config.USE_PSEUDO_LABELS}")
 
-    all_spectrograms = None # Initialize as None
+    all_spectrograms = None 
 
-    # --- Load Main Training Data --- 
     print("Loading main training metadata...")
     try:
         main_train_df_full = pd.read_csv(config.train_csv_path)
         main_train_df_full['filepath'] = main_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
         main_train_df_full['samplename'] = main_train_df_full.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
-        main_train_df_full['data_source'] = 'main' # Add data source identifier
+        main_train_df_full['data_source'] = 'main'
         
         # Select only necessary columns for training
-        required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source'] # Include data_source
+        required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source']
         main_train_df = main_train_df_full[required_cols_main].copy()
         print(f"Loaded and selected columns for {len(main_train_df)} main training samples.")
         del main_train_df_full; gc.collect()
-
     except Exception as e:
         print(f"CRITICAL ERROR loading main training CSV {config.train_csv_path}: {e}. Exiting.")
         sys.exit(1)
 
-    training_df = main_train_df # Start with main data
+    training_df = main_train_df 
 
     # --- Load Preprocessed Spectrograms (if configured) --- #
     if config.LOAD_PREPROCESSED_DATA:
@@ -1053,9 +979,6 @@ if __name__ == "__main__":
         else:
             print("\nSkipping pseudo-label data (USE_PSEUDO_LABELS=False).")
 
-    else: 
-        print("\nSkipping preprocessed data loading (LOAD_PREPROCESSED_DATA=False). Will generate on-the-fly.")
-
     # Final check on combined dataframe and spectrograms
     print(f"\nFinal training dataframe size: {len(training_df)} samples.")
     if all_spectrograms is not None:
@@ -1068,6 +991,6 @@ if __name__ == "__main__":
               # Potentially filter df: training_df = training_df[training_df['samplename'].isin(all_spectrograms.keys())]
 
     # --- Run Training --- #
-    run_training(training_df, config, args.resume_fold, all_spectrograms=all_spectrograms)
+    run_training(training_df, config, all_spectrograms=all_spectrograms)
 
     print("\nTraining script finished!")
