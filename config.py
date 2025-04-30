@@ -85,9 +85,12 @@ class Config:
     focal_loss_gamma = 2.0
     focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
-    # --- Label Smoothing --- 
     label_smoothing_factor = 0.0 # Set to > 0 (e.g., 0.1) to enable
     # --- End Label Smoothing ---
+
+    # --- Pseudo Label Usage Threshold ---
+    pseudo_label_usage_threshold = 0.90 # Filter pseudo labels below this confidence during training run
+    # --- End Pseudo Label Usage Threshold ---
 
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
@@ -111,7 +114,8 @@ class Config:
     inference_batch_size = 16
     use_tta = False
     tta_count = 3
-    threshold = 0.90
+    # Threshold for generating pseudo labels
+    threshold = 0.75
 
     use_specific_folds_inference = False
     inference_folds = [0, 1]

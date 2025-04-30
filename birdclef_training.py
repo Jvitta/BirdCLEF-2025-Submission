@@ -231,11 +231,9 @@ def collate_fn(batch):
     """Custom collate function."""
     batch = [item for item in batch if item is not None]
     if len(batch) == 0:
-        # Return None for empty batch, handled in train/val loops
         print("Warning: collate_fn received empty batch, returning None.")
         return None
 
-    # Check for consistent keys before trying to access batch[0]
     expected_keys = {'melspec', 'target', 'filename'}
     if not all(expected_keys.issubset(item.keys()) for item in batch):
          print("Warning: Batch items have inconsistent keys. Returning None.")
@@ -246,20 +244,16 @@ def collate_fn(batch):
         for key, value in item.items():
             result[key].append(value)
 
-    # Stack tensors
     try:
         result['target'] = torch.stack(result['target'])
-        # Assuming melspec should always be stackable due to TARGET_SHAPE
         result['melspec'] = torch.stack(result['melspec'])
     except RuntimeError as e:
-        # This might happen if melspecs somehow have different shapes despite TARGET_SHAPE
         print(f"Error stacking tensors in collate_fn: {e}. Returning None.")
         return None
     except Exception as e:
         print(f"Unexpected error in collate_fn: {e}. Returning None.")
         return None
 
-    # Check batch size consistency after stacking
     if result['melspec'].shape[0] != len(batch) or result['target'].shape[0] != len(batch):
         print("Warning: Collated tensors have incorrect batch dimension. Returning None.")
         return None
@@ -268,13 +262,9 @@ def collate_fn(batch):
 
 class BirdCLEFModel(nn.Module):
     """BirdCLEF model using timm backbone."""
-    def __init__(self, config): # Pass config object
+    def __init__(self, config):
         super().__init__()
         self.config = config
-
-        # Ensure num_classes is available
-        if not hasattr(config, 'num_classes') or config.num_classes <= 0:
-             raise ValueError("config.num_classes must be set to a positive integer.")
 
         self.backbone = timm.create_model(
             config.model_name,
@@ -288,11 +278,7 @@ class BirdCLEFModel(nn.Module):
         if 'efficientnet' in config.model_name:
             backbone_out = self.backbone.classifier.in_features
             self.backbone.classifier = nn.Identity()
-        elif 'resnet' in config.model_name:
-            backbone_out = self.backbone.fc.in_features
-            self.backbone.fc = nn.Identity()
         else:
-            # Assuming this path handles other timm models with get_classifier
             backbone_out = self.backbone.get_classifier().in_features
             self.backbone.reset_classifier(0, '')
 
@@ -300,8 +286,7 @@ class BirdCLEFModel(nn.Module):
         self.feat_dim = backbone_out
         self.classifier = nn.Linear(backbone_out, config.num_classes)
 
-        # Mixup setup - use config directly
-        self.mixup_enabled = hasattr(config, 'mixup_alpha') and config.mixup_alpha > 0
+        self.mixup_enabled = config.mixup_alpha > 0
         if self.mixup_enabled:
             self.mixup_alpha = config.mixup_alpha
             print(f"Mixup enabled with alpha={self.mixup_alpha}")
@@ -319,8 +304,6 @@ class BirdCLEFModel(nn.Module):
         logits = self.classifier(features)
         return logits
 
-# --- Helper Functions --- #
-
 def mixup_data(x, targets, alpha, device):
     """Applies mixup augmentation.
     Returns mixed inputs, targets_a, targets_b, and lambda.
@@ -332,7 +315,7 @@ def mixup_data(x, targets, alpha, device):
     targets_a, targets_b = targets, targets[indices]
     return mixed_x, targets_a, targets_b, lam
 
-def get_optimizer(model, config): # Pass config object
+def get_optimizer(model, config):
     """Creates optimizer based on config settings."""
     if config.optimizer == 'AdamW':
         optimizer = optim.AdamW(
@@ -350,25 +333,25 @@ def get_optimizer(model, config): # Pass config object
          optimizer = optim.SGD(
             model.parameters(),
             lr=config.lr,
-            momentum=0.9, # Common default
+            momentum=0.9,
             weight_decay=config.weight_decay
         )
     else:
         raise NotImplementedError(f"Optimizer '{config.optimizer}' not implemented")
     return optimizer
 
-def get_scheduler(optimizer, config, steps_per_epoch=None): # Pass config, potentially steps_per_epoch
+def get_scheduler(optimizer, config):
     """Creates learning rate scheduler based on config settings."""
     if config.scheduler == 'CosineAnnealingLR':
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=config.epochs, # T_max in epochs
+            T_max=config.epochs,
             eta_min=config.min_lr
         )
     elif config.scheduler == 'ReduceLROnPlateau':
         scheduler = lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min', # Use min mode as per user's version
+            mode='min',
             factor=0.5,
             patience=2,
             min_lr=config.min_lr,
@@ -380,22 +363,17 @@ def get_scheduler(optimizer, config, steps_per_epoch=None): # Pass config, poten
             step_size=max(1, config.epochs // 3),
             gamma=0.5
         )
-    elif config.scheduler == 'OneCycleLR':
-        # Use original implementation detail (scheduler=None handled in run_training)
-        scheduler = None # Let run_training handle the specific OneCycleLR setup
     elif config.scheduler is None or config.scheduler.lower() == 'none':
         scheduler = None
     else:
         raise NotImplementedError(f"Scheduler '{config.scheduler}' not implemented")
     return scheduler
 
-def get_criterion(config): # Pass config object
+def get_criterion(config):
     """Creates loss criterion based on config settings."""
     if config.criterion == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss()
     elif config.criterion == 'FocalLossBCE':
-        # Uses hardcoded defaults in losses.py (alpha=0.25, gamma=2, bce_w=0.6, focal_w=1.4) 
-        # as per user preference
         print("INFO: Using FocalLossBCE with parameters hardcoded in losses.py")
         criterion = FocalLossBCE(config=config)
     else:
@@ -403,11 +381,10 @@ def get_criterion(config): # Pass config object
     return criterion
 
 def calculate_auc(targets, outputs):
-    """Calculates macro-averaged ROC AUC (User's version)."""
+    """Calculates macro-averaged ROC AUC."""
     num_classes = targets.shape[1]
     aucs = []
 
-    # Use user's calculation logic
     probs = 1 / (1 + np.exp(-outputs))
 
     for i in range(num_classes):
@@ -420,16 +397,14 @@ def calculate_auc(targets, outputs):
 
     return np.mean(aucs) if aucs else 0.0
 
-# --- Training and Validation Loops (Using User's versions, simplified batch handling) --- #
-
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler, scheduler=None):
     """Runs one epoch of training with optional mixed precision."""
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
-    use_amp = scaler.is_enabled() # Check if AMP is active via the scaler
-    mixup_active = model.mixup_enabled # Check if model has mixup enabled
+    use_amp = scaler.is_enabled()
+    mixup_active = model.mixup_enabled
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
 
@@ -447,9 +422,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
 
         optimizer.zero_grad()
 
-        # --- AMP: autocast context --- #
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            # Apply mixup BEFORE model if enabled
             if mixup_active:
                 inputs, targets_a, targets_b, lam = mixup_data(
                     inputs_orig, targets_orig, model.mixup_alpha, device
@@ -457,29 +430,21 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
             else:
                 inputs = inputs_orig
             
-            # Model only returns logits now
             logits = model(inputs)
 
-            # Calculate loss AFTER model, potentially using mixup targets
             if mixup_active:
                 loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
             else:
                 loss = criterion(logits, targets_orig)
-        # --- End autocast --- #
 
-        # --- AMP: Scale loss and step --- #
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        # --- End AMP --- #
+
 
         # Use original targets for AUC calculation
-        outputs_np = logits.detach().float().cpu().numpy() # Ensure float32 for numpy ops
+        outputs_np = logits.detach().float().cpu().numpy()
         targets_np = targets_orig.detach().cpu().numpy()
-
-        # Scheduler step (only for OneCycleLR here, matching original)
-        if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
-            scheduler.step()
 
         all_outputs.append(outputs_np)
         all_targets.append(targets_np)
@@ -490,7 +455,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
             'lr': optimizer.param_groups[0]['lr']
         })
 
-        # --- Debugging: Limit batches --- #
         if config.debug and (step + 1) >= config.debug_limit_batches:
             print(f"DEBUG: Stopping training epoch early after {config.debug_limit_batches} batches.")
             break
@@ -512,7 +476,7 @@ def validate(model, loader, criterion, device):
     losses = []
     all_targets = []
     all_outputs = []
-    use_amp = config.use_amp # Check config directly for validation
+    use_amp = config.use_amp
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
@@ -527,17 +491,14 @@ def validate(model, loader, criterion, device):
                 print(f"Error: Skipping validation batch {step} due to unexpected format: {e}")
                 continue
 
-            # --- AMP: autocast context for validation --- #
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
-            # --- End autocast --- #
 
-            all_outputs.append(outputs.float().cpu().numpy()) # Ensure float32 for numpy ops
+            all_outputs.append(outputs.float().cpu().numpy())
             all_targets.append(targets.cpu().numpy())
             losses.append(loss.item())
 
-            # --- Debugging: Limit batches --- #
             if config.debug and (step + 1) >= config.debug_limit_batches:
                 print(f"DEBUG: Stopping validation early after {config.debug_limit_batches} batches.")
                 break
@@ -577,28 +538,44 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     print(f"Using Seed: {config.seed}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
 
-    # --- NPZ Data Loading moved to the main script block --- #
-    # Removed the NPZ loading logic from here. 
-    # `all_spectrograms` is now expected as an argument.
     if all_spectrograms is not None:
         print(f"run_training received {len(all_spectrograms)} pre-loaded samples.")
-    elif config.LOAD_PREPROCESSED_DATA:
-        print("Warning: run_training received no pre-loaded samples, but LOAD_PREPROCESSED_DATA is True.")
     else:
-        print("run_training configured for on-the-fly generation (all_spectrograms is None).")
-    # --- End NPZ Data Loading Removal --- #
+        print("Warning: run_training received no pre-loaded samples")
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
     working_df = df.copy()
 
-    # --- Samplename generation moved to the main script block --- #
-    # Removed samplename generation logic
+    # --- Filter pseudo-labels based on usage threshold --- 
+    if config.USE_PSEUDO_LABELS and 'data_source' in working_df.columns and 'confidence' in working_df.columns:
+        usage_threshold = config.pseudo_label_usage_threshold
+        initial_count = len(working_df)
+        pseudo_count_before = len(working_df[working_df['data_source'] == 'pseudo'])
+        
+        # Identify pseudo rows below threshold
+        rows_to_drop = working_df[
+            (working_df['data_source'] == 'pseudo') &
+            (working_df['confidence'] < usage_threshold)
+        ].index
+        
+        if not rows_to_drop.empty:
+            working_df = working_df.drop(rows_to_drop).reset_index(drop=True)
+            pseudo_count_after = len(working_df[working_df['data_source'] == 'pseudo'])
+            print(f"Applied pseudo-label usage threshold ({usage_threshold}):")
+            print(f"Removed {len(rows_to_drop)} pseudo labels (Confidence < {usage_threshold}).")
+            print(f"Pseudo count: {pseudo_count_before} -> {pseudo_count_after}")
+            print(f"Total training df size: {initial_count} -> {len(working_df)}")
+        else:
+            print(f"No pseudo-labels found below usage threshold {usage_threshold}. All {pseudo_count_before} pseudo labels kept.")
+    elif config.USE_PSEUDO_LABELS:
+         print("Warning: Could not filter pseudo-labels by confidence. 'data_source' or 'confidence' column missing.")
+    # --- End filtering --- 
+
     if 'samplename' not in working_df.columns:
         print("CRITICAL ERROR: 'samplename' column missing from DataFrame passed to run_training. Exiting.")
         sys.exit(1)
-    # --- End Samplename Generation Removal --- #
 
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
    
@@ -615,7 +592,6 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             'train_loss': [], 'val_loss': [],
             'train_auc': [], 'val_auc': []
         }
-        # --- End History Init --- #
 
         train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
         val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
@@ -628,7 +604,6 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             print(f"  Original val count: {original_val_count}, Filtered val count: {len(val_df_fold)}")
         else:
             print("Warning: 'data_source' column not found in validation fold. Cannot filter.")
-        # --- End Validation Set Filtering --- 
 
         print(f'Training set: {len(train_df_fold)} samples (includes main and potentially pseudo)')
         print(f'Validation set: {len(val_df_fold)} samples (main data only)')
@@ -641,21 +616,19 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             train_dataset,
             batch_size=config.train_batch_size,
             shuffle=True,
-            num_workers=config.num_workers, # Can still use workers for CPU tasks
+            num_workers=config.num_workers, 
             pin_memory=True,
             collate_fn=collate_fn,
             drop_last=True
-            # REMOVED worker_init_fn
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=config.val_batch_size,
             shuffle=False,
-            num_workers=config.num_workers, # Can still use workers for CPU tasks
+            num_workers=config.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
             drop_last=False
-            # REMOVED worker_init_fn
         )
 
         print("\nSetting up model, optimizer, criterion, scheduler...")
@@ -664,31 +637,27 @@ def run_training(df, config, trial=None, all_spectrograms=None):
         criterion = get_criterion(config)
         scheduler = get_scheduler(optimizer, config)
 
-        # --- AMP: Initialize GradScaler --- #
         scaler = torch.amp.GradScaler(device='cuda', enabled=config.use_amp)
         print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
-        # --- End AMP Init --- #
+
 
         best_val_auc = 0.0
         best_epoch = 0
-        # Removed patience counter / early stopping for simplicity, can be added back
 
         # --- Epoch Loop --- #
         for epoch in range(config.epochs):
             print(f"\nEpoch {epoch + 1}/{config.epochs}")
 
-            # Pass scaler to train_one_epoch
             train_loss, train_auc = train_one_epoch(
                 model,
                 train_loader,
                 optimizer,
                 criterion,
                 config.device,
-                scaler, # <-- Pass scaler
+                scaler,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
             )
 
-            # Validation uses autocast internally based on config
             val_loss, val_auc = validate(
                 model,
                 val_loader,
@@ -703,8 +672,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                     scheduler.step()
 
             print(f"Epoch {epoch+1} Summary:")
-            print(f"  Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            print(f"  Val Loss:   {val_loss:.4f}, Val AUC:   {val_auc:.4f}")
+            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
+            print(f"Val Loss:   {val_loss:.4f}, Val AUC:   {val_auc:.4f}")
 
             # --- Append metrics for the CURRENT fold's history --- #
             fold_history['epochs'].append(epoch + 1)
@@ -712,7 +681,6 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             fold_history['val_loss'].append(val_loss)
             fold_history['train_auc'].append(train_auc)
             fold_history['val_auc'].append(val_auc)
-            # --- End Appending ---
 
             # --- HPO Pruning --- #
             if is_hpo_trial:
@@ -720,13 +688,12 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                 if trial.should_prune():
                     print(f"  Pruning trial based on intermediate value at epoch {epoch+1}.")
                     raise optuna.TrialPruned() # Raise exception to stop training
-            # --- End HPO Pruning ---
             
             # --- Model Checkpointing ---
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
                 best_epoch = epoch + 1
-                print(f"  ✨ New best AUC: {best_val_auc:.4f} at epoch {best_epoch}. Saving model...")
+                print(f"✨ New best AUC: {best_val_auc:.4f} at epoch {best_epoch}. Saving model...")
 
                 checkpoint = {
                     'model_state_dict': model.state_dict(),
@@ -744,19 +711,15 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                     print(f"  Error saving model checkpoint: {e}")
 
         print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
-        # Store the best AUC for this fold (will be the only one if is_hpo_trial)
         single_fold_best_auc = best_val_auc 
 
-        # --- Store history for this fold (only relevant if not HPO or if analyzing HPO runs later) --- #
         all_folds_history.append(fold_history)
-        # --- End Store History --- #
 
         del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
         del train_df_fold, val_df_fold 
         torch.cuda.empty_cache()
         gc.collect()
 
-    # --- Plotting & Summary (Only for Non-HPO Runs) --- #
     if not is_hpo_trial:
         if all_folds_history:
             print("\n--- Generating Average Training History Plot Across Folds ---")
@@ -773,8 +736,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                 # Use the actual number of epochs recorded in the history for this fold
                 epochs_ran = len(fold_hist['epochs'])
                 for i in range(epochs_ran):
-                    epoch_idx = i # 0-based index for arrays
-                    if epoch_idx < num_epochs: # Safety check
+                    epoch_idx = i 
+                    if epoch_idx < num_epochs:
                         avg_train_loss[epoch_idx] += fold_hist['train_loss'][i]
                         avg_val_loss[epoch_idx] += fold_hist['val_loss'][i]
                         avg_train_auc[epoch_idx] += fold_hist['train_auc'][i]
@@ -814,7 +777,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             plt.tight_layout()
 
             plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
-            os.makedirs(plot_dir, exist_ok=True) # Ensure the directory exists
+            os.makedirs(plot_dir, exist_ok=True)
             plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
 
             try:
@@ -822,10 +785,9 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                 print(f"Saved average plot to: {plot_save_path}")
             except Exception as e:
                 print(f"Error saving average plot to {plot_save_path}: {e}")
-            plt.close(fig) # Close the figure to free memory
+            plt.close(fig)
         else:
             print("\nNo fold histories recorded, skipping average plot generation.")
-        # --- End Plotting --- #
         
         # --- Non-HPO Summary --- #
         if all_folds_history:
@@ -833,10 +795,9 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
             print("\n" + "="*60)
             print("Cross-Validation Training Summary:")
-            # Use actual selected folds list length for iteration, assuming it matches history order for non-hpo
             num_folds_run = len(all_folds_history) 
             for i in range(num_folds_run):
-                 fold_num = config.selected_folds[i] # Index based on number of folds actually run
+                 fold_num = config.selected_folds[i] 
                  best_fold_auc = max(all_folds_history[i]['val_auc']) if all_folds_history[i]['val_auc'] else 0.0
                  print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
             print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
@@ -844,11 +805,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
         else:
             print("\nNo folds were trained.")
             print("="*60)
-        # --- End Non-HPO Summary ---
 
-    # --- Final Return Value --- #
     if is_hpo_trial:
-        # For HPO, return the best AUC achieved in the single fold run
         print(f"\nReturning best AUC for HPO Trial (Fold {config.selected_folds[0]}): {single_fold_best_auc:.4f}")
         return single_fold_best_auc
     else:
@@ -860,7 +818,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             print("\n" + "="*60)
             print("Cross-Validation Training Summary:")
             for i, fold_hist in enumerate(all_folds_history):
-                 fold_num = config.selected_folds[i] # Assumes selected_folds matches history order
+                 fold_num = config.selected_folds[i]
                  best_fold_auc = max(fold_hist['val_auc']) if fold_hist['val_auc'] else 0.0
                  print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
             print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
@@ -935,10 +893,10 @@ if __name__ == "__main__":
                     pseudo_labels_df_full['filepath'] = pseudo_labels_df_full['filename'].apply(lambda f: os.path.join(config.unlabeled_audio_dir, f))
                     pseudo_labels_df_full['data_source'] = 'pseudo' # Add data source identifier
                     
-                    # Select only necessary columns for training (note: secondary_labels will be NaN)
-                    required_cols_pseudo = ['samplename', 'primary_label', 'filepath', 'filename', 'data_source'] # Include data_source
+                    # Select necessary columns including confidence for filtering later
+                    required_cols_pseudo = ['samplename', 'primary_label', 'filepath', 'filename', 'data_source', 'confidence'] # Include data_source AND confidence
                     pseudo_labels_df = pseudo_labels_df_full[required_cols_pseudo].copy()
-                    print(f"Loaded and selected columns for {len(pseudo_labels_df)} pseudo labels.")
+                    print(f"Loaded and selected columns (including confidence) for {len(pseudo_labels_df)} pseudo labels.")
                     del pseudo_labels_df_full; gc.collect()
 
                     # Load pseudo spectrograms (check path exists first)
