@@ -3,19 +3,16 @@ import sys
 import time
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import warnings
 import pickle
-import glob         # For finding background chunks
-import random       # For random selection
-import math         # For padding calculations
-import multiprocessing # For parallel processing
-from functools import partial # Useful for multiprocessing args
-import traceback    # For detailed error logging
-import cv2          # For resizing spectrograms
-import librosa      # For audio loading
-from tqdm.auto import tqdm # Import tqdm for progress bar
-import soundfile as sf # For saving audio examples
+import random   
+import math   
+import multiprocessing
+from functools import partial 
+import traceback  
+import cv2         
+import librosa      
+from tqdm.auto import tqdm 
 from config import config 
 import birdclef_utils as utils 
 
@@ -30,9 +27,6 @@ def load_and_prepare_metadata(config):
         df_train_full = pd.read_csv(config.train_csv_path)
         df_train = df_train_full[['filename', 'primary_label']].copy()
         print(f"Loaded and filtered main metadata: {df_train.shape[0]} rows")
-    except FileNotFoundError:
-        print(f"CRITICAL ERROR: Main metadata file not found at {config.train_csv_path}. Exiting.")
-        sys.exit(1)
     except Exception as e:
         print(f"CRITICAL ERROR loading main metadata {config.train_csv_path}: {e}. Exiting.")
         sys.exit(1)
@@ -47,10 +41,6 @@ def load_and_prepare_metadata(config):
             df_combined = pd.concat([df_train, df_rare], ignore_index=True)
             df_working = df_combined
             print(f"Working metadata size (main + rare): {df_working.shape[0]} rows")
-        except FileNotFoundError:
-            print(f"Warning: Rare species metadata file not found at {config.train_rare_csv_path}. Proceeding with main data only.")
-            df_working = df_train 
-            print(f"Working metadata size (main only): {df_working.shape[0]} rows")
         except Exception as e:
             print(f"Error loading or processing rare species metadata: {e}. Proceeding with main data only.")
             df_working = df_train 
@@ -68,21 +58,19 @@ def load_and_prepare_metadata(config):
 
 def _process_primary_for_chunking(args):
     """Worker to generate multiple 5-second spectrogram chunks for one primary audio file."""
-    primary_filepath, samplename, config, fabio_intervals, vad_intervals, example_samplenames, example_audio_dirs, primary_filename = args
+    primary_filepath, samplename, config, fabio_intervals, vad_intervals, primary_filename = args
 
     results_dict = {}
-    example_specs_to_return = None
     target_samples = int(config.TARGET_DURATION * config.FS)
-    min_samples = int(0.5 * config.FS) 
+    min_samples = int(0.5 * config.FS)
 
     try:
         primary_audio, sr = librosa.load(primary_filepath, sr=config.FS, mono=True)
         if primary_audio is None or len(primary_audio) < min_samples:
-            return samplename, {}, f"Primary audio too short/empty: {primary_filepath}", None
+            return samplename, {}, f"Primary audio too short/empty: {primary_filepath}"
 
         relevant_audio = primary_audio
         if config.REMOVE_SPEECH_INTERVALS:
-            is_example_file = samplename in example_samplenames
             cleaned_audio = None
 
             if primary_filename in fabio_intervals: 
@@ -127,7 +115,7 @@ def _process_primary_for_chunking(args):
                 pass
 
         if len(relevant_audio) < min_samples:
-             return samplename, {}, f"Relevant audio too short after processing: {primary_filepath}", None
+             return samplename, {}, f"Relevant audio too short after processing: {primary_filepath}"
 
         relevant_duration = len(relevant_audio)
         num_versions_to_generate = config.PRECOMPUTE_VERSIONS
@@ -146,7 +134,7 @@ def _process_primary_for_chunking(args):
             primary_spec_chunk = None
             try:
                 primary_spec_chunk = utils.audio2melspec(primary_chunk, config)
-                if primary_spec_chunk is None: continue 
+                if primary_spec_chunk is None: continue
 
                 if primary_spec_chunk.shape != tuple(config.TARGET_SHAPE):
                      final_spec = cv2.resize(primary_spec_chunk, tuple(config.TARGET_SHAPE)[::-1], interpolation=cv2.INTER_LINEAR)
@@ -155,25 +143,14 @@ def _process_primary_for_chunking(args):
 
                 results_dict[f"{samplename}_chunk{i}"] = final_spec.astype(np.float32)
 
-                if is_example_file and i == 0:
-                    safe_samplename = samplename.replace('/', '_').replace('\\', '_')
-
-                    try:
-                        sf.write(os.path.join(example_audio_dirs['primary'], f"{safe_samplename}_primary_chunk0.wav"), primary_chunk, config.FS)
-                    except Exception as e_audio_save:
-                        pass 
-
-                    if primary_spec_chunk is not None:
-                         example_specs_to_return = (samplename, primary_spec_chunk.astype(np.float32))
-
             except Exception as e_spec:
-                 pass 
+                 pass
 
     except Exception as e_main:
         tb_str = traceback.format_exc()
-        return samplename, results_dict, f"Error processing {primary_filepath}: {e_main}\n{tb_str}", None # Return error and None for example
+        return samplename, results_dict, f"Error processing {primary_filepath}: {e_main}\n{tb_str}"
 
-    return samplename, results_dict, None, example_specs_to_return
+    return samplename, results_dict, None
 
 
 def generate_and_save_spectrograms(df, config):
@@ -226,31 +203,10 @@ def generate_and_save_spectrograms(df, config):
     print("\n--- 2. Generating Spectrogram Chunks (Multi-Chunk, NPZ) ---")
     start_time = time.time()
     all_spectrograms = {}
-    example_spectrograms = {} # Dictionary to store example spectrograms {samplename: spec}
     processed_count = 0
     error_count = 0
     skipped_files = 0 # Files processed by worker but yielded no valid spectrograms
     errors = []
-
-    # --- Select First N Examples --- #
-    num_examples = 5
-    # potential_examples = df['samplename'].unique().tolist() # Old random selection
-    potential_examples = df['samplename'].tolist() # Get samplenames in order
-    example_samplenames = set(potential_examples[:num_examples]) # Take the first N unique ones
-    print(f"Selected first {len(example_samplenames)} samplenames for detailed examples: {list(example_samplenames)}")
-    # Create specific output directories for example audio components
-    example_audio_base_dir = os.path.join(config.OUTPUT_DIR, "example_audio")
-    # Simplify example directories - only need primary now
-    example_audio_dirs = {
-        'primary': os.path.join(example_audio_base_dir, 'primary'),
-        # 'background': os.path.join(example_audio_base_dir, 'background'), # Remove
-        # 'mixed': os.path.join(example_audio_base_dir, 'mixed') # Remove
-    }
-    for dir_path in example_audio_dirs.values():
-        try:
-            os.makedirs(dir_path, exist_ok=True)
-        except OSError as e:
-            print(f"Warning: Could not create example directory {dir_path}: {e}")
 
     # --- Setup Multiprocessing Tasks --- #
     tasks = []
@@ -274,11 +230,7 @@ def generate_and_save_spectrograms(df, config):
             primary_filepath = potential_rare_path
 
         if primary_filepath:
-            # Pass the set of example samplenames AND the original filename to the worker
-            # Remove background_chunk_paths from task arguments
-            tasks.append((primary_filepath, samplename, config, # Removed background_chunk_paths
-                          fabio_intervals, vad_intervals, example_samplenames, example_audio_dirs,
-                          primary_filename)) # Added primary_filename
+            tasks.append((primary_filepath, samplename, config, fabio_intervals, vad_intervals, primary_filename))
         else:
             skipped_path_count += 1
 
@@ -307,8 +259,8 @@ def generate_and_save_spectrograms(df, config):
 
             # Process results as they complete, wrapped with tqdm for progress bar
             for i, result in enumerate(tqdm(results_iterator, total=len(tasks), desc="Generating Specs")):
-                # Unpack result: samplename, spec_dict (chunks for this file), error_msg, example_spec_tuple
-                samplename, spec_dict, error_msg, example_spec_tuple = result # Adjusted unpacking
+                # Unpack result: samplename, spec_dict (chunks for this file), error_msg
+                samplename, spec_dict, error_msg = result # Adjusted unpacking
                 if error_msg:
                     errors.append(f"{samplename}: {error_msg}")
                     error_count += 1
@@ -323,12 +275,6 @@ def generate_and_save_spectrograms(df, config):
                 else:
                     # Worker finished but produced no specs
                     skipped_files += 1
-
-                # --- Store Example Spectrogram (if generated by worker) --- #
-                if example_spec_tuple:
-                    # The worker now returns the correct tuple format
-                    ex_samplename, ex_primary_spec = example_spec_tuple
-                    example_spectrograms[ex_samplename] = ex_primary_spec
 
     except Exception as e:
         print(f"\nCRITICAL ERROR during multiprocessing: {e}")
@@ -380,10 +326,8 @@ def main(config):
     print(f"Configuration: Using {'Rare Data' if config.USE_RARE_DATA else 'Main Data Only'}, {'Removing Speech Intervals' if config.REMOVE_SPEECH_INTERVALS else 'Not Removing Speech'}, Target Duration: {config.TARGET_DURATION}s, Versions per File: {config.PRECOMPUTE_VERSIONS}")
     print(f"Output NPZ: {config.PREPROCESSED_NPZ_PATH}")
 
-    # --- 1. Load Metadata --- #
     df_working = load_and_prepare_metadata(config)
 
-    # --- 2. Generate and Save Spectrograms --- #
     if df_working is not None and not df_working.empty:
         _ = generate_and_save_spectrograms(df_working, config)
     else:

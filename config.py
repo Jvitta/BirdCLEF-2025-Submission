@@ -37,7 +37,6 @@ class Config:
     # These derived paths use the mount point when IS_CUSTOM_JOB is False
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
-    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
     test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
     sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
     taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
@@ -45,7 +44,7 @@ class Config:
     train_audio_rare_dir = os.path.join(DATA_ROOT, 'train_audio_rare')
     train_rare_csv_path = os.path.join(DATA_ROOT, 'train_rare.csv')
     # Pseudo-label paths
-    train_audio_pseudo_dir = os.path.join(DATA_ROOT, 'train_audio_pseudo')
+    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
     train_pseudo_csv_path = os.path.join(DATA_ROOT, 'train_pseudo.csv')
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
@@ -81,7 +80,13 @@ class Config:
     val_batch_size = 64
     use_amp = False
 
-    criterion = 'BCEWithLogitsLoss'
+    criterion = 'FocalLossBCE'
+    focal_loss_alpha = 0.25
+    focal_loss_gamma = 2.0
+    focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
+
+    label_smoothing_factor = 0.1
+
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 
@@ -104,8 +109,9 @@ class Config:
     inference_batch_size = 16
     use_tta = False
     tta_count = 3
-    threshold = 0.90
-
+    # Threshold for generating pseudo labels
+    threshold = 0.75
+    pseudo_label_usage_threshold = 0.80
     use_specific_folds_inference = False
     inference_folds = [0, 1]
 
@@ -114,4 +120,9 @@ class Config:
 
     # --- New: Smoothing Parameter ---
     smoothing_neighbor_weight = 0.125
+
+    # --- BirdNET Preprocessing Config ---
+    birdnet_confidence_threshold = 0.3 # Minimum confidence for BirdNET detection to be considered
+    BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
+
 config = Config()
