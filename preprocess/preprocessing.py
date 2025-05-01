@@ -120,6 +120,9 @@ def _process_primary_for_chunking(args):
         relevant_duration = len(relevant_audio)
         num_versions_to_generate = config.PRECOMPUTE_VERSIONS
 
+        if relevant_duration < target_samples:
+            num_versions_to_generate = 1
+
         for i in range(num_versions_to_generate):
             if relevant_duration < target_samples:
                 n_copy = math.ceil(target_samples / relevant_duration)
