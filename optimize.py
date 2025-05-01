@@ -19,7 +19,26 @@ from birdclef_training import run_training, set_seed, calculate_auc # Import cal
 # load data once for HPO
 print("Loading main training metadata for HPO...")
 try:
-    main_train_df = pd.read_csv(base_config.train_csv_path)
+    main_train_df_full = pd.read_csv(base_config.train_csv_path)
+    # Add the necessary samplename derivation
+    if 'filename' in main_train_df_full.columns:
+        main_train_df_full['samplename'] = main_train_df_full.filename.map(
+            lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0]
+        )
+    else:
+        print("Error: 'filename' column not found in main training CSV. Cannot create 'samplename'. Exiting.")
+        sys.exit(1)
+    
+    # Select only necessary columns to mimic training script setup
+    required_cols_main = ['samplename', 'primary_label', 'secondary_labels'] # Add other cols if needed by run_training
+    if not all(col in main_train_df_full.columns for col in required_cols_main):
+        missing = [col for col in required_cols_main if col not in main_train_df_full.columns]
+        print(f"Error: Required columns missing from main training CSV: {missing}. Exiting.")
+        sys.exit(1)
+    
+    main_train_df = main_train_df_full[required_cols_main].copy()
+    print(f"Successfully loaded and prepared {len(main_train_df)} samples for HPO.")
+    del main_train_df_full # Free up memory
 
 except FileNotFoundError:
     print(f"Error: Main training CSV not found at {base_config.train_csv_path}. Exiting.")
@@ -41,29 +60,33 @@ def objective(trial, preloaded_data):
     cfg.selected_folds = [fold_to_run] # Configure training to run only this fold
     # --- End Fold Determination ---
 
-    # --- Hyperparameter Suggestions ---
-    cfg.lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    # Keep optimizer fixed for this run
-    # cfg.optimizer = trial.suggest_categorical("optimizer", ["AdamW", "Adam"])
-    cfg.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    cfg.mixup_alpha = trial.suggest_float("mixup_alpha", 0.0, 0.7) # Tune mixup alpha
-    # Keep scheduler fixed for this run
-    # cfg.scheduler = trial.suggest_categorical("scheduler", ["CosineAnnealingLR", "ReduceLROnPlateau"])
+    # --- Hyperparameter Suggestions --- #
+    # Keep learning rate search tight around the known good value
+    cfg.lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True) # e.g., Tight range around 5e-4
 
-    # Granular augmentation parameters
-    cfg.time_mask_prob = trial.suggest_float("time_mask_prob", 0.0, 0.6)
-    cfg.freq_mask_prob = trial.suggest_float("freq_mask_prob", 0.0, 0.6)
-    cfg.contrast_prob = trial.suggest_float("contrast_prob", 0.0, 0.6)
-    cfg.max_time_mask_width = trial.suggest_int("max_time_mask_width", 5, 40)
-    cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 5, 40)
+    # Keep weight decay search tight around the known good value
+    cfg.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True) # e.g., Tight range around 1e-5
+
+    # Focal Loss Hyperparameters
+    cfg.focal_loss_alpha = trial.suggest_float("focal_loss_alpha", 0.05, 0.95) # Standard range, often 0.25 is good
+    cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 0.5, 5.0) # Standard range, 1.0-3.0 often good
+    cfg.focal_loss_bce_weight = trial.suggest_float("focal_loss_bce_weight", 0.0, 2.0) # Full range for BCE vs Focal balance
+
+    # Keep other parameters fixed for this study
+    cfg.mixup_alpha = base_config.mixup_alpha
+    cfg.time_mask_prob = base_config.time_mask_prob
+    cfg.freq_mask_prob = base_config.freq_mask_prob
+    cfg.contrast_prob = base_config.contrast_prob
+    cfg.max_time_mask_width = base_config.max_time_mask_width
+    cfg.max_freq_mask_height = base_config.max_freq_mask_height
     # --- End Hyperparameter Suggestions ---
 
     # --- Trial Configuration ---
-    cfg.epochs = 25 # Set epochs to 25 for HPO trials
+    cfg.epochs = base_config.epochs # Use the base config epochs for HPO trials
     print(f"INFO: Running HPO trial with {cfg.epochs} epochs.")
 
-    cfg.n_fold = 5 # Use full 5 folds for HPO evaluation
-    print(f"INFO: Running HPO trial with folds {cfg.selected_folds}")
+    # cfg.n_fold = 5 # Use full 5 folds for HPO evaluation
+    print(f"INFO: Running HPO trial with fold {cfg.selected_folds}")
     # --- End Trial Configuration ---
 
 
@@ -116,12 +139,12 @@ def objective(trial, preloaded_data):
 
 if __name__ == "__main__":
     # --- Study Configuration ---
-    study_name = "BirdCLEF_HPO_GCP_Augmentation_LR_WD" # Updated study name
-    n_trials = 300 # Increased trials due to single-fold evaluation
+    study_name = "BirdCLEF_HPO_FocalLoss_LR_WD" # Focused study name
+    n_trials = 200 # Adjust number of trials as needed for this focused study
 
     # --- Define paths for GCP --- #
     # Database will be stored in the OUTPUT_DIR defined in config.py
-    db_filename = "hpo_study_results.db"
+    db_filename = "hpo_focalloss_study_results.db" # Specific DB file
     db_filepath = os.path.join(base_config.OUTPUT_DIR, db_filename)
     storage_path = f"sqlite:///{db_filepath}" # Use absolute path for Optuna
 
@@ -136,17 +159,16 @@ if __name__ == "__main__":
         os.makedirs(base_config.OUTPUT_DIR, exist_ok=True)
 
     # Define HPO settings for clarity
-    hpo_trial_epochs = 25 # Updated HPO epochs
-    hpo_trial_folds = [0, 1, 2, 3, 4] # Updated HPO folds
+    hpo_trial_epochs = base_config.epochs # Use base epochs
+    # hpo_trial_folds = [0, 1, 2, 3, 4] # We run one fold per trial
 
-    print(f"\n--- Starting Optuna Optimization ---")
+    print(f"\n--- Starting Optuna Optimization --- ")
     print(f"Study Name: {study_name}")
     print(f"Number of Trials: {n_trials}")
     print(f"Storage (using): {storage_path_to_use}")
-    print(f"Metric to Optimize: Mean AUC over folds {hpo_trial_folds} (Maximizing)")
-    print(f"Base Config Epochs (for reference): {base_config.epochs}")
+    print(f"Metric to Optimize: Validation AUC on single fold per trial (Maximizing)")
     print(f"HPO Trial Epochs: {hpo_trial_epochs}")
-    print(f"HPO Trial Folds: {hpo_trial_folds}")
+    # print(f"HPO Trial Folds: {hpo_trial_folds}")
 
     # Create study using the storage path in the *working* directory
     study = optuna.create_study(
@@ -162,17 +184,23 @@ if __name__ == "__main__":
     # Add base config parameters and tuned parameters as user attributes for reference
     study.set_user_attr("base_config_epochs", base_config.epochs)
     study.set_user_attr("hpo_trial_epochs", hpo_trial_epochs)
-    study.set_user_attr("hpo_trial_folds", hpo_trial_folds)
+    # study.set_user_attr("hpo_trial_folds", hpo_trial_folds)
     # Updated list of tuned parameters
     tuned_params_list = [
-        "lr", "weight_decay", "mixup_alpha",
-        "time_mask_prob", "freq_mask_prob", "contrast_prob",
-        "max_time_mask_width", "max_freq_mask_height"
+        "lr", "weight_decay", "focal_loss_alpha", "focal_loss_gamma", "focal_loss_bce_weight"
     ]
     study.set_user_attr("tuned_parameters", tuned_params_list)
     # Store fixed parameters for reference
     study.set_user_attr("fixed_optimizer", base_config.optimizer)
     study.set_user_attr("fixed_scheduler", base_config.scheduler)
+    study.set_user_attr("fixed_mixup_alpha", base_config.mixup_alpha)
+    study.set_user_attr("fixed_augmentations", {
+        "time_mask_prob": base_config.time_mask_prob,
+        "freq_mask_prob": base_config.freq_mask_prob,
+        "contrast_prob": base_config.contrast_prob,
+        "max_time_mask_width": base_config.max_time_mask_width,
+        "max_freq_mask_height": base_config.max_freq_mask_height
+    })
 
     # --- Pre-load NPZ data once --- #
     global_all_spectrograms = None

@@ -70,7 +70,7 @@ class Config:
     LOAD_PREPROCESSED_DATA = True 
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
-    USE_PSEUDO_LABELS = True
+    USE_PSEUDO_LABELS = False
 
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
@@ -85,12 +85,7 @@ class Config:
     focal_loss_gamma = 2.0
     focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
-    label_smoothing_factor = 0.0 # Set to > 0 (e.g., 0.1) to enable
-    # --- End Label Smoothing ---
-
-    # --- Pseudo Label Usage Threshold ---
-    pseudo_label_usage_threshold = 0.90 # Filter pseudo labels below this confidence during training run
-    # --- End Pseudo Label Usage Threshold ---
+    label_smoothing_factor = 0.1
 
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
@@ -116,7 +111,7 @@ class Config:
     tta_count = 3
     # Threshold for generating pseudo labels
     threshold = 0.75
-
+    pseudo_label_usage_threshold = 0.80
     use_specific_folds_inference = False
     inference_folds = [0, 1]
 
@@ -125,4 +120,9 @@ class Config:
 
     # --- New: Smoothing Parameter ---
     smoothing_neighbor_weight = 0.125
+
+    # --- BirdNET Preprocessing Config ---
+    birdnet_confidence_threshold = 0.3 # Minimum confidence for BirdNET detection to be considered
+    BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
+
 config = Config()

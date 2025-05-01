@@ -4,9 +4,9 @@ from pathlib import Path
 import os # Added for directory creation
 
 # --- Configuration (MUST match optimize.py) ---
-STUDY_NAME = "BirdCLEF_HPO_GCP_Augmentation_LR_WD" # The name of your study
+STUDY_NAME = "BirdCLEF_HPO_FocalLoss_LR_WD" # The name of your study
 OUTPUT_DIR = Path("./outputs")
-DB_FILENAME = "hpo_study_results.db"
+DB_FILENAME = "hpo_focalloss_study_results.db"
 PLOT_SUBDIR = "hpo_live_plots" # Subdirectory for plots
 # --- End Configuration ---
 

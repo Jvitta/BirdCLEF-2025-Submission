@@ -442,9 +442,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
         scaler.update()
 
 
-        # Use original targets for AUC calculation
+        # Use original targets for AUC calculation, applying ceil for label smoothing
         outputs_np = logits.detach().float().cpu().numpy()
-        targets_np = targets_orig.detach().cpu().numpy()
+        targets_np = torch.ceil(targets_orig).detach().cpu().numpy() 
 
         all_outputs.append(outputs_np)
         all_targets.append(targets_np)
@@ -496,7 +496,7 @@ def validate(model, loader, criterion, device):
                 loss = criterion(outputs, targets)
 
             all_outputs.append(outputs.float().cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
+            all_targets.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
             losses.append(loss.item())
 
             if config.debug and (step + 1) >= config.debug_limit_batches:
