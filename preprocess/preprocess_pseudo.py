@@ -10,6 +10,10 @@ import cv2
 import librosa
 from tqdm.auto import tqdm
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.append(project_root)
+
 # Import shared config and utilities
 from config import config 
 import birdclef_utils as utils 
