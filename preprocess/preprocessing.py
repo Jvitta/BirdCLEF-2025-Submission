@@ -78,12 +78,21 @@ def _process_primary_for_chunking(args):
         if primary_audio is None or len(primary_audio) < min_samples:
             return samplename, {}, f"Primary audio too short/empty: {primary_filepath}"
 
-        # --- Apply VAD/Fabio if configured --- 
+        # --- Apply VAD/Fabio if configured ---
         relevant_audio = primary_audio
-        if config.REMOVE_SPEECH_INTERVALS:
-            cleaned_audio = None
+        # Determine if speech removal should be applied based on config and class_name
+        should_apply_vad_fabio = False
+        if config.REMOVE_SPEECH_INTERVALS: # Check master switch
+            if not config.REMOVE_SPEECH_ONLY_NON_AVES: # Apply to all?
+                should_apply_vad_fabio = True
+            elif class_name != 'Aves': # Apply only to non-Aves and this is non-Aves?
+                 should_apply_vad_fabio = True
+            # Implicit else: REMOVE_SPEECH_ONLY_NON_AVES is True and class_name == 'Aves', so should_apply_vad_fabio remains False
 
-            if primary_filename in fabio_intervals: 
+        if should_apply_vad_fabio:
+            cleaned_audio = None
+            # --- Existing VAD/Fabio logic starts here ---
+            if primary_filename in fabio_intervals:
                 start_time, stop_time = fabio_intervals[primary_filename]
                 start_idx = max(0, int(start_time * config.FS))
                 end_idx = min(len(primary_audio), int(stop_time * config.FS))
@@ -118,11 +127,15 @@ def _process_primary_for_chunking(args):
                          if non_speech_segments: cleaned_audio = np.concatenate(non_speech_segments)
                          else: cleaned_audio = np.array([])
                     else: cleaned_audio = np.array([])
-            
+            # --- Existing VAD/Fabio logic ends here ---
+
             if cleaned_audio is not None and len(cleaned_audio) >= min_samples:
                 relevant_audio = cleaned_audio
             else:
+                # If cleaning resulted in audio that's too short or None, keep the original audio.
+                # Log this potentially? For now, just pass.
                 pass
+        # --- End Apply VAD/Fabio ---
 
         if len(relevant_audio) < min_samples:
              return samplename, {}, f"Relevant audio too short after processing: {primary_filepath}"

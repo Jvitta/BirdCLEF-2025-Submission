@@ -57,10 +57,12 @@ class Config:
     in_channels = 1
     num_classes = 206  
 
-    LOAD_PREPROCESSED_DATA = True 
+    LOAD_PREPROCESSED_DATA = True
     REMOVE_SPEECH_INTERVALS = False
     USE_RARE_DATA = False
     USE_PSEUDO_LABELS = False
+
+    REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
 
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
