@@ -39,16 +39,6 @@ from google.cloud import storage
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-gcs_client = None
-if config.IS_CUSTOM_JOB:
-    try:
-        gcs_client = storage.Client()
-        print("INFO: Google Cloud Storage client initialized successfully.")
-    except Exception as e:
-        print(f"CRITICAL WARNING: Failed to initialize Google Cloud Storage client: {e}")
-        # Training will likely fail if client is needed and not initialized.
-# --- End GCS Client Init --- #
-
 def set_seed(seed=42):
     """
     Set seed for reproducibility

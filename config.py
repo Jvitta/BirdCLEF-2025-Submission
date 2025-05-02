@@ -10,16 +10,6 @@ class Config:
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    IS_CUSTOM_JOB = os.getenv('AIP_JOB_NAME') is not None
-    if IS_CUSTOM_JOB:
-        print("INFO: Detected execution in Vertex AI Custom Job. Using direct GCS access.")
-    else:
-        print("INFO: Running in interactive mode (or non-Vertex AI job). Using gcsfuse mount paths.")
-
-    GCS_BUCKET_NAME = "birdclef-2025-data"
-    GCS_PREPROCESSED_PATH_PREFIX = "preprocessed/"
-    GCS_VOICE_SEP_PATH_PREFIX = "BC25 voice separation/"
-
     # --- Workbench/Local Paths (using gcsfuse mount) --- #
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
     GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/gcs_mount"
