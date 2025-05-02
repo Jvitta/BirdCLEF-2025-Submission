@@ -68,7 +68,7 @@ class Config:
     num_classes = 206  
 
     LOAD_PREPROCESSED_DATA = True 
-    REMOVE_SPEECH_INTERVALS = True
+    REMOVE_SPEECH_INTERVALS = False
     USE_RARE_DATA = False
     USE_PSEUDO_LABELS = False
 

@@ -11,14 +11,10 @@ import logging
 import io
 import contextlib
 
-# --- Add project root to sys.path ---
-# Get the absolute path of the current script's directory
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# Get the parent directory (project root)
 project_root = os.path.dirname(current_dir)
-# Add the project root to the Python path
 sys.path.append(project_root)
-# --- End path modification ---
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 
