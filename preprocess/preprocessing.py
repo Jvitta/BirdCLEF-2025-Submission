@@ -118,10 +118,7 @@ def _process_primary_for_chunking(args):
              return samplename, {}, f"Relevant audio too short after processing: {primary_filepath}"
 
         relevant_duration = len(relevant_audio)
-        num_versions_to_generate = config.PRECOMPUTE_VERSIONS
-
-        if relevant_duration < target_samples:
-            num_versions_to_generate = 1
+        num_versions_to_generate = 1 if relevant_duration < target_samples else config.PRECOMPUTE_VERSIONS
 
         for i in range(num_versions_to_generate):
             if relevant_duration < target_samples:

@@ -122,7 +122,7 @@ class Config:
     smoothing_neighbor_weight = 0.125
 
     # --- BirdNET Preprocessing Config ---
-    birdnet_confidence_threshold = 0.3 # Minimum confidence for BirdNET detection to be considered
+    birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
 config = Config()
