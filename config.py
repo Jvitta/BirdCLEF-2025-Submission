@@ -10,16 +10,6 @@ class Config:
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    IS_CUSTOM_JOB = os.getenv('AIP_JOB_NAME') is not None
-    if IS_CUSTOM_JOB:
-        print("INFO: Detected execution in Vertex AI Custom Job. Using direct GCS access.")
-    else:
-        print("INFO: Running in interactive mode (or non-Vertex AI job). Using gcsfuse mount paths.")
-
-    GCS_BUCKET_NAME = "birdclef-2025-data"
-    GCS_PREPROCESSED_PATH_PREFIX = "preprocessed/"
-    GCS_VOICE_SEP_PATH_PREFIX = "BC25 voice separation/"
-
     # --- Workbench/Local Paths (using gcsfuse mount) --- #
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
     GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/gcs_mount"
@@ -64,13 +54,15 @@ class Config:
 
     model_name = 'efficientnet_b0'
     pretrained = True
-    in_channels = 1
+    in_channels = 3
     num_classes = 206  
 
-    LOAD_PREPROCESSED_DATA = True 
+    LOAD_PREPROCESSED_DATA = True
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
     USE_PSEUDO_LABELS = False
+
+    REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
 
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
@@ -122,7 +114,7 @@ class Config:
     smoothing_neighbor_weight = 0.125
 
     # --- BirdNET Preprocessing Config ---
-    birdnet_confidence_threshold = 0.3 # Minimum confidence for BirdNET detection to be considered
+    birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
 config = Config()

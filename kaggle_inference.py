@@ -34,7 +34,7 @@ class BirdCLEF2025Pipeline:
 
     # Nested Model Class (uses config passed to pipeline)
     class BirdCLEFModel(nn.Module):
-        """Internal model definition, mirrors training structure."""
+        """Internal model definition, mirrors training structure"""
         def __init__(self, config, num_classes):
             super().__init__()
             self.config = config # Store config if needed internally
@@ -150,6 +150,7 @@ class BirdCLEF2025Pipeline:
         :return: List of model file paths.
         """
         model_files = []
+        print(f"Looking for Model files in {self.config.MODEL_INPUT_DIR}")
         model_dir = Path(self.config.MODEL_INPUT_DIR)
         for path in model_dir.glob('**/*.pth'):
             model_files.append(str(path))
@@ -381,7 +382,7 @@ class BirdCLEF2025Pipeline:
             
             if predictions.shape[0] > 1:
                 # Smooth the predictions using neighboring segments
-                neighbor_weight = self.config.smoothing_neighbor_weight
+                neighbor_weight = 0.125
                 center_weight = 1.0 - (2 * neighbor_weight)
                 edge_weight = 1.0 - neighbor_weight
 

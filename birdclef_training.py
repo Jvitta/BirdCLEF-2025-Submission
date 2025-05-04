@@ -25,6 +25,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
 from torch.amp import GradScaler
 from losses import FocalLossBCE
+import torchvision.transforms as transforms
 
 from tqdm.auto import tqdm
 
@@ -38,16 +39,6 @@ from google.cloud import storage
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
-
-gcs_client = None
-if config.IS_CUSTOM_JOB:
-    try:
-        gcs_client = storage.Client()
-        print("INFO: Google Cloud Storage client initialized successfully.")
-    except Exception as e:
-        print(f"CRITICAL WARNING: Failed to initialize Google Cloud Storage client: {e}")
-        # Training will likely fail if client is needed and not initialized.
-# --- End GCS Client Init --- #
 
 def set_seed(seed=42):
     """
@@ -157,21 +148,25 @@ class BirdCLEFDataset(Dataset):
             print(f"ERROR: Samplename '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
 
-        # --- Final Shape Guarantee --- 
+        # --- Final Shape Guarantee ---
         expected_shape = tuple(self.config.TARGET_SHAPE)
         if not isinstance(spec, np.ndarray) or spec.shape != expected_shape:
              print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
              spec = np.zeros(expected_shape, dtype=np.float32)
 
-        # Ensure spec is float32 before converting to tensor
+        # Ensure spec is float32 before augmentations/tensor conversion
         spec = spec.astype(np.float32)
-        spec = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
 
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
+        # Convert to tensor, add channel dimension, repeat, and normalize
+        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        spec_tensor = normalize(spec_tensor)
+
         # Encode labels retrieved from the dataframe row
-        target = self.encode_label(primary_label) 
+        target = self.encode_label(primary_label)
         if secondary_labels and secondary_labels not in [[''], None, np.nan]:
              # Ensure secondary_labels is a list 
              if isinstance(secondary_labels, str):
@@ -188,37 +183,43 @@ class BirdCLEFDataset(Dataset):
                        target[self.label_to_idx[label]] = 1.0 - self.config.label_smoothing_factor
 
         return {
-            'melspec': spec,
+            'melspec': spec_tensor,
             'target': torch.tensor(target, dtype=torch.float32),
             'filename': filename_for_error 
         }
 
-    def apply_spec_augmentations(self, spec):
-        """Apply augmentations to spectrogram."""
+    def apply_spec_augmentations(self, spec_np):
+        """Apply augmentations to a single-channel numpy spectrogram."""
         # Time masking (horizontal stripes)
         if random.random() < self.config.time_mask_prob:
             num_masks = random.randint(1, 3)
             for _ in range(num_masks):
-                width = random.randint(5, self.config.max_time_mask_width) 
-                start = random.randint(0, max(0, spec.shape[2] - width))
-                spec[0, :, start:start+width] = 0
+                width = random.randint(5, self.config.max_time_mask_width)
+                # Use NumPy shape access (spec_np.shape[1] is width/time)
+                start = random.randint(0, max(0, spec_np.shape[1] - width))
+                # Apply to the 2D numpy array
+                spec_np[:, start:start+width] = 0
 
         # Frequency masking (vertical stripes)
-        if random.random() < self.config.freq_mask_prob: 
+        if random.random() < self.config.freq_mask_prob:
             num_masks = random.randint(1, 3)
             for _ in range(num_masks):
-                height = random.randint(5, self.config.max_freq_mask_height) 
-                start = random.randint(0, max(0, spec.shape[1] - height))
-                spec[0, start:start+height, :] = 0
+                height = random.randint(5, self.config.max_freq_mask_height)
+                # Use NumPy shape access (spec_np.shape[0] is height/frequency)
+                start = random.randint(0, max(0, spec_np.shape[0] - height))
+                 # Apply to the 2D numpy array
+                spec_np[start:start+height, :] = 0
 
         # Random brightness/contrast
         if random.random() < self.config.contrast_prob:
             gain = random.uniform(0.8, 1.2)
             bias = random.uniform(-0.1, 0.1)
-            spec = spec * gain + bias
-            spec = torch.clamp(spec, 0, 1) 
+            spec_np = spec_np * gain + bias
+            # Assuming spec_np was already normalized [0,1] during preprocessing
+            # Use np.clip for NumPy array
+            spec_np = np.clip(spec_np, 0, 1)
 
-        return spec
+        return spec_np
 
     def encode_label(self, label):
         """Encode primary label to one-hot vector."""

@@ -11,6 +11,11 @@ import logging
 import io
 import contextlib
 
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.append(project_root)
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 
 from birdnetlib import Recording
@@ -99,7 +104,6 @@ def process_file_birdnet(args):
                 analyzer=analyzer,
                 path=filepath,
                 min_conf=CONFIDENCE_THRESHOLD,
-                # Pass validated lat/lon to BirdNET
                 lat=lat_val, 
                 lon=lon_val,
             )
