@@ -80,18 +80,6 @@ class BirdCLEFDataset(Dataset):
             print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
             raise
 
-        # Initialize RandomErasing transform if needed for training
-        if self.mode == "train":
-            self.random_eraser = transforms.RandomErasing(
-                p=self.config.random_erase_prob,
-                scale=self.config.random_erase_scale,
-                ratio=self.config.random_erase_ratio,
-                value=self.config.random_erase_value,
-                inplace=False # Important: operates on tensor, so don't modify numpy in place
-            )
-        else:
-            self.random_eraser = None
-
         if self.all_spectrograms is not None:
             print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
             print(f"Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
@@ -175,10 +163,6 @@ class BirdCLEFDataset(Dataset):
 
         # Convert to tensor, add channel dimension, repeat
         spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
-
-        # Apply RandomErasing on the 3-channel tensor during training
-        if self.mode == "train" and self.random_eraser is not None:
-             spec_tensor = self.random_eraser(spec_tensor)
 
         # Normalize the (potentially augmented) tensor
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -335,6 +319,49 @@ def mixup_data(x, targets, alpha, device):
     targets_a, targets_b = targets, targets[indices]
     return mixed_x, targets_a, targets_b, lam
 
+def rand_bbox(size, lam):
+    """Generates random bounding box coordinates based on lambda."""
+    W = size[2] # Width (time dimension)
+    H = size[3] # Height (frequency dimension)
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # Uniform random center point
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    # Calculate box coordinates, clamping to image boundaries
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+def cutmix_data(x, targets, alpha, device):
+    """Applies CutMix augmentation.
+    Returns mixed inputs, targets_a, targets_b, and lambda.
+    """
+    batch_size = x.size(0)
+    indices = torch.randperm(batch_size, device=device)
+    targets_a, targets_b = targets, targets[indices]
+
+    # Generate lambda using beta distribution
+    lam = np.random.beta(alpha, alpha)
+
+    # Get bounding box coordinates
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+
+    # Create mixed inputs by pasting the patch
+    mixed_x = x.clone()
+    mixed_x[:, :, bbx1:bbx2, bby1:bby2] = x[indices, :, bbx1:bbx2, bby1:bby2]
+
+    # Adjust lambda based on actual patch area relative to image area
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+
+    return mixed_x, targets_a, targets_b, lam
+
 def get_optimizer(model, config):
     """Creates optimizer based on config settings."""
     if config.optimizer == 'AdamW':
@@ -424,7 +451,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
     all_targets = []
     all_outputs = []
     use_amp = scaler.is_enabled()
-    mixup_active = model.mixup_enabled
+    # Check if batch augmentation is globally enabled
+    batch_augment_active = config.batch_augment_prob > 0
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
 
@@ -442,25 +470,45 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
 
         optimizer.zero_grad()
 
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            if mixup_active:
+        # --- Decide whether to apply batch augmentation --- #
+        apply_augmentation_this_batch = (batch_augment_active and 
+                                       random.random() < config.batch_augment_prob)
+        
+        apply_mixup = False
+        apply_cutmix = False # Ensure apply_cutmix is always initialized
+
+        if apply_augmentation_this_batch:
+            # --- Decide which augmentation: Mixup or CutMix --- #
+            use_mixup_decision = random.random() < config.mixup_vs_cutmix_ratio
+
+            if use_mixup_decision:
                 inputs, targets_a, targets_b, lam = mixup_data(
-                    inputs_orig, targets_orig, model.mixup_alpha, device
+                    inputs_orig, targets_orig, config.mixup_alpha, device
                 )
+                apply_mixup = True
             else:
-                inputs = inputs_orig
-            
+                inputs, targets_a, targets_b, lam = cutmix_data(
+                    inputs_orig, targets_orig, config.cutmix_alpha, device
+                )
+                apply_cutmix = True
+        else:
+            # No augmentation for this batch
+            inputs = inputs_orig
+            targets_a = targets_orig
+            lam = 1.0 # Ensure lambda is 1 when no augmentation
+
+        # --- Forward pass and Loss Calculation --- #
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
             logits = model(inputs)
 
-            if mixup_active:
+            if apply_mixup or apply_cutmix:
                 loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
             else:
-                loss = criterion(logits, targets_orig)
+                loss = criterion(logits, targets_a) # targets_a is targets_orig here
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-
 
         # Use original targets for AUC calculation, applying ceil for label smoothing
         outputs_np = logits.detach().float().cpu().numpy()
@@ -967,6 +1015,20 @@ if __name__ == "__main__":
               print(f"  WARNING: {len(missing_keys)} samplenames in the final dataframe are missing from the loaded spectrograms!")
               print(f"    Examples: {list(missing_keys)[:10]}")
               # Potentially filter df: training_df = training_df[training_df['samplename'].isin(all_spectrograms.keys())]
+
+    # --- Filter training_df to only include samples with loaded spectrograms --- #
+    if all_spectrograms is not None:
+        print("\nFiltering training dataframe based on loaded spectrogram keys...")
+        original_count = len(training_df)
+        loaded_keys = set(all_spectrograms.keys())
+        training_df = training_df[training_df['samplename'].isin(loaded_keys)].reset_index(drop=True)
+        filtered_count = len(training_df)
+        removed_count = original_count - filtered_count
+        if removed_count > 0:
+            print(f"  Removed {removed_count} samples from training_df because their spectrograms were not found in the loaded NPZ file(s).")
+        print(f"  Final training_df size after filtering: {filtered_count} samples.")
+    else:
+        print("\nWarning: all_spectrograms is None, cannot filter training_df by loaded keys.")
 
     # --- Run Training --- #
     run_training(training_df, config, all_spectrograms=all_spectrograms)

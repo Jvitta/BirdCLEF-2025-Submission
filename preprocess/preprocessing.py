@@ -86,7 +86,7 @@ def _process_primary_for_chunking(args):
             if not config.REMOVE_SPEECH_ONLY_NON_AVES: # Apply to all?
                 should_apply_vad_fabio = True
             elif class_name != 'Aves' or scientific_name == UNCOVERED_AVES_SCIENTIFIC_NAME: # Apply only to non-Aves and this is non-Aves?
-                 should_apply_vad_fabio = True
+                should_apply_vad_fabio = True
             # Implicit else: REMOVE_SPEECH_ONLY_NON_AVES is True and class_name == 'Aves', so should_apply_vad_fabio remains False
 
         if should_apply_vad_fabio:
@@ -178,52 +178,81 @@ def _process_primary_for_chunking(args):
             
             # --- Logic for long audio (BirdNET or Random) --- 
             else:
-                # Condition: Use BirdNET if eligible, possible, and we haven't used all detections yet
-                if use_birdnet and i < len(sorted_detections):
-                    try:
-                        detection = sorted_detections[i]
-                        birdnet_start_sec = detection.get('start_time', 0)
-                        birdnet_end_sec = detection.get('end_time', 0)
-                        
-                        # Calculate center and target 5-second window
-                        center_sec = (birdnet_start_sec + birdnet_end_sec) / 2.0
-                        target_start_sec = center_sec - (config.TARGET_DURATION / 2.0)
-                        target_end_sec = center_sec + (config.TARGET_DURATION / 2.0)
-                        
-                        # Convert to samples and clamp
-                        final_start_idx = max(0, int(target_start_sec * config.FS))
-                        final_end_idx = min(relevant_duration, int(target_end_sec * config.FS))
-                        
-                        # Ensure minimum length wasn't violated by clamping
-                        if final_end_idx - final_start_idx < min_samples:
-                             # Fallback to random if clamped window is too short
-                             max_start_idx = relevant_duration - target_samples
-                             start_idx = random.randint(0, max_start_idx)
-                             primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
-                        else:
-                            # Extract the chunk
-                            primary_chunk = relevant_audio[final_start_idx:final_end_idx]
+                if use_birdnet:
+                    # Try to use the i-th best detection if available
+                    if i < len(sorted_detections):
+                        try:
+                            detection = sorted_detections[i]
+                            birdnet_start_sec = detection.get('start_time', 0)
+                            birdnet_end_sec = detection.get('end_time', 0)
                             
-                            # Pad if extracted chunk is shorter than target duration (due to clamping at edges)
-                            if len(primary_chunk) < target_samples:
-                                pad_width = target_samples - len(primary_chunk)
-                                # Simple padding at the end
-                                primary_chunk = np.pad(primary_chunk, (0, pad_width), mode='constant')
+                            # Calculate center and target 5-second window
+                            center_sec = (birdnet_start_sec + birdnet_end_sec) / 2.0
+                            target_start_sec = center_sec - (config.TARGET_DURATION / 2.0)
+                            target_end_sec = center_sec + (config.TARGET_DURATION / 2.0)
+                            
+                            # Convert to samples and clamp
+                            final_start_idx = max(0, int(target_start_sec * config.FS))
+                            final_end_idx = min(relevant_duration, int(target_end_sec * config.FS))
+                            
+                            # Ensure minimum length wasn't violated by clamping
+                            if final_end_idx - final_start_idx < min_samples:
+                                # If clamped window is too short, this detection is unusable for centering.
+                                # Instead of random fallback, maybe just skip this detection index?
+                                # For now, let's keep the random fallback for this specific failure case.
+                                # TODO: Revisit if this fallback is desired.
+                                print(f"  Warning: Clamped BirdNET window too short for det {i} in {samplename}. Falling back to random for this chunk.")
+                                max_start_idx = relevant_duration - target_samples
+                                start_idx = random.randint(0, max_start_idx)
+                                primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
+                            else:
+                                # Extract the chunk
+                                primary_chunk = relevant_audio[final_start_idx:final_end_idx]
                                 
-                    except Exception as e_birdnet_chunk:
-                        print(f"Warning: Error processing BirdNET detection {i} for {samplename}: {e_birdnet_chunk}. Falling back to random.")
-                        # Fallback to random chunk if BirdNET processing fails
-                        max_start_idx = relevant_duration - target_samples
-                        start_idx = random.randint(0, max_start_idx)
-                        primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
-                        
-                # Fallback Condition: Not eligible for BirdNET, no detections left, or BirdNET failed
+                                # Pad if extracted chunk is shorter than target duration (due to clamping at edges)
+                                if len(primary_chunk) < target_samples:
+                                    pad_width = target_samples - len(primary_chunk)
+                                    primary_chunk = np.pad(primary_chunk, (0, pad_width), mode='constant')
+                                    
+                        except Exception as e_birdnet_chunk:
+                            print(f"Warning: Error processing BirdNET detection {i} for {samplename}: {e_birdnet_chunk}. Falling back to random for this chunk.")
+                            # Fallback to random chunk if this specific BirdNET processing fails
+                            max_start_idx = relevant_duration - target_samples
+                            start_idx = random.randint(0, max_start_idx)
+                            primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
+                    else:
+                        # We are using BirdNET, but have run out of detections. 
+                        # Handle specific exception for Turkey Vulture.
+                        if scientific_name == 'Cathartes aura':
+                            # Special case: Generate a random chunk for TurVul if no more detections
+                            print(f"  Info: Ran out of BirdNET detections for TurVul ({samplename}). Generating random fallback chunk for chunk {i}.")
+                            try:
+                                max_start_idx = relevant_duration - target_samples
+                                start_idx = random.randint(0, max_start_idx)
+                                primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
+                                # Basic check for validity
+                                if primary_chunk is None or len(primary_chunk) != target_samples:
+                                     print(f"  Warning: Failed to generate valid random fallback chunk for TurVul {samplename}.")
+                                     primary_chunk = None # Will cause this iteration to be skipped
+                            except Exception as e_turvul_fallback:
+                                 print(f"  Warning: Error during random fallback chunk generation for TurVul {samplename}: {e_turvul_fallback}")
+                                 primary_chunk = None # Will cause this iteration to be skipped
+                        else:
+                            # For all other Aves species, stop generating chunks.
+                            # print(f"  Info: Ran out of BirdNET detections for {samplename} after {i} chunks. Stopping.") # Optional log
+                            break # Exit the loop for this file
+                            
+                # Fallback Condition: Not using BirdNET for this file (non-Aves etc.)
                 else:
                     max_start_idx = relevant_duration - target_samples
                     start_idx = random.randint(0, max_start_idx)
                     primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
 
             # --- Generate Spectrogram from selected chunk --- 
+            if primary_chunk is None: 
+                # This can happen if the loop was broken early due to running out of detections
+                continue # Skip spectrogram generation for this iteration
+
             if primary_chunk is not None and len(primary_chunk) == target_samples:
                 try:
                     primary_spec_chunk = utils.audio2melspec(primary_chunk, config)

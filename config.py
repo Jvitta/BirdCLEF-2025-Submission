@@ -91,12 +91,18 @@ class Config:
     T_max = epochs 
 
     # --- Augmentation Parameters ---
-    mixup_alpha = 0.3901120986458487
-    time_mask_prob = 0.446875227279031
-    freq_mask_prob = 0.263834841662896
-    contrast_prob = 0.445985839941462
-    max_time_mask_width = 30
-    max_freq_mask_height = 26
+    # Batch-level augmentations (Mixup/CutMix)
+    batch_augment_prob = 1.0     # Probability of applying Mixup OR CutMix to a batch
+    mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
+    mixup_alpha = 0.3901120986458487 # Mixup alpha parameter (higher means more similar mixes)
+    cutmix_alpha = 1.0           # CutMix alpha parameter (controls patch size distribution)
+
+    # Spectrogram Augmentation (applied manually in Dataset)
+    time_mask_prob = 0.446875227279031 # Probability of applying time masking
+    freq_mask_prob = 0.263834841662896 # Probability of applying frequency masking
+    contrast_prob = 0.445985839941462  # Probability of applying random contrast
+    max_time_mask_width = 30     # Maximum width of time mask
+    max_freq_mask_height = 26    # Maximum height of frequency mask
 
     inference_batch_size = 16
     use_tta = False
@@ -116,14 +122,5 @@ class Config:
     # --- BirdNET Preprocessing Config ---
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
-
-    # --- Augmentation Settings --- #
-    # New: RandomErasing Settings
-    random_erase_prob = 0.3 # Probability of applying RandomErasing
-    random_erase_scale = (0.02, 0.2) # Range of proportion of area to erase
-    random_erase_ratio = (0.3, 3.3) # Range of aspect ratio of erased area
-    random_erase_value = 0 # Value to fill erased area with (0 or 'random')
-
-    # --- Model Settings --- #
 
 config = Config()
