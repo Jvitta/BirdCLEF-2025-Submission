@@ -80,6 +80,18 @@ class BirdCLEFDataset(Dataset):
             print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
             raise
 
+        # Initialize RandomErasing transform if needed for training
+        if self.mode == "train":
+            self.random_eraser = transforms.RandomErasing(
+                p=self.config.random_erase_prob,
+                scale=self.config.random_erase_scale,
+                ratio=self.config.random_erase_ratio,
+                value=self.config.random_erase_value,
+                inplace=False # Important: operates on tensor, so don't modify numpy in place
+            )
+        else:
+            self.random_eraser = None
+
         if self.all_spectrograms is not None:
             print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
             print(f"Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
@@ -157,11 +169,18 @@ class BirdCLEFDataset(Dataset):
         # Ensure spec is float32 before augmentations/tensor conversion
         spec = spec.astype(np.float32)
 
+        # Apply manual SpecAugment (Time/Freq Mask, Contrast) on NumPy array
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
-        # Convert to tensor, add channel dimension, repeat, and normalize
+        # Convert to tensor, add channel dimension, repeat
         spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
+
+        # Apply RandomErasing on the 3-channel tensor during training
+        if self.mode == "train" and self.random_eraser is not None:
+             spec_tensor = self.random_eraser(spec_tensor)
+
+        # Normalize the (potentially augmented) tensor
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         spec_tensor = normalize(spec_tensor)
 

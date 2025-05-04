@@ -117,4 +117,13 @@ class Config:
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
+    # --- Augmentation Settings --- #
+    # New: RandomErasing Settings
+    random_erase_prob = 0.3 # Probability of applying RandomErasing
+    random_erase_scale = (0.02, 0.2) # Range of proportion of area to erase
+    random_erase_ratio = (0.3, 3.3) # Range of aspect ratio of erased area
+    random_erase_value = 0 # Value to fill erased area with (0 or 'random')
+
+    # --- Model Settings --- #
+
 config = Config()
