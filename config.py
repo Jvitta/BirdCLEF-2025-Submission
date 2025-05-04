@@ -54,11 +54,11 @@ class Config:
 
     model_name = 'efficientnet_b0'
     pretrained = True
-    in_channels = 1
+    in_channels = 3
     num_classes = 206  
 
     LOAD_PREPROCESSED_DATA = True
-    REMOVE_SPEECH_INTERVALS = False
+    REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
     USE_PSEUDO_LABELS = False
 

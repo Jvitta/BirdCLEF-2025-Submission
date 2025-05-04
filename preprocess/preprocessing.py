@@ -85,7 +85,7 @@ def _process_primary_for_chunking(args):
         if config.REMOVE_SPEECH_INTERVALS: # Check master switch
             if not config.REMOVE_SPEECH_ONLY_NON_AVES: # Apply to all?
                 should_apply_vad_fabio = True
-            elif class_name != 'Aves': # Apply only to non-Aves and this is non-Aves?
+            elif class_name != 'Aves' or scientific_name == UNCOVERED_AVES_SCIENTIFIC_NAME: # Apply only to non-Aves and this is non-Aves?
                  should_apply_vad_fabio = True
             # Implicit else: REMOVE_SPEECH_ONLY_NON_AVES is True and class_name == 'Aves', so should_apply_vad_fabio remains False
 
@@ -309,10 +309,7 @@ def generate_and_save_spectrograms(df, config):
         print(f"Info: VAD intervals pickle file not found at {config.TRANSFORMED_VOICE_DATA_PKL_PATH}. Skipping.")
     except Exception as e:
         print(f"Warning: Could not load VAD intervals: {e}")
-    else:
-        print("REMOVE_SPEECH_INTERVALS is False, skipping loading VAD/Fabio intervals.")
-    # --- End Interval Loading ---
-
+        
     # --- Load BirdNET Detections ---
     print(f"\nAttempting to load BirdNET detections from: {config.BIRDNET_DETECTIONS_NPZ_PATH}")
     all_birdnet_detections = {}
