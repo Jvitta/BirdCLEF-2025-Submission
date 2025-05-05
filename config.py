@@ -47,7 +47,7 @@ class Config:
     TARGET_DURATION = 5.0  
     N_FFT = 1024
     HOP_LENGTH = 128
-    N_MELS = 136
+    N_MELS = 160
     FMIN = 20
     FMAX = 16000
     TARGET_SHAPE = (256, 256) 

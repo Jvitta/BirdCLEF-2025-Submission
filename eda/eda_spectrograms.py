@@ -24,55 +24,47 @@ NUM_EXAMPLES_TO_VISUALIZE = 5 # How many random chunks to analyze
 MIN_BIRDNET_CONFIDENCE = 0.5 # Minimum confidence for selecting a BirdNET detection
 OUTPUT_BASE_DIR = project_root / "outputs" / "eda_spectrograms"
 
-# Define parameter sets to test (including baseline)
+# Define parameter sets to test (including baseline and top solutions from previous year)
 PARAM_SETS = [
     {
-        "name": "baseline",
+        "name": "baseline", # Our current configuration
         "n_fft": config.N_FFT, # 1024
         "hop_length": config.HOP_LENGTH, # 128
         "n_mels": config.N_MELS, # 136
-        "fmin": config.FMIN,
-        "fmax": config.FMAX,
+        "fmin": config.FMIN, # 20
+        "fmax": config.FMAX, # 16000
     },
     {
-        "name": "mels_128",
-        "n_fft": config.N_FFT, # 1024
-        "hop_length": config.HOP_LENGTH, # 128
+        "name": "top_sol_1",
+        "n_fft": 1024,
+        "hop_length": 500,
         "n_mels": 128,
-        "fmin": config.FMIN,
-        "fmax": config.FMAX,
+        "fmin": 40,
+        "fmax": 15000,
     },
     {
-        "name": "mels_160_fft1024",
-        "n_fft": config.N_FFT, # 1024
-        "hop_length": config.HOP_LENGTH, # 128
-        "n_mels": 160,
-        "fmin": config.FMIN,
-        "fmax": config.FMAX,
+        "name": "top_sol_2",
+        "n_fft": 2048,
+        "hop_length": 512,
+        "n_mels": 128,
+        "fmin": 20,
+        "fmax": 16000,
     },
     {
-        "name": "mels_200_fft1024",
-        "n_fft": config.N_FFT, # 1024
-        "hop_length": config.HOP_LENGTH, # 128
-        "n_mels": 200,
-        "fmin": config.FMIN,
-        "fmax": config.FMAX,
+        "name": "top_sol_3_torch",
+        "n_fft": 4096, # From 2048*2
+        "hop_length": 512,
+        "n_mels": 512,
+        "fmin": 0,
+        "fmax": 16000,
     },
     {
-        "name": "mels_160_fft2048",
-        "n_fft": config.N_FFT * 2, # 2048
-        "hop_length": config.HOP_LENGTH, # 128
-        "n_mels": 160,
-        "fmin": config.FMIN,
-        "fmax": config.FMAX,
-    },
-    {
-        "name": "mels_200_fft2048",
-        "n_fft": config.N_FFT * 2, # 2048
-        "hop_length": config.HOP_LENGTH, # 128
-        "n_mels": 200,
-        "fmin": config.FMIN,
-        "fmax": config.FMAX,
+        "name": "top_sol_4",
+        "n_fft": 1095, # Unusual n_fft
+        "hop_length": 500,
+        "n_mels": 128,
+        "fmin": 40,
+        "fmax": 15000,
     },
 ]
 

@@ -221,26 +221,11 @@ def _process_primary_for_chunking(args):
                             start_idx = random.randint(0, max_start_idx)
                             primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
                     else:
-                        # We are using BirdNET, but have run out of detections. 
-                        # Handle specific exception for Turkey Vulture.
-                        if scientific_name == 'Cathartes aura':
-                            # Special case: Generate a random chunk for TurVul if no more detections
-                            print(f"  Info: Ran out of BirdNET detections for TurVul ({samplename}). Generating random fallback chunk for chunk {i}.")
-                            try:
-                                max_start_idx = relevant_duration - target_samples
-                                start_idx = random.randint(0, max_start_idx)
-                                primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
-                                # Basic check for validity
-                                if primary_chunk is None or len(primary_chunk) != target_samples:
-                                     print(f"  Warning: Failed to generate valid random fallback chunk for TurVul {samplename}.")
-                                     primary_chunk = None # Will cause this iteration to be skipped
-                            except Exception as e_turvul_fallback:
-                                 print(f"  Warning: Error during random fallback chunk generation for TurVul {samplename}: {e_turvul_fallback}")
-                                 primary_chunk = None # Will cause this iteration to be skipped
-                        else:
-                            # For all other Aves species, stop generating chunks.
-                            # print(f"  Info: Ran out of BirdNET detections for {samplename} after {i} chunks. Stopping.") # Optional log
-                            break # Exit the loop for this file
+                        # Fallback Condition: Ran out of BirdNET detections, use random chunk
+                        # (Also covers the case where BirdNET processing for a detection failed earlier)
+                        max_start_idx = relevant_duration - target_samples
+                        start_idx = random.randint(0, max_start_idx)
+                        primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
                             
                 # Fallback Condition: Not using BirdNET for this file (non-Aves etc.)
                 else:
@@ -249,8 +234,9 @@ def _process_primary_for_chunking(args):
                     primary_chunk = relevant_audio[start_idx : start_idx + target_samples]
 
             # --- Generate Spectrogram from selected chunk --- 
+            # If primary_chunk is None here, it means something went wrong in the random fallback, 
+            # or the initial audio was too short. We should skip.
             if primary_chunk is None: 
-                # This can happen if the loop was broken early due to running out of detections
                 continue # Skip spectrogram generation for this iteration
 
             if primary_chunk is not None and len(primary_chunk) == target_samples:

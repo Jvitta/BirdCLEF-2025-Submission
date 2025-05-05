@@ -10,10 +10,71 @@ import matplotlib.pyplot as plt
 import IPython.display as ipd
 import multiprocessing
 import traceback
+from pathlib import Path
 
 import torch
 import warnings
 warnings.filterwarnings("ignore")
+
+# --- Worker Function (moved from kaggle_inference.py) ---
+def _preprocess_audio_file_worker(audio_path_str, config):
+    """Loads one audio file, generates all 5s specs and row IDs."""
+    audio_path = Path(audio_path_str)
+    soundscape_id = audio_path.stem
+    segment_specs = []
+    segment_row_ids = []
+
+    try:
+        audio_data, sr = librosa.load(audio_path, sr=config.FS, mono=True)
+        segment_length_samples = int(config.TARGET_DURATION * config.FS)
+        total_duration_samples = len(audio_data)
+        num_segments = total_duration_samples // segment_length_samples
+
+        if num_segments == 0:
+            return [], [] # Skip short files
+
+        for segment_idx in range(num_segments):
+            start_sample = segment_idx * segment_length_samples
+            end_sample = start_sample + segment_length_samples
+            segment_audio = audio_data[start_sample:end_sample]
+
+            # --- Replicate processing logic (could be moved to utils) ---
+            target_len = segment_length_samples
+            if len(segment_audio) < target_len:
+                segment_audio = np.pad(segment_audio, (0, target_len - len(segment_audio)), mode='constant')
+            elif len(segment_audio) > target_len:
+                segment_audio = segment_audio[:target_len]
+
+            # --- Re-use audio2melspec if it exists and handles this --- 
+            # For now, keep the direct implementation as before
+            mel_spec = librosa.feature.melspectrogram(
+                y=segment_audio,
+                sr=config.FS, n_fft=config.N_FFT, hop_length=config.HOP_LENGTH,
+                n_mels=config.N_MELS, fmin=config.FMIN, fmax=config.FMAX, power=2.0
+            )
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            min_val, max_val = mel_spec_db.min(), mel_spec_db.max()
+            if max_val > min_val: mel_spec_norm = (mel_spec_db - min_val) / (max_val - min_val)
+            else: mel_spec_norm = np.zeros_like(mel_spec_db)
+
+            if mel_spec_norm.shape != config.TARGET_SHAPE:
+                mel_spec_resized = cv2.resize(mel_spec_norm, config.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
+            else:
+                mel_spec_resized = mel_spec_norm
+            # --- End Replicated Processing --- 
+
+            segment_specs.append(mel_spec_resized.astype(np.float32))
+            
+            end_time_sec = (segment_idx + 1) * config.TARGET_DURATION
+            row_id = f"{soundscape_id}_{int(end_time_sec)}"
+            segment_row_ids.append(row_id)
+
+        return segment_row_ids, segment_specs
+
+    except Exception as e:
+        # Print error specific to this file and return empty
+        print(f"\nError preprocessing worker {audio_path.name}: {e}\n{traceback.format_exc()}")
+        return [], []
 
 def audio2melspec(audio_data, cfg):
     """Convert audio data to mel spectrogram"""
