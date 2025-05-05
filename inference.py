@@ -251,7 +251,7 @@ class BirdCLEF2025Pipeline:
 
                 if actual_batch_size == 0:
                     continue
-
+                
                 # Convert the list of numpy arrays to a single numpy array
                 batch_specs_np = np.array(batch_segments) # Shape (B, H, W)
 
@@ -263,7 +263,7 @@ class BirdCLEF2025Pipeline:
 
                 # Define normalization transform once
                 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
+                
                 for tta_idx in range(tta_iterations):
                     # Apply TTA to the numpy batch
                     tta_specs_np = np.array([self.apply_tta(spec, tta_idx) for spec in batch_specs_np])
@@ -274,7 +274,7 @@ class BirdCLEF2025Pipeline:
                     batch_specs_tta = batch_specs_tta.unsqueeze(1).repeat(1, 3, 1, 1) # Shape (B, 3, H, W)
                     batch_specs_tta = batch_specs_tta.to(self.config.device)
                     batch_specs_tta = normalize(batch_specs_tta)
-
+                
                     # --- Model Ensemble Loop --- #
                     batch_model_preds = [] # Store predictions from each model for this TTA batch
                     for model in self.models:
@@ -282,11 +282,11 @@ class BirdCLEF2025Pipeline:
                             outputs = model(batch_specs_tta)
                             probs = torch.sigmoid(outputs)
                             batch_model_preds.append(probs.cpu().numpy())
-
+                    
                     # Average predictions across models for this TTA iteration
                     avg_model_preds = np.mean(batch_model_preds, axis=0)
                     all_tta_preds.append(avg_model_preds)
-
+                    
                 # Average predictions across TTA iterations for the batch
                 final_batch_preds = np.mean(all_tta_preds, axis=0)
                 # batch_final_preds.extend(final_batch_preds) # This was incorrect, extend overwrites

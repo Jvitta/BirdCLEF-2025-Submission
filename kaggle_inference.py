@@ -6,6 +6,10 @@ import time
 import math
 import cv2
 from pathlib import Path
+import multiprocessing
+from functools import partial
+import traceback
+import random # Import random module
 
 import numpy as np
 import pandas as pd
@@ -19,8 +23,8 @@ import torchvision.transforms as transforms
 
 # Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
 from config import config # Import central config
-# Optionally import utils if audio processing functions are moved there
-# import utils
+import birdclef_utils as utils # Import utils
+from birdclef_utils import _preprocess_audio_file_worker # Import the worker
 
 # Suppress warnings and limit logging output
 warnings.filterwarnings("ignore")
@@ -197,136 +201,152 @@ class BirdCLEF2025Pipeline:
         return self.models
 
     def apply_tta(self, spec, tta_idx):
-        """Apply basic Test-Time Augmentation (flip)."""
+        """Apply Test-Time Augmentation.
+        tta_idx=0: Original
+        tta_idx > 0: Random time shift within +/- max_shift_ratio.
+        """
         if tta_idx == 0:
-            return spec
-        elif tta_idx == 1:
-            return np.flip(spec, axis=1).copy() # Horizontal flip
-        elif tta_idx == 2:
-            return np.flip(spec, axis=0).copy() # Vertical flip
-        # Add more TTA types here if needed
+            return spec # Return original for index 0
         else:
-            return spec
-
-    def predict_on_audio_file(self, audio_path):
-        """Predict on all 5-second segments of a single audio file."""
-        all_predictions = []
-        row_ids = []
-        soundscape_id = Path(audio_path).stem
-
-        try:
-            print(f"Processing {soundscape_id}...")
-            # Load the entire audio file
-            audio_data, _ = librosa.load(audio_path, sr=self.config.FS, mono=True)
-
-            segment_length_samples = int(self.config.TARGET_DURATION * self.config.FS)
-            total_duration_samples = len(audio_data)
-            num_segments = total_duration_samples // segment_length_samples # Integer division for full segments
-
-            if num_segments == 0:
-                print(f"Warning: Audio file {audio_path} is shorter than target duration ({self.config.TARGET_DURATION}s). Skipping.")
-                return [], []
-
-            print(f"  Found {num_segments} segments.")
-            segments_processed = 0
+            # Apply random time shift for other indices
+            height, width = spec.shape
+            max_shift_ratio = 0.15 # Max shift percentage (e.g., 15%)
             
-            # Process segments in batches for efficiency
-            for i in range(0, num_segments, self.config.inference_batch_size):
-                batch_segments = []
-                batch_row_ids = []
-                actual_batch_size = 0
-                
-                for segment_idx in range(i, min(i + self.config.inference_batch_size, num_segments)):
-                    start_sample = segment_idx * segment_length_samples
-                    end_sample = start_sample + segment_length_samples
-                    segment_audio = audio_data[start_sample:end_sample]
+            # Generate random shift amount (-max_shift to +max_shift)
+            shift_ratio = random.uniform(-max_shift_ratio, max_shift_ratio)
+            shift_pixels = int(width * shift_ratio)
 
-                    end_time_sec = (segment_idx + 1) * self.config.TARGET_DURATION
-                    row_id = f"{soundscape_id}_{int(end_time_sec)}" # Ensure integer end time
-                    batch_row_ids.append(row_id)
-
-                    # Process segment (convert to spectrogram)
-                    mel_spec = self.process_audio_segment(segment_audio)
-                    batch_segments.append(mel_spec)
-                    actual_batch_size += 1
-
-                if actual_batch_size == 0:
-                    continue
-
-                # Convert the list of numpy arrays to a single numpy array
-                batch_specs_np = np.array(batch_segments) # Shape (B, H, W)
-
-                batch_final_preds = [] # Store predictions for this batch
-
-                # --- TTA Loop (if enabled) --- #
-                tta_iterations = self.config.tta_count if self.config.use_tta else 1
-                all_tta_preds = [] # Store predictions across TTA iterations for this batch
-
-                # Define normalization transform once
-                normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-                for tta_idx in range(tta_iterations):
-                    # Apply TTA to the numpy batch
-                    tta_specs_np = np.array([self.apply_tta(spec, tta_idx) for spec in batch_specs_np])
-
-                    # Convert augmented numpy batch to 3-channel, normalized tensor
-                    batch_specs_tta = torch.tensor(tta_specs_np, dtype=torch.float32) # Shape (B, H, W)
-                    # Add channel dim, repeat, move to device, normalize
-                    batch_specs_tta = batch_specs_tta.unsqueeze(1).repeat(1, 3, 1, 1) # Shape (B, 3, H, W)
-                    batch_specs_tta = batch_specs_tta.to(self.config.device)
-                    batch_specs_tta = normalize(batch_specs_tta)
-
-                    # --- Model Ensemble Loop --- #
-                    batch_model_preds = [] # Store predictions from each model for this TTA batch
-                    for model in self.models:
-                        with torch.no_grad():
-                            outputs = model(batch_specs_tta)
-                            probs = torch.sigmoid(outputs)
-                            batch_model_preds.append(probs.cpu().numpy())
-
-                    # Average predictions across models for this TTA iteration
-                    avg_model_preds = np.mean(batch_model_preds, axis=0)
-                    all_tta_preds.append(avg_model_preds)
-
-                # Average predictions across TTA iterations for the batch
-                final_batch_preds = np.mean(all_tta_preds, axis=0)
-                # batch_final_preds.extend(final_batch_preds) # This was incorrect, extend overwrites
-
-                # Append batch results to overall lists
-                all_predictions.extend(final_batch_preds) # Extend with the averaged predictions for the batch
-                row_ids.extend(batch_row_ids)
-                segments_processed += actual_batch_size
-                print(f"    Processed segments {segments_processed}/{num_segments}", end='\r')
-
-            print(f"\n  Finished processing {soundscape_id}.")
-
-        except Exception as e:
-            print(f"Error processing {audio_path}: {e}")
-            # Optionally return partial results or empty lists
-            return [], []
-
-        return row_ids, all_predictions
+            if shift_pixels == 0:
+                return spec # No shift
+            
+            if shift_pixels > 0: # Positive shift -> Shift content right (pad left)
+                padded = np.pad(spec, ((0, 0), (shift_pixels, 0)), mode='reflect')
+                return padded[:, :width] # Crop from left
+            else: # Negative shift -> Shift content left (pad right)
+                shift_pixels = abs(shift_pixels)
+                padded = np.pad(spec, ((0, 0), (0, shift_pixels)), mode='reflect')
+                return padded[:, -width:] # Crop from right
 
     def run_inference(self):
         """
-        Run inference on all test soundscape audio files.
-        
-        :return: Tuple (all_row_ids, all_predictions) aggregated from all files.
+        Run inference: Preprocess all files in parallel, then predict in batches.
         """
         test_files = list(Path(self.config.test_audio_dir).glob('*.ogg'))
         if self.config.debug:
             print(f"Debug mode enabled, using only {self.config.debug_limit_files} files")
             test_files = test_files[:self.config.debug_limit_files]
         print(f"Found {len(test_files)} test soundscapes")
+        if not test_files:
+            print("No test files found. Exiting.")
+            return [], []
 
+        # --- Stage 1: Parallel Preprocessing --- 
+        print("Starting parallel preprocessing of audio files...")
+        start_preprocess = time.time()
         all_row_ids = []
-        all_predictions = []
-
-        for audio_path in tqdm(test_files, desc="Inferring on Test Set"):
-            row_ids, predictions = self.predict_on_audio_file(str(audio_path))
-            all_row_ids.extend(row_ids)
-            all_predictions.extend(predictions)
+        all_specs_list = []
+        num_workers = max(1, multiprocessing.cpu_count() - 1)
+        print(f"Using {num_workers} workers for preprocessing.")
         
+        # Use functools.partial to pass the config to the *imported* worker function
+        # Ensure the function name matches the one imported from utils
+        worker_func = partial(_preprocess_audio_file_worker, config=self.config)
+        
+        pool = None
+        try:
+            pool = multiprocessing.Pool(processes=num_workers)
+            # Process files and collect results
+            results_iterator = pool.imap_unordered(worker_func, [str(p) for p in test_files])
+            
+            for result in tqdm(results_iterator, total=len(test_files), desc="Preprocessing Files"):
+                row_ids_part, specs_part = result
+                if row_ids_part: # Only extend if results are not empty (error handling in worker)
+                    all_row_ids.extend(row_ids_part)
+                    all_specs_list.extend(specs_part)
+        except Exception as e:
+            print(f"\nCRITICAL ERROR during multiprocessing: {e}")
+            print(traceback.format_exc())
+            # Decide how to proceed: exit or try inference on partial data?
+            print("Exiting due to multiprocessing error.")
+            if pool: pool.terminate()
+            return [], []
+        finally:
+            if pool:
+                pool.close()
+                pool.join()
+        
+        end_preprocess = time.time()
+        print(f"Preprocessing finished in {end_preprocess - start_preprocess:.2f} seconds.")
+        print(f"Total spectrogram segments generated: {len(all_specs_list)}")
+
+        if not all_specs_list:
+            print("No spectrograms were generated. Exiting inference.")
+            return [], []
+
+        # Consolidate into NumPy array (potential memory bottleneck)
+        try:
+            print("Consolidating spectrograms into NumPy array...")
+            all_specs_np = np.array(all_specs_list)
+            del all_specs_list # Free up memory
+            gc.collect()
+            print(f"Consolidated array shape: {all_specs_np.shape}")
+        except MemoryError:
+            print("MemoryError: Could not create NumPy array of all spectrograms. Not enough RAM.")
+            print("Consider reducing NUM_EXAMPLES_TO_VISUALIZE in debug mode or using a machine with more RAM.")
+            return [], []
+        except Exception as e:
+            print(f"Error converting spectrogram list to NumPy array: {e}")
+            return [], []
+
+        # --- Stage 2: Batched Inference --- 
+        print("Starting batched inference...")
+        start_inference = time.time()
+        all_predictions = []
+        # Define normalization transform once
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        num_total_specs = all_specs_np.shape[0]
+
+        for i in tqdm(range(0, num_total_specs, self.config.inference_batch_size), desc="Inference Batches"):
+            batch_specs_np = all_specs_np[i : i + self.config.inference_batch_size]
+            
+            # --- TTA Logic --- 
+            tta_iterations = self.config.tta_count if self.config.use_tta else 1
+            batch_tta_preds = [] # Store preds for each TTA variant for this batch
+            for tta_idx in range(tta_iterations):
+                # Apply TTA to the numpy batch
+                tta_batch_np = np.array([self.apply_tta(spec, tta_idx) for spec in batch_specs_np])
+                
+                # Convert TTA'd batch to normalized tensor
+                batch_tensor = torch.tensor(tta_batch_np, dtype=torch.float32)
+                batch_tensor = batch_tensor.unsqueeze(1).repeat(1, 3, 1, 1) 
+                batch_tensor = batch_tensor.to(self.config.device)
+                batch_tensor = normalize(batch_tensor)
+                
+                # --- Ensemble Logic --- 
+                batch_model_preds = []
+                for model in self.models:
+                    with torch.no_grad():
+                        outputs = model(batch_tensor)
+                        probs = torch.sigmoid(outputs)
+                        batch_model_preds.append(probs.cpu().numpy())
+                        
+                # Average predictions across models for this TTA iteration
+                avg_model_preds = np.mean(batch_model_preds, axis=0)
+                batch_tta_preds.append(avg_model_preds)
+                
+            # Average predictions across TTA iterations for the final batch prediction
+            final_batch_preds = np.mean(batch_tta_preds, axis=0)
+            all_predictions.extend(final_batch_preds)
+            
+        end_inference = time.time()
+        print(f"Inference finished in {end_inference - start_inference:.2f} seconds.")
+
+        # Ensure prediction count matches row_id count
+        if len(all_predictions) != len(all_row_ids):
+            print(f"CRITICAL WARNING: Mismatch between number of predictions ({len(all_predictions)}) and row_ids ({len(all_row_ids)}). Submission will likely fail.")
+            # Handle this error - maybe return empty? 
+            return [], []
+
         return all_row_ids, all_predictions
 
     def create_submission(self, row_ids, predictions):
@@ -399,7 +419,7 @@ class BirdCLEF2025Pipeline:
     def run(self):
         """Main method to execute the full inference pipeline."""
         start_time = time.time()
-        print("\n--- Starting BirdCLEF-2025 Inference Pipeline ---")
+        print("\n--- Starting BirdCLEF-2025 Inference Pipeline (Parallel Preprocessing) ---")
         print(f"Using Device: {self.config.device}")
         print(f"Debug Mode: {self.config.debug}")
         print(f"TTA Enabled: {self.config.use_tta} (Variations: {self.config.tta_count if self.config.use_tta else 1})")
@@ -408,12 +428,20 @@ class BirdCLEF2025Pipeline:
         # 1. Load Models
         self.load_models()
         if not self.models:
-            print("Error: No models loaded! Please check model paths and fold configuration. Exiting.")
+            print("Error: No models loaded! Exiting.")
             return
         print(f"Model usage: {'Single model' if len(self.models) == 1 else f'Ensemble of {len(self.models)} models'}")
+        
+        # 2. Run Inference (Now includes parallel preprocessing)
         row_ids, predictions = self.run_inference()
+        if not row_ids:
+            print("Inference failed or produced no results. Exiting.")
+            return
+            
+        # 3. Create Submission
         submission_df = self.create_submission(row_ids, predictions)
         
+        # 4. Save and Smooth
         submission_path = 'submission.csv'
         submission_df.to_csv(submission_path, index=False)
         print(f"Initial submission saved to {submission_path}")
@@ -426,6 +454,16 @@ class BirdCLEF2025Pipeline:
 
 # Run the BirdCLEF2025 Pipeline:
 if __name__ == "__main__":
+    # Force 'spawn' start method for multiprocessing in interactive environments
+    # This often prevents hangs/deadlocks.
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+        print("Multiprocessing start method set to 'spawn'.")
+    except RuntimeError:
+        # Might already be set or not applicable
+        print("Could not set multiprocessing start method (might be already set or unsupported).")
+        pass 
+        
     print(f"Initializing pipeline with device: {config.device}")
     pipeline = BirdCLEF2025Pipeline(config) # Pass the imported config
     pipeline.run()
