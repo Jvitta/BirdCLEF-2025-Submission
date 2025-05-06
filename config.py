@@ -1,6 +1,7 @@
 import torch
 import os
 import multiprocessing
+import math
 from google.cloud import storage
 
 class Config:
@@ -47,15 +48,15 @@ class Config:
     TARGET_DURATION = 5.0  
     N_FFT = 1024
     HOP_LENGTH = 128
-    N_MELS = 160
-    FMIN = 20
+    N_MELS = 136
+    FMIN = 50
     FMAX = 16000
-    TARGET_SHAPE = (256, 256) 
+    TARGET_SHAPE = (256, 256)
 
     model_name = 'efficientnet_b0'
     pretrained = True
     in_channels = 3
-    num_classes = 206  
+    num_classes = 206
 
     LOAD_PREPROCESSED_DATA = True
     REMOVE_SPEECH_INTERVALS = True
@@ -75,7 +76,7 @@ class Config:
     criterion = 'FocalLossBCE'
     focal_loss_alpha = 0.25
     focal_loss_gamma = 2.0
-    focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
+    focal_loss_bce_weight = 1.0 # Focal weight will be calculated as 2.0 - bce_weight
 
     label_smoothing_factor = 0.1
 
@@ -124,3 +125,6 @@ class Config:
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
 config = Config()
+
+# Optional: Add another print here to confirm the final config object shape if needed
+# print(f"[Config Instance] TARGET_SHAPE: {config.TARGET_SHAPE}")

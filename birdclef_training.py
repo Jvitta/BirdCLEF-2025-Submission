@@ -102,57 +102,70 @@ class BirdCLEFDataset(Dataset):
         primary_label = row['primary_label']
         secondary_labels = row.get('secondary_labels', [])
         filename_for_error = row.get('filename', samplename) # Use filename if available
-        spec = None
+        
+        spec = None # This will hold the final (H_5s, W_5s) processed chunk
+        target_h_5s, target_w_5s = self.config.TARGET_SHAPE # Expected final shape, e.g., (256, 256)
 
-        # --- Load preprocessed data --- #
-        if self.all_spectrograms is None:
-            print(f"CRITICAL ERROR: all_spectrograms is None in __getitem__ for {samplename}! Cannot proceed.")
-            raise ValueError("BirdCLEFDataset received None for all_spectrograms, but preprocessed data is required.")
-            
         if samplename in self.all_spectrograms:
-            spec_data = self.all_spectrograms[samplename] # Can be (3, 256, 256) or (256, 256)
-            selected_spec_np = None # To hold the final (256, 256) numpy array
-            expected_shape_2d = tuple(self.config.TARGET_SHAPE)
+            spec_data_from_npz = self.all_spectrograms[samplename]
+            raw_selected_chunk_2d = None # This will be the 2D chunk selected, potentially >5s wide
 
-            # --- Handle based on retrieved data type/shape --- 
-            if isinstance(spec_data, np.ndarray):
-                # Case 1: Primary Data (Multiple Chunks stacked) - Shape (3, 256, 256)
-                if spec_data.ndim == 3 and spec_data.shape[1:] == expected_shape_2d:
-                    if self.mode == 'train':
-                        # Randomly select one chunk (np array iterates over first dim)
-                        selected_spec_np = random.choice(spec_data) 
-                    else:
-                        # Validation/Test: Take the first chunk
-                        selected_spec_np = spec_data[0]
-                    
-                # Case 2: Pseudo Data (Single Chunk) - Shape (256, 256)
-                elif spec_data.ndim == 2 and spec_data.shape == expected_shape_2d:
-                    selected_spec_np = spec_data
+            if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 3:
+                # Assumes data is always (N, H, W_chunk)
+                # N is number of chunks, H is consistent height, W_chunk is width of EACH chunk.
+                num_available_chunks = spec_data_from_npz.shape[0]
                 
-                # Case 3: Unexpected ndarray shape
+                if num_available_chunks > 0:
+                    selected_idx = 0
+                    if self.mode == 'train' and num_available_chunks > 1:
+                        selected_idx = random.randint(0, num_available_chunks - 1)
+                    raw_selected_chunk_2d = spec_data_from_npz[selected_idx]
                 else:
-                    print(f"WARNING: Ndarray '{samplename}' has unexpected shape {spec_data.shape}. Attempting reshape or using zeros.")
-                    try:
-                        selected_spec_np = spec_data.reshape(expected_shape_2d)
-                        print(f"  Successfully reshaped '{samplename}' to {selected_spec_np.shape}")
-                    except:
-                        print(f"  Reshape failed for '{samplename}'. Using zeros.")
+                    print(f"WARNING: Data for '{samplename}' is a 3D array but has 0 chunks. Using zeros.")
 
-            if selected_spec_np is not None and selected_spec_np.shape == expected_shape_2d:
-                spec = selected_spec_np
+            elif isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 2:
+                # This case should ideally be phased out if preprocessing always saves as 3D (1, H, W)
+                print(f"WARNING: Data for '{samplename}' is a 2D array. Preprocessing should save as 3D (e.g., (1, H, W)). Attempting to use directly.")
+                raw_selected_chunk_2d = spec_data_from_npz
             else:
-                spec = np.zeros(expected_shape_2d, dtype=np.float32)
-                shape_info = selected_spec_np.shape if isinstance(selected_spec_np, np.ndarray) else type(selected_spec_np)
-                print(f"Fallback: Using zeros for '{samplename}' due to processing issues (Final shape before fallback: {shape_info}).")
-        else:
-            print(f"ERROR: Samplename '{samplename}' not found in the pre-loaded spectrogram dictionary! Using zeros.")
+                ndim_info = spec_data_from_npz.ndim if isinstance(spec_data_from_npz, np.ndarray) else "Not an ndarray"
+                print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
+
+            # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
+            # Crop it if it's wider than the target 5s width.
+            if raw_selected_chunk_2d is not None:
+                current_h, current_w = raw_selected_chunk_2d.shape
+
+                if current_h != target_h_5s:
+                    print(f"ERROR: Chunk for '{samplename}' (shape {raw_selected_chunk_2d.shape}) has height {current_h} but expected {target_h_5s}. Using zeros.")
+                elif current_w == target_w_5s:
+                    spec = raw_selected_chunk_2d
+                elif current_w > target_w_5s:
+                    if self.mode == 'train':
+                        max_start = current_w - target_w_5s
+                        start_idx = random.randint(0, max_start)
+                        spec = raw_selected_chunk_2d[:, start_idx : start_idx + target_w_5s]
+                    else: # Validation/Test: center crop
+                        start_idx = (current_w - target_w_5s) // 2
+                        spec = raw_selected_chunk_2d[:, start_idx : start_idx + target_w_5s]
+                else: # current_w < target_w_5s
+                    print(f"WARNING: Chunk for '{samplename}' (shape {raw_selected_chunk_2d.shape}) is shorter (width {current_w}) than target 5s width ({target_w_5s}). Using zeros as fallback.")
+            
+            # Fallback if spec is still None or issues occurred during processing
+            if spec is None or spec.shape != self.config.TARGET_SHAPE:
+                 original_shape_info = spec_data_from_npz.shape if isinstance(spec_data_from_npz, np.ndarray) else type(spec_data_from_npz)
+                 current_spec_shape_info = spec.shape if spec is not None else "None"
+                 print(f"Fallback: Using zeros for '{samplename}'. Raw NPZ shape: {original_shape_info}, Processed spec shape before fallback: {current_spec_shape_info}.")
+                 spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+        
+        else: # samplename not found in the pre-loaded spectrogram dictionary
+            print(f"ERROR: Samplename '{samplename}' not found in pre-loaded dictionary! Using zeros.")
             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
 
-        # --- Final Shape Guarantee ---
-        expected_shape = tuple(self.config.TARGET_SHAPE)
-        if not isinstance(spec, np.ndarray) or spec.shape != expected_shape:
+        # --- Final Shape Guarantee --- (important for downstream code)
+        if not isinstance(spec, np.ndarray) or spec.shape != tuple(self.config.TARGET_SHAPE):
              print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
-             spec = np.zeros(expected_shape, dtype=np.float32)
+             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
 
         # Ensure spec is float32 before augmentations/tensor conversion
         spec = spec.astype(np.float32)

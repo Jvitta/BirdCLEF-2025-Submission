@@ -10,6 +10,7 @@ import soundfile as sf
 from pathlib import Path
 from tqdm.auto import tqdm
 import math
+import cv2 # <-- Import OpenCV
 
 # Ensure project root is in path to import config and utils
 current_dir = Path(__file__).parent
@@ -22,51 +23,55 @@ import birdclef_utils as utils # Assuming utils has audio2melspec or similar
 # --- Configuration ---
 NUM_EXAMPLES_TO_VISUALIZE = 5 # How many random chunks to analyze
 MIN_BIRDNET_CONFIDENCE = 0.5 # Minimum confidence for selecting a BirdNET detection
-OUTPUT_BASE_DIR = project_root / "outputs" / "eda_spectrograms"
+OUTPUT_BASE_DIR = project_root / "outputs" / "eda_spectrograms_resized" # New output dir
+FINAL_RESIZE_SHAPE = (256, 256) # The final shape fed to the model (height, width)
 
-# Define parameter sets to test (including baseline and top solutions from previous year)
-PARAM_SETS = [
-    {
-        "name": "baseline", # Our current configuration
-        "n_fft": config.N_FFT, # 1024
-        "hop_length": config.HOP_LENGTH, # 128
-        "n_mels": config.N_MELS, # 136
-        "fmin": config.FMIN, # 20
-        "fmax": config.FMAX, # 16000
-    },
-    {
-        "name": "top_sol_1",
-        "n_fft": 1024,
-        "hop_length": 500,
-        "n_mels": 128,
-        "fmin": 40,
-        "fmax": 15000,
-    },
-    {
-        "name": "top_sol_2",
-        "n_fft": 2048,
-        "hop_length": 512,
-        "n_mels": 128,
-        "fmin": 20,
-        "fmax": 16000,
-    },
-    {
-        "name": "top_sol_3_torch",
-        "n_fft": 4096, # From 2048*2
-        "hop_length": 512,
-        "n_mels": 512,
-        "fmin": 0,
-        "fmax": 16000,
-    },
-    {
-        "name": "top_sol_4",
-        "n_fft": 1095, # Unusual n_fft
-        "hop_length": 500,
-        "n_mels": 128,
-        "fmin": 40,
-        "fmax": 15000,
-    },
-]
+# --- Define Parameter Combinations --- #
+new_param_sets = []
+
+# Parameter lists to combine
+n_fft_list = [1024, 2048]
+n_mels_list = [136, 256]
+hop_lengths = [64, 128, 256]
+fmin_list = [20, 50, 100]
+
+# Add the current baseline config explicitly (which will also be resized)
+new_param_sets.append({
+    "name": f"BASELINE_fft{config.N_FFT}_hop{config.HOP_LENGTH}_mel{config.N_MELS}_fmin{config.FMIN}",
+    "n_fft": config.N_FFT,
+    "hop_length": config.HOP_LENGTH,
+    "n_mels": config.N_MELS,
+    "fmin": config.FMIN,
+    "fmax": config.FMAX, # Keep FMAX from config
+})
+
+
+# Generate new combinations
+for n_fft in n_fft_list:
+    for hop in hop_lengths:
+        for n_mels in n_mels_list:
+            for fmin in fmin_list:
+                # Basic validation
+                if n_fft < hop: continue
+
+                param_name = f"fft{n_fft}_hop{hop}_mel{n_mels}_fmin{fmin}"
+                # Avoid adding duplicate if it matches baseline params
+                is_baseline = (n_fft == config.N_FFT and
+                               hop == config.HOP_LENGTH and
+                               n_mels == config.N_MELS and
+                               fmin == config.FMIN)
+                if not is_baseline:
+                    new_param_sets.append({
+                        "name": param_name,
+                        "n_fft": n_fft,
+                        "hop_length": hop,
+                        "n_mels": n_mels,
+                        "fmin": fmin,
+                        "fmax": config.FMAX, # Keep FMAX from config
+                    })
+
+PARAM_SETS = new_param_sets
+print(f"Generated {len(PARAM_SETS)} parameter sets for visualization.")
 
 # Create base output directory
 OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,9 +88,7 @@ def generate_spectrogram(audio, sr, n_fft, hop_length, n_mels, fmin, fmax):
             n_mels=n_mels,
             fmin=fmin,
             fmax=fmax,
-            # power=2.0 # librosa default
         )
-        # Convert to decibels
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
         return mel_spec_db
     except Exception as e:
@@ -94,28 +97,32 @@ def generate_spectrogram(audio, sr, n_fft, hop_length, n_mels, fmin, fmax):
 
 # --- Main Logic ---
 def main():
-    print("--- EDA: Spectrogram Parameter Visualization ---")
+    print("--- EDA: Resized Spectrogram Parameter Visualization ---")
 
-    # 1. Load BirdNET Detections
+    # 1. Load BirdNET Detections (Optional, adjust if needed)
     print(f"Loading BirdNET detections from: {config.BIRDNET_DETECTIONS_NPZ_PATH}")
     try:
+        # Load or define logic to get audio files for visualization
+        # This example still uses BirdNET to find interesting segments
         with np.load(config.BIRDNET_DETECTIONS_NPZ_PATH, allow_pickle=True) as data:
             all_birdnet_detections = {key: data[key] for key in data.files}
         print(f"Loaded {len(all_birdnet_detections)} files with BirdNET detections.")
         if not all_birdnet_detections:
             print("No detections found. Exiting.")
             return
-    except FileNotFoundError:
-        print(f"Error: BirdNET detections file not found at {config.BIRDNET_DETECTIONS_NPZ_PATH}. Exiting.")
-        return
+        valid_filenames = list(all_birdnet_detections.keys())
     except Exception as e:
-        print(f"Error loading BirdNET detections: {e}. Exiting.")
-        return
+        print(f"Could not load BirdNET detections ({e}). Falling back to random files if metadata exists.")
+        try:
+            df_train = pd.read_csv(config.train_csv_path)
+            valid_filenames = df_train['filename'].unique().tolist()
+        except Exception as e_meta:
+             print(f"Could not load metadata either ({e_meta}). Exiting.")
+             return
 
-    # 2. Select Files and Detections
-    valid_filenames = list(all_birdnet_detections.keys())
+    # 2. Select Files
     if len(valid_filenames) < NUM_EXAMPLES_TO_VISUALIZE:
-        print(f"Warning: Only {len(valid_filenames)} files have detections. Visualizing all.")
+        print(f"Warning: Only {len(valid_filenames)} files available. Visualizing all.")
         num_to_select = len(valid_filenames)
     else:
         num_to_select = NUM_EXAMPLES_TO_VISUALIZE
@@ -125,106 +132,73 @@ def main():
 
     # 3. Process Each Selected File/Chunk
     target_samples = int(config.TARGET_DURATION * config.FS)
-    min_samples_preprocess = int(0.5 * config.FS) # From preprocessing
+    min_samples_preprocess = int(0.5 * config.FS)
 
     for filename in tqdm(selected_files, desc="Processing Files"):
         print(f"Processing: {filename}")
-        detections = all_birdnet_detections[filename]
 
-        # Find a suitable detection (e.g., highest confidence above threshold)
-        suitable_detections = [
-            d for d in detections
-            if isinstance(d, dict) and d.get('confidence', 0) >= MIN_BIRDNET_CONFIDENCE
-        ]
-        if not suitable_detections:
-            print(f"  Skipping {filename}: No detections found with confidence >= {MIN_BIRDNET_CONFIDENCE}")
-            continue
-
-        # Sort by confidence and pick the best one for this example
-        suitable_detections.sort(key=lambda x: x.get('confidence', 0), reverse=True)
-        best_detection = suitable_detections[0]
-        det_start = best_detection.get('start_time', 0)
-        det_end = best_detection.get('end_time', 0)
-        det_conf = best_detection.get('confidence', 0)
-        print(f"  Using detection: Start={det_start:.2f}s, End={det_end:.2f}s, Conf={det_conf:.3f}")
-
-        # Construct audio path (assuming it's in the main train_audio dir for simplicity)
-        # TODO: Add logic for rare_audio if needed
+        # Construct audio path
         audio_path = Path(config.train_audio_dir) / filename
         if not audio_path.exists():
-             # Try rare audio path if configured
-             if config.USE_RARE_DATA:
-                 audio_path = Path(config.train_audio_rare_dir) / filename
-                 if not audio_path.exists():
-                    print(f"  Skipping {filename}: Audio file not found in {config.train_audio_dir} or {config.train_audio_rare_dir}")
+            if config.USE_RARE_DATA:
+                audio_path = Path(config.train_audio_rare_dir) / filename
+                if not audio_path.exists():
+                    print(f"  Skipping {filename}: Audio file not found.")
                     continue
-             else:
-                print(f"  Skipping {filename}: Audio file not found in {config.train_audio_dir}")
+            else:
+                print(f"  Skipping {filename}: Audio file not found.")
                 continue
 
-        # Create output subdir for this chunk
-        chunk_id = f"{Path(filename).stem}_start{det_start:.1f}_end{det_end:.1f}"
-        chunk_output_dir = OUTPUT_BASE_DIR / chunk_id
-        chunk_output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  Output directory: {chunk_output_dir}")
+        # Create output subdir for this file
+        file_stem = Path(filename).stem
+        file_output_dir = OUTPUT_BASE_DIR / file_stem
+        file_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Output directory: {file_output_dir}")
 
         # Load full audio
         try:
             full_audio, sr = librosa.load(audio_path, sr=config.FS, mono=True)
             if full_audio is None or len(full_audio) < min_samples_preprocess:
-                 print(f"  Skipping {filename}: Full audio too short or empty after loading.")
+                 print(f"  Skipping {filename}: Audio too short or empty.")
                  continue
             full_duration_samples = len(full_audio)
-
         except Exception as e:
             print(f"  Error loading audio file {audio_path}: {e}")
             continue
 
-        # Extract 5-second chunk centered on detection (mirroring preprocessing logic)
+        # --- Extract a SINGLE random 5-second chunk for consistent visualization ---
         try:
-            center_sec = (det_start + det_end) / 2.0
-            target_start_sec = center_sec - (config.TARGET_DURATION / 2.0)
-            target_end_sec = center_sec + (config.TARGET_DURATION / 2.0)
-
-            # Convert to samples and clamp
-            final_start_idx = max(0, int(target_start_sec * config.FS))
-            final_end_idx = min(full_duration_samples, int(target_end_sec * config.FS))
-
-            # Extract chunk
-            audio_chunk = full_audio[final_start_idx:final_end_idx]
-
-            # Pad if necessary
-            current_len = len(audio_chunk)
-            if current_len < target_samples:
-                pad_width = target_samples - current_len
-                # Simple padding at the end (adjust if different padding desired)
-                audio_chunk = np.pad(audio_chunk, (0, pad_width), mode='constant')
-            elif current_len > target_samples: # Should ideally not happen with correct logic, but trim just in case
-                audio_chunk = audio_chunk[:target_samples]
+            if full_duration_samples <= target_samples:
+                 # Pad short audio
+                 pad_width = target_samples - full_duration_samples
+                 audio_chunk = np.pad(full_audio, (0, pad_width), mode='constant')
+            else:
+                 # Take random crop
+                 max_start = full_duration_samples - target_samples
+                 start_idx = random.randint(0, max_start)
+                 audio_chunk = full_audio[start_idx : start_idx + target_samples]
 
             if len(audio_chunk) != target_samples:
-                 print(f"  Skipping {filename}: Final audio chunk length ({len(audio_chunk)}) != target ({target_samples}) after processing.")
+                 print(f"  Skipping {filename}: Problem creating 5s audio chunk.")
                  continue
-
         except Exception as e:
             print(f"  Error extracting chunk for {filename}: {e}")
             continue
 
         # Save audio chunk
-        audio_chunk_path = chunk_output_dir / "audio_chunk.wav"
+        audio_chunk_path = file_output_dir / "audio_chunk.wav"
         try:
             sf.write(audio_chunk_path, audio_chunk, config.FS)
-            print(f"  Saved audio chunk to: {audio_chunk_path}")
+            # print(f"  Saved audio chunk to: {audio_chunk_path}") # Less verbose
         except Exception as e:
-            print(f"  Error saving audio chunk: {e}")
-            # Continue to spectrogram generation even if audio saving fails
+            print(f"  Warning: Error saving audio chunk: {e}")
 
         # Generate and save spectrograms for different parameters
-        print("  Generating and saving spectrograms...")
-        for params in tqdm(PARAM_SETS, desc=f"Params for {chunk_id}", leave=False):
+        print("  Generating and resizing spectrograms...")
+        for params in tqdm(PARAM_SETS, desc=f"Params for {file_stem}", leave=False):
             param_name = params['name']
-            # print(f"    Testing params: {param_name}") # Optional verbose logging
 
+            # --- Generate original spectrogram ---
             mel_spec_db = generate_spectrogram(
                 audio_chunk, config.FS,
                 params['n_fft'], params['hop_length'], params['n_mels'],
@@ -232,34 +206,39 @@ def main():
             )
 
             if mel_spec_db is not None:
-                # Plot and save
-                plt.figure(figsize=(10, 4))
-                librosa.display.specshow(
-                    mel_spec_db,
-                    sr=config.FS,
-                    hop_length=params['hop_length'],
-                    x_axis='time',
-                    y_axis='mel',
-                    fmin=params['fmin'],
-                    fmax=params['fmax']
-                )
-                plt.colorbar(format='%+2.0f dB')
-                title = (
-                    f"Mel Spectrogram ({param_name})\n"
-                    f"n_fft={params['n_fft']}, hop={params['hop_length']}, n_mels={params['n_mels']}\n"
-                    f"File: {chunk_id}"
-                )
-                plt.title(title)
-                plt.tight_layout()
+                orig_h, orig_w = mel_spec_db.shape
 
-                img_path = chunk_output_dir / f"spectrogram_{param_name}.png"
+                # --- ALWAYS resize to FINAL_RESIZE_SHAPE ---
+                target_h, target_w = FINAL_RESIZE_SHAPE
+                target_shape_cv2 = (target_w, target_h) # OpenCV uses (width, height)
+                spec_to_plot = cv2.resize(mel_spec_db, target_shape_cv2, interpolation=cv2.INTER_LINEAR)
+                final_shape_h, final_shape_w = target_h, target_w # Should always be 256x256
+
+                # --- Plotting ---
+                # Set DPI and calculate figsize for exact 256x256 pixel output
+                dpi = 100
+                figsize = (final_shape_w / dpi, final_shape_h / dpi)
+                plt.figure(figsize=figsize, dpi=dpi)
+
+                # Use imshow with aspect='equal'
+                img = plt.imshow(spec_to_plot, aspect='equal', origin='lower', cmap='magma', interpolation='nearest')
+
+                # Remove axes, labels, colorbar, title for pure image view
+                plt.axis('off')
+                plt.margins(0,0)
+                plt.gca().xaxis.set_major_locator(plt.NullLocator())
+                plt.gca().yaxis.set_major_locator(plt.NullLocator())
+
+                # Construct filename including original params
+                img_path = file_output_dir / f"resized_256x256_orig_{param_name}.png"
                 try:
-                    plt.savefig(img_path)
+                    # Save without padding/whitespace
+                    plt.savefig(img_path, bbox_inches='tight', pad_inches=0, dpi=dpi)
                 except Exception as e:
                     print(f"    Error saving spectrogram image {img_path}: {e}")
                 plt.close() # Close plot to free memory
-            # else:
-                # print(f"    Skipped saving for params {param_name} due to generation error.")
+            else:
+                 print(f"    Skipped {param_name} due to generation error.")
 
     print("--- EDA Script Finished ---")
 
