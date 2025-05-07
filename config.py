@@ -6,8 +6,8 @@ from google.cloud import storage
 
 class Config:
     seed = 40
-    debug = False  # Master debug flag for limiting epochs, batches etc.
-    debug_preprocessing_mode = False # Controls N_MAX_PREPROCESS and filename suffix
+    debug = True  # Master debug flag for limiting epochs, batches etc.
+    debug_preprocessing_mode = True # Controls N_MAX_PREPROCESS and filename suffix
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -115,7 +115,7 @@ class Config:
     inference_folds = [0, 1]
 
     debug_limit_batches = 5 
-    debug_limit_files = 3 
+    debug_limit_files = 500
 
     # --- New: Smoothing Parameter ---
     smoothing_neighbor_weight = 0.125
