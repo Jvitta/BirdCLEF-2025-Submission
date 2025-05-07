@@ -49,7 +49,7 @@ class Config:
     N_FFT = 1024
     HOP_LENGTH = 128
     N_MELS = 136
-    FMIN = 50
+    FMIN = 20
     FMAX = 16000
     TARGET_SHAPE = (256, 256)
 
