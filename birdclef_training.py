@@ -211,9 +211,7 @@ class BirdCLEFDataset(Dataset):
             num_masks = random.randint(1, 3)
             for _ in range(num_masks):
                 width = random.randint(5, self.config.max_time_mask_width)
-                # Use NumPy shape access (spec_np.shape[1] is width/time)
                 start = random.randint(0, max(0, spec_np.shape[1] - width))
-                # Apply to the 2D numpy array
                 spec_np[:, start:start+width] = 0
 
         # Frequency masking (vertical stripes)
@@ -221,9 +219,7 @@ class BirdCLEFDataset(Dataset):
             num_masks = random.randint(1, 3)
             for _ in range(num_masks):
                 height = random.randint(5, self.config.max_freq_mask_height)
-                # Use NumPy shape access (spec_np.shape[0] is height/frequency)
                 start = random.randint(0, max(0, spec_np.shape[0] - height))
-                 # Apply to the 2D numpy array
                 spec_np[start:start+height, :] = 0
 
         # Random brightness/contrast
@@ -231,8 +227,6 @@ class BirdCLEFDataset(Dataset):
             gain = random.uniform(0.8, 1.2)
             bias = random.uniform(-0.1, 0.1)
             spec_np = spec_np * gain + bias
-            # Assuming spec_np was already normalized [0,1] during preprocessing
-            # Use np.clip for NumPy array
             spec_np = np.clip(spec_np, 0, 1)
 
         return spec_np

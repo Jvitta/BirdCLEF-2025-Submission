@@ -8,7 +8,6 @@ import pickle
 import random   
 import math   
 import multiprocessing
-from functools import partial 
 import traceback  
 import cv2         
 import librosa      
@@ -22,6 +21,10 @@ from config import config
 import birdclef_utils as utils 
 
 warnings.filterwarnings("ignore")
+
+
+random.seed(config.seed)
+np.random.seed(config.seed)
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""
@@ -466,11 +469,23 @@ def generate_and_save_spectrograms(df, config):
     if grouped_results:
         num_saved_files = len(grouped_results)
         total_chunks = sum(arr.shape[0] for arr in grouped_results.values() if arr is not None)
-        print(f"Saving {num_saved_files} primary file entries (total {total_chunks} chunks) to: {config.PREPROCESSED_NPZ_PATH}") 
+        
+        if config.debug:
+            debug_output_dir = os.path.join(project_root, "outputs", "preprocessed")
+            output_npz_path = os.path.join(debug_output_dir, "debug_spectrograms.npz")
+        else:
+            output_npz_path = config.PREPROCESSED_NPZ_PATH
+
+        output_dir = os.path.dirname(output_npz_path)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Created directory: {output_dir}")
+
+        print(f"Saving {num_saved_files} primary file entries (total {total_chunks} chunks) to: {output_npz_path}") 
         start_save = time.time()
         try:
             # Save the dictionary directly - values are already numpy arrays
-            np.savez_compressed(config.PREPROCESSED_NPZ_PATH, **grouped_results)
+            np.savez_compressed(output_npz_path, **grouped_results)
             end_save = time.time()
             print(f"NPZ saving took {end_save - start_save:.2f} seconds.")
         except Exception as e_save:
