@@ -222,14 +222,8 @@ def _process_primary_for_chunking(args):
         if error_msg:
             return samplename, None, error_msg
 
-        # 2. Determine strategy and handle short audio
-        original_relevant_len = len(relevant_audio)
-        is_originally_short = original_relevant_len < target_samples
-        
-        audio_for_processing = relevant_audio # Will be padded if short
-        if is_originally_short:
-            audio_for_processing = _pad_or_tile_audio(relevant_audio, target_samples)
 
+        MAX_AUDIO_SAMPLES_FOR_FULL_SPEC = int(config.MAX_DURATION_FOR_FULL_SPEC_SEC * config.FS)
         use_birdnet_strategy = (
             class_name == 'Aves' and
             scientific_name != UNCOVERED_AVES_SCIENTIFIC_NAME and
@@ -237,14 +231,28 @@ def _process_primary_for_chunking(args):
             len([d for d in birdnet_dets_for_file if isinstance(d, dict)]) > 0
         )
 
+        if not use_birdnet_strategy and MAX_AUDIO_SAMPLES_FOR_FULL_SPEC is not None:
+            if len(relevant_audio) > MAX_AUDIO_SAMPLES_FOR_FULL_SPEC:
+                relevant_audio = relevant_audio[:MAX_AUDIO_SAMPLES_FOR_FULL_SPEC]
+
+        # 2. Determine strategy and handle short audio
+        original_relevant_len = len(relevant_audio) # Length after potential truncation
+        is_originally_short = original_relevant_len < target_samples
+        
+        audio_for_processing = relevant_audio # Will be padded if short
+        if is_originally_short:
+            audio_for_processing = _pad_or_tile_audio(relevant_audio, target_samples)
+
         # 3. Generate Spectrogram(s)
         final_specs_list = []
 
         if not use_birdnet_strategy:
             # Strategy 1: Non-BirdNET -> Single spectrogram from (potentially padded) full audio
-            # Save at native mel resolution, resize will happen in dataloader after 5s crop.
-            # audio_for_processing is ensured to be at least 5s long (padded/tiled if original was shorter).
-            spec = _generate_spectrogram_from_chunk(audio_for_processing, config, resize_to_target_shape=False)
+            if is_originally_short:
+                spec = _generate_spectrogram_from_chunk(audio_for_processing, config, resize_to_target_shape=True)
+            else:
+                spec = _generate_spectrogram_from_chunk(audio_for_processing, config, resize_to_target_shape=False)
+            
             if spec is not None:
                 final_specs_list.append(spec)
         else:

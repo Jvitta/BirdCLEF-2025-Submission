@@ -4,8 +4,7 @@ import multiprocessing
 
 class Config:
     seed = 40
-    debug = True  # Master debug flag for limiting epochs, batches etc.
-    debug_preprocessing_mode = True # Controls N_MAX_PREPROCESS and filename suffix
+    debug = False
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -62,6 +61,7 @@ class Config:
     USE_PSEUDO_LABELS = False
 
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
+    MAX_DURATION_FOR_FULL_SPEC_SEC = 30.0
 
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
