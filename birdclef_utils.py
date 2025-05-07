@@ -1,7 +1,6 @@
 import cv2
 import librosa
 import numpy as np
-from tqdm import tqdm
 import traceback
 from pathlib import Path
 
@@ -55,7 +54,6 @@ def _preprocess_audio_file_worker(audio_path_str, config):
         return segment_row_ids, segment_specs
 
     except Exception as e:
-        # Print error specific to this file and return empty
         print(f"\nError preprocessing worker {audio_path.name}: {e}\n{traceback.format_exc()}")
         return [], []
 
