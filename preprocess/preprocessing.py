@@ -22,7 +22,6 @@ import birdclef_utils as utils
 
 warnings.filterwarnings("ignore")
 
-
 random.seed(config.seed)
 np.random.seed(config.seed)
 
@@ -66,7 +65,7 @@ def load_and_prepare_metadata(config):
 
 def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_intervals, 
                           class_name, scientific_name, UNCOVERED_AVES_SCIENTIFIC_NAME, min_samples):
-    """Loads audio, applies VAD/Fabio if needed, checks min length."""
+    """Loads audio, applies VAD/Fabio speech removal if needed, checks min length."""
     try:
         primary_audio, _ = librosa.load(filepath, sr=config.FS, mono=True)
         if primary_audio is None or len(primary_audio) < min_samples:
@@ -75,46 +74,60 @@ def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_inter
         return None, f"Error loading audio {filepath}: {e_load}"
 
     relevant_audio = primary_audio
-    should_apply_vad_fabio = False
-    if config.REMOVE_SPEECH_INTERVALS:
-        if not config.REMOVE_SPEECH_ONLY_NON_AVES:
-            should_apply_vad_fabio = True
-        elif class_name != 'Aves' or scientific_name == UNCOVERED_AVES_SCIENTIFIC_NAME:
-            should_apply_vad_fabio = True
+    should_apply_vad_fabio = config.REMOVE_SPEECH_INTERVALS and \
+                             (class_name != 'Aves' or scientific_name == UNCOVERED_AVES_SCIENTIFIC_NAME)
 
     if should_apply_vad_fabio:
         cleaned_audio_vad_fabio = None
+        # Apply Fabio speech removal
         if filename in fabio_intervals:
             start_time_fabio, stop_time_fabio = fabio_intervals[filename]
             start_idx_fabio = max(0, int(start_time_fabio * config.FS))
             end_idx_fabio = min(len(primary_audio), int(stop_time_fabio * config.FS))
+
             if start_idx_fabio < end_idx_fabio:
                 cleaned_audio_vad_fabio = primary_audio[start_idx_fabio:end_idx_fabio]
+        # Apply VAD speech removal
         elif filepath in vad_intervals:
             speech_timestamps = vad_intervals[filepath]
+
             if speech_timestamps:
                 non_speech_segments = []
                 current_pos_sec = 0.0
                 audio_duration_sec = len(primary_audio) / config.FS
-                try: speech_timestamps.sort(key=lambda x: x.get('start', 0))
-                except: speech_timestamps = []
+
+                try: 
+                    speech_timestamps.sort(key=lambda x: x.get('start', 0))
+                except: 
+                    speech_timestamps = []
+
                 for segment in speech_timestamps:
-                    if not isinstance(segment, dict) or 'start' not in segment or 'end' not in segment: continue
+                    if not isinstance(segment, dict) or 'start' not in segment or 'end' not in segment: 
+                        continue
                     start_speech_sec = segment['start']
                     end_speech_sec = segment['end']
+
                     if start_speech_sec > current_pos_sec:
                         start_idx_segment = max(0, int(current_pos_sec * config.FS))
                         end_idx_segment = min(len(primary_audio), int(start_speech_sec * config.FS))
-                        if end_idx_segment > start_idx_segment: non_speech_segments.append(primary_audio[start_idx_segment:end_idx_segment])
+                        if end_idx_segment > start_idx_segment: 
+                            non_speech_segments.append(primary_audio[start_idx_segment:end_idx_segment])
+                    
                     current_pos_sec = max(current_pos_sec, end_speech_sec)
+
                 if current_pos_sec < audio_duration_sec:
                     start_idx_segment = max(0, int(current_pos_sec * config.FS))
-                    if start_idx_segment < len(primary_audio): non_speech_segments.append(primary_audio[start_idx_segment:])
+                    if start_idx_segment < len(primary_audio): 
+                        non_speech_segments.append(primary_audio[start_idx_segment:])
+
                 if non_speech_segments:
                     non_speech_segments = [s for s in non_speech_segments if len(s) > 0]
-                    if non_speech_segments: cleaned_audio_vad_fabio = np.concatenate(non_speech_segments)
-                    else: cleaned_audio_vad_fabio = np.array([])
-                else: cleaned_audio_vad_fabio = np.array([])
+                    if non_speech_segments: 
+                        cleaned_audio_vad_fabio = np.concatenate(non_speech_segments)
+                    else: 
+                        cleaned_audio_vad_fabio = np.array([])
+                else: 
+                    cleaned_audio_vad_fabio = np.array([])
         
         if cleaned_audio_vad_fabio is not None and len(cleaned_audio_vad_fabio) >= min_samples:
             relevant_audio = cleaned_audio_vad_fabio
@@ -132,10 +145,10 @@ def _pad_or_tile_audio(audio_data, target_samples):
     elif current_len < target_samples:
         n_copy = math.ceil(target_samples / current_len) 
         padded_audio = np.tile(audio_data, n_copy)[:target_samples]
-        if len(padded_audio) < target_samples: # Final padding check
+        if len(padded_audio) < target_samples: 
             padded_audio = np.pad(padded_audio, (0, target_samples - len(padded_audio)), mode='constant')
         return padded_audio
-    else: # current_len > target_samples (shouldn't happen if called correctly, but safe)
+    else: 
         return audio_data[:target_samples]
 
 def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples):
@@ -162,31 +175,34 @@ def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_sa
 def _extract_random_chunk(audio_long, target_samples):
     """Extracts a random 5s chunk."""
     if len(audio_long) < target_samples: 
-        # This case should ideally be handled before calling, but return padded if needed
-        print(f"Warning: _extract_random_chunk called with audio shorter than target. Padding.")
         return _pad_or_tile_audio(audio_long, target_samples)
         
     max_start_idx_5s = len(audio_long) - target_samples
     start_idx_5s = random.randint(0, max_start_idx_5s)
     return audio_long[start_idx_5s : start_idx_5s + target_samples]
 
-def _generate_spectrogram_from_chunk(audio_chunk_5s, config):
-    """Generates and resizes a mel spectrogram from a 5s audio chunk."""
+def _generate_spectrogram_from_chunk(audio_chunk_5s, config, resize_to_target_shape: bool):
+    """Generates a mel spectrogram from an audio chunk, optionally resizes."""
     try:
-        raw_spec_5s_chunk = utils.audio2melspec(audio_chunk_5s, config)
-        if raw_spec_5s_chunk is None:
+        raw_spec_chunk = utils.audio2melspec(audio_chunk_5s, config)
+        if raw_spec_chunk is None:
             return None
         
-        # Resize to target shape
-        resized_spec_5s = cv2.resize(raw_spec_5s_chunk, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
-        if resized_spec_5s.shape == tuple(config.TARGET_SHAPE):
-            return resized_spec_5s.astype(np.float32)
+        if resize_to_target_shape:
+            # Resize to target shape for BirdNET chunks or if explicitly needed
+            resized_spec = cv2.resize(raw_spec_chunk, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+            if resized_spec.shape == tuple(config.TARGET_SHAPE):
+                return resized_spec.astype(np.float32)
+            else:
+                print(f"Warning: Resized spec has wrong shape {resized_spec.shape} (expected {config.TARGET_SHAPE})")
+                return None
         else:
-            print(f"Warning: Resized spec has wrong shape {resized_spec_5s.shape} (expected {config.TARGET_SHAPE})")
-            return None
-    except Exception as e_spec_5s:
-        # Optional: Log error e_spec_5s
-        # print(f"Warning: Spectrogram generation/resize failed for chunk: {e_spec_5s}")
+            # Return raw spec (H_mels, W_variable) for full audio strategy
+            return raw_spec_chunk.astype(np.float32)
+            
+    except Exception as e_spec_chunk:
+        # Optional: Log error e_spec_chunk
+        # print(f"Warning: Spectrogram generation/resize failed for chunk: {e_spec_chunk}")
         return None
 
 def _process_primary_for_chunking(args):
@@ -226,11 +242,13 @@ def _process_primary_for_chunking(args):
 
         if not use_birdnet_strategy:
             # Strategy 1: Non-BirdNET -> Single spectrogram from (potentially padded) full audio
-            spec = _generate_spectrogram_from_chunk(audio_for_processing, config)
+            # Save at native mel resolution, resize will happen in dataloader after 5s crop.
+            # audio_for_processing is ensured to be at least 5s long (padded/tiled if original was shorter).
+            spec = _generate_spectrogram_from_chunk(audio_for_processing, config, resize_to_target_shape=False)
             if spec is not None:
                 final_specs_list.append(spec)
         else:
-            # Strategy 2: BirdNET -> Multiple versions
+            # Strategy 2: BirdNET -> Multiple versions, pre-resized
             sorted_detections = []
             try:
                 sorted_detections = sorted(
@@ -253,9 +271,9 @@ def _process_primary_for_chunking(args):
                     if chunk_5s is None: 
                         chunk_5s = _extract_random_chunk(relevant_audio, target_samples)
 
-                # Generate spec from the obtained chunk
+                # Generate spec from the obtained chunk, and resize it here
                 if chunk_5s is not None:
-                    spec = _generate_spectrogram_from_chunk(chunk_5s, config)
+                    spec = _generate_spectrogram_from_chunk(chunk_5s, config, resize_to_target_shape=True)
                     if spec is not None:
                         final_specs_list.append(spec)
 
@@ -410,14 +428,13 @@ def _run_parallel_processing(tasks, worker_func, num_workers):
         with multiprocessing.Pool(processes=num_workers) as pool:
             results_iterator = pool.imap_unordered(worker_func, tasks)
             for result in tqdm(results_iterator, total=len(tasks), desc="Generating Specs"):
-                results_list.append(result) # Append tuple (samplename, spec_array, error_msg)
+                results_list.append(result) # tuple (samplename, spec_array, error_msg)
     except Exception as e:
         print(f"\nCRITICAL ERROR during multiprocessing: {e}")
         print(traceback.format_exc())
-        # Depending on desired behavior, could raise e or return partial results
-        raise # Re-raise the exception to stop the script
+        raise
 
-    print() # Newline after progress indicator
+    print()
     return results_list
 
 def _aggregate_results(results_list):
@@ -433,12 +450,10 @@ def _aggregate_results(results_list):
         if error_msg:
             errors_list.append(f"{samplename}: {error_msg}")
             error_count += 1
-        elif spec_array is not None and spec_array.ndim == 3: # Expect (N, H, W)
+        elif spec_array is not None and spec_array.ndim == 3: # (N, H, W)
             grouped_results[samplename] = spec_array
             processed_count += 1
         else:
-            # Worker finished but produced no valid specs or returned None
-            # print(f"Debug: Worker for {samplename} yielded no valid spectrogram array.")
             skipped_files += 1
             errors_list.append(f"{samplename}: Skipped (No valid spec array)")
 
@@ -553,8 +568,6 @@ def main(config):
     df_working = load_and_prepare_metadata(config)
 
     if df_working is not None and not df_working.empty:
-        # Call the refactored main generation function
-        # Removed the unnecessary assignment to '_'
         generate_and_save_spectrograms(df_working, config) 
     else:
         print("Metadata loading failed or resulted in empty dataframe. Cannot proceed.")
