@@ -36,6 +36,7 @@ import optuna
 from config import config
 import birdclef_utils as utils
 from google.cloud import storage
+import cv2
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -134,22 +135,47 @@ class BirdCLEFDataset(Dataset):
             # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
             # Crop it if it's wider than the target 5s width.
             if raw_selected_chunk_2d is not None:
+                # NEW LOGIC TO PROCESS raw_selected_chunk_2d INTO spec
+                final_target_shape_tuple = tuple(self.config.TARGET_SHAPE)
+                native_5s_frames = math.ceil(self.config.TARGET_DURATION * self.config.FS / self.config.HOP_LENGTH)
+                
                 current_h, current_w = raw_selected_chunk_2d.shape
+                processed_intermediate_spec = None
 
-                if current_h != target_h_5s:
-                    print(f"ERROR: Chunk for '{samplename}' (shape {raw_selected_chunk_2d.shape}) has height {current_h} but expected {target_h_5s}. Using zeros.")
-                elif current_w == target_w_5s:
-                    spec = raw_selected_chunk_2d
-                elif current_w > target_w_5s:
-                    if self.mode == 'train':
-                        max_start = current_w - target_w_5s
-                        start_idx = random.randint(0, max_start)
-                        spec = raw_selected_chunk_2d[:, start_idx : start_idx + target_w_5s]
-                    else: # Validation/Test: center crop
-                        start_idx = (current_w - target_w_5s) // 2
-                        spec = raw_selected_chunk_2d[:, start_idx : start_idx + target_w_5s]
-                else: # current_w < target_w_5s
-                    print(f"WARNING: Chunk for '{samplename}' (shape {raw_selected_chunk_2d.shape}) is shorter (width {current_w}) than target 5s width ({target_w_5s}). Using zeros as fallback.")
+                if current_h == self.config.N_MELS: # Native mel spec (e.g., 136, W_variable)
+                    img_5s_native = None
+                    if current_w > native_5s_frames: # Wider than 5s native, needs crop
+                        if self.mode == 'train':
+                            max_offset = current_w - native_5s_frames
+                            offset = random.randint(0, max_offset)
+                            img_5s_native = raw_selected_chunk_2d[:, offset:offset + native_5s_frames]
+                        else: # eval/test: center crop
+                            offset = (current_w - native_5s_frames) // 2
+                            img_5s_native = raw_selected_chunk_2d[:, offset:offset + native_5s_frames]
+                    elif current_w == native_5s_frames: # Already 5s native width
+                        img_5s_native = raw_selected_chunk_2d
+                    else: # Narrower than 5s native width, needs padding
+                        padding_width = native_5s_frames - current_w
+                        background_val = self.config.BACKGROUND_VALUE_MELSPEC if hasattr(self.config, 'BACKGROUND_VALUE_MELSPEC') else 0.0
+                        img_5s_native = np.pad(raw_selected_chunk_2d, ((0,0), (0, padding_width)), mode='constant', constant_values=background_val)
+                    
+                    # Resize this (N_MELS, native_5s_frames) segment to TARGET_SHAPE.
+                    if img_5s_native.shape != final_target_shape_tuple: 
+                        processed_intermediate_spec = cv2.resize(img_5s_native, (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        processed_intermediate_spec = img_5s_native # Should be TARGET_SHAPE if N_MELS was already TARGET_SHAPE[0] and width was TARGET_SHAPE[1]
+
+                elif current_h == self.config.TARGET_SHAPE[0]: # Already height-resized chunk (e.g., 256, W_target_shape)
+                    if raw_selected_chunk_2d.shape == final_target_shape_tuple:
+                        processed_intermediate_spec = raw_selected_chunk_2d
+                    else: # Fallback: width might not match, so resize to be sure
+                        processed_intermediate_spec = cv2.resize(raw_selected_chunk_2d, (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+                else:
+                    print(f"ERROR: Chunk for '{samplename}' (shape {raw_selected_chunk_2d.shape}) has unexpected height {current_h}. Expected {self.config.N_MELS} or {self.config.TARGET_SHAPE[0]}. Using zeros.")
+                    processed_intermediate_spec = np.zeros(final_target_shape_tuple, dtype=np.float32)
+                
+                spec = processed_intermediate_spec # Assign to the 'spec' variable
+                # END OF NEW LOGIC
             
             # Fallback if spec is still None or issues occurred during processing
             if spec is None or spec.shape != self.config.TARGET_SHAPE:
@@ -211,9 +237,7 @@ class BirdCLEFDataset(Dataset):
             num_masks = random.randint(1, 3)
             for _ in range(num_masks):
                 width = random.randint(5, self.config.max_time_mask_width)
-                # Use NumPy shape access (spec_np.shape[1] is width/time)
                 start = random.randint(0, max(0, spec_np.shape[1] - width))
-                # Apply to the 2D numpy array
                 spec_np[:, start:start+width] = 0
 
         # Frequency masking (vertical stripes)
@@ -221,9 +245,7 @@ class BirdCLEFDataset(Dataset):
             num_masks = random.randint(1, 3)
             for _ in range(num_masks):
                 height = random.randint(5, self.config.max_freq_mask_height)
-                # Use NumPy shape access (spec_np.shape[0] is height/frequency)
                 start = random.randint(0, max(0, spec_np.shape[0] - height))
-                 # Apply to the 2D numpy array
                 spec_np[start:start+height, :] = 0
 
         # Random brightness/contrast
@@ -231,8 +253,6 @@ class BirdCLEFDataset(Dataset):
             gain = random.uniform(0.8, 1.2)
             bias = random.uniform(-0.1, 0.1)
             spec_np = spec_np * gain + bias
-            # Assuming spec_np was already normalized [0,1] during preprocessing
-            # Use np.clip for NumPy array
             spec_np = np.clip(spec_np, 0, 1)
 
         return spec_np
