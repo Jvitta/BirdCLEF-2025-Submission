@@ -241,8 +241,6 @@ def _generate_spectrogram_from_chunk(audio_chunk_5s, config, resize_to_target_sh
             return raw_spec_chunk.astype(np.float32)
             
     except Exception as e_spec_chunk:
-        # Optional: Log error e_spec_chunk
-        # print(f"Warning: Spectrogram generation/resize failed for chunk: {e_spec_chunk}")
         return None
 
 def _process_primary_for_chunking(args):
@@ -279,11 +277,6 @@ def _process_primary_for_chunking(args):
 
         original_relevant_len = len(relevant_audio)
         
-        # Determine effective target samples for padding/tiling initial audio *if not using birdnet strategy for long files*
-        # or if birdnet strategy applies to short audio (it will use target_samples_extended_aves).
-        # For non-Aves short audio, it should be padded to 5s (target_samples_5s_final_model).
-        # For Aves short audio, it will be handled by _extract_birdnet_chunk to target_samples_extended_aves.
-
         audio_for_processing = relevant_audio 
         
         is_originally_short_for_5s_model = original_relevant_len < target_samples_5s_final_model
@@ -301,7 +294,6 @@ def _process_primary_for_chunking(args):
                     final_specs_list.append(spec_float32_resized) 
             else:
                 # Generate native spec from (potentially truncated at 25s) full audio, NO resize here.
-                # Dataloader will handle cropping to 5s and resizing.
                 spec_float32_native = _generate_spectrogram_from_chunk(relevant_audio, config, resize_to_target_shape=False)
                 if spec_float32_native is not None:
                     # Quantize the [0,1] float32 spec to uint16 [0, 65535]
@@ -327,28 +319,23 @@ def _process_primary_for_chunking(args):
                 
                 # _extract_birdnet_chunk handles cases where original audio is < 6s.
                 # It will use target_samples_extended_aves for its internal logic.
-                # min_samples is still 0.5s for a valid detection to start from.
                 if i < len(sorted_detections):
                     chunk_extended_audio = _extract_birdnet_chunk(
                         relevant_audio, 
                         sorted_detections[i], 
                         config, 
                         min_samples, 
-                        target_samples_extended_aves # Ensure ~6s target for extraction
+                        target_samples_extended_aves
                     )
                 
                 # Fallback to random ~6s chunk if BirdNET extraction failed or not enough detections
-                # This random chunk should also be target_samples_extended_aves
                 if chunk_extended_audio is None and not is_originally_short_for_6s_aves:
-                    # Only try random if original audio was long enough for a 6s chunk
                     chunk_extended_audio = _extract_random_chunk(relevant_audio, target_samples_extended_aves)
                 elif chunk_extended_audio is None and is_originally_short_for_6s_aves:
-                    # If original audio was < 6s, and BirdNET failed, pad/tile the original short audio to 6s
                     chunk_extended_audio = _pad_or_tile_audio(relevant_audio, target_samples_extended_aves)
 
                 if chunk_extended_audio is not None:
                     # Generate native mel spectrogram (e.g., 136xW_6s) from the ~6s audio chunk.
-                    # NO resize here.
                     spec_float32_native = _generate_spectrogram_from_chunk(
                         chunk_extended_audio, config, resize_to_target_shape=False
                     )
@@ -367,7 +354,6 @@ def _process_primary_for_chunking(args):
             return samplename, None, f"Error stacking specs for {samplename}: {e_stack}"
 
     except Exception as e_main:
-        # Catch any other unexpected errors in the main flow
         tb_str = traceback.format_exc()
         return samplename, None, f"Outer error processing {primary_filepath}: {e_main}\n{tb_str}"
 
