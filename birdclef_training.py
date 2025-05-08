@@ -111,6 +111,17 @@ class BirdCLEFDataset(Dataset):
             spec_data_from_npz = self.all_spectrograms[samplename]
             raw_selected_chunk_2d = None # This will be the 2D chunk selected, potentially >5s wide
 
+            # --- Dequantization Step --- 
+            if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.dtype == np.uint16:
+                # Dequantize from uint16 [0, 65535] to float32 [0, 1]
+                spec_data_from_npz = spec_data_from_npz.astype(np.float32) / 65535.0
+            elif isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.dtype != np.float32:
+                # If it's some other non-float32 type we weren't expecting after uint16,
+                # try to convert to float32. This is a fallback.
+                print(f"WARNING: Samplename '{samplename}' has unexpected dtype {spec_data_from_npz.dtype}. Converting to float32.")
+                spec_data_from_npz = spec_data_from_npz.astype(np.float32)
+            # If it was already float32, spec_data_from_npz is unchanged.
+
             if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 3:
                 # Assumes data is always (N, H, W_chunk)
                 # N is number of chunks, H is consistent height, W_chunk is width of EACH chunk.
