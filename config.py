@@ -12,17 +12,14 @@ class Config:
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
     GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/gcs_mount"
 
-    # These paths will be used primarily when IS_CUSTOM_JOB is False
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
-    # Define the directory where preprocessing outputs go
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
-    # Define the specific path for the single NPZ file
     PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
     MODEL_INPUT_DIR = MODEL_OUTPUT_DIR
 
-    # These derived paths use the mount point when IS_CUSTOM_JOB is False
+    # These derived paths use the mount point
     train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
     train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
     test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
@@ -59,10 +56,9 @@ class Config:
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
     USE_PSEUDO_LABELS = False
-
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
-    MAX_DURATION_FOR_FULL_SPEC_SEC = 30.0
-
+    
+    MAX_DURATION_FOR_FULL_SPEC_SEC = 25.0
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 

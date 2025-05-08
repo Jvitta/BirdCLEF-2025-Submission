@@ -16,12 +16,12 @@ import torch.nn.functional as F
 import timm
 from tqdm.auto import tqdm
 
-# Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
-from config import config # Import central config
-# Optionally import utils if audio processing functions are moved there
-# import utils
+current_dir = Path(__file__).parent
+project_root = current_dir.parent
+sys.path.append(str(project_root))
 
-# Suppress warnings and limit logging output
+from config import config 
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
