@@ -152,22 +152,64 @@ def _pad_or_tile_audio(audio_data, target_samples):
         return audio_data[:target_samples]
 
 def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples):
-    """Extracts a 5s chunk centered around a BirdNET detection."""
+    """
+    Extracts a chunk of `target_samples` length from `audio_long`.
+    If the BirdNET detection is near a boundary, the window is shifted to capture
+    `config.TARGET_DURATION` seconds of continuous audio if possible.
+    If `audio_long` itself is shorter than `config.TARGET_DURATION`, the full audio is taken
+    and `_pad_or_tile_audio` will handle making it `target_samples` long.
+    """
     try:
         birdnet_start_sec = detection.get('start_time', 0)
         birdnet_end_sec = detection.get('end_time', 0)
         center_sec = (birdnet_start_sec + birdnet_end_sec) / 2.0
-        target_start_sec_det = center_sec - (config.TARGET_DURATION / 2.0)
-        target_end_sec_det = center_sec + (config.TARGET_DURATION / 2.0)
-        final_start_idx_det = max(0, int(target_start_sec_det * config.FS))
-        final_end_idx_det = min(len(audio_long), int(target_end_sec_det * config.FS))
 
-        extracted_audio_segment = audio_long[final_start_idx_det:final_end_idx_det]
+        audio_len_samples = len(audio_long)
+        audio_duration_sec = audio_len_samples / config.FS
+        
+        # target_duration_sec is fixed by the model's input requirement
+        target_duration_sec = config.TARGET_DURATION 
 
-        if len(extracted_audio_segment) >= min_samples:
-            return _pad_or_tile_audio(extracted_audio_segment, target_samples) # Ensure exact length
+        final_start_sec = 0.0
+        final_end_sec = 0.0
+
+        if audio_duration_sec < target_duration_sec:
+            # If the entire audio is shorter than our target, take all of it.
+            final_start_sec = 0.0
+            final_end_sec = audio_duration_sec
         else:
-            return None # Indicate failure if segment too short after extraction
+            # Audio is long enough for a full target_duration_sec chunk.
+            # Calculate ideal window and adjust if it goes out of bounds.
+            ideal_start_sec = center_sec - (target_duration_sec / 2.0)
+            ideal_end_sec = center_sec + (target_duration_sec / 2.0)
+
+            if ideal_start_sec < 0:
+                final_start_sec = 0.0
+                final_end_sec = target_duration_sec
+            elif ideal_end_sec > audio_duration_sec:
+                final_end_sec = audio_duration_sec
+                final_start_sec = audio_duration_sec - target_duration_sec
+            else:
+                # The ideal window is fully within bounds
+                final_start_sec = ideal_start_sec
+                final_end_sec = ideal_end_sec
+        
+        # Convert seconds to sample indices, ensuring they are valid
+        final_start_idx = max(0, int(final_start_sec * config.FS))
+        final_end_idx = min(audio_len_samples, int(final_end_sec * config.FS))
+        
+        # Ensure start_idx is not greater than end_idx (can happen with very short audio or rounding)
+        if final_start_idx >= final_end_idx:
+            pass
+
+        extracted_audio_segment = audio_long[final_start_idx:final_end_idx]
+
+        if len(extracted_audio_segment) < min_samples:
+            return None 
+        
+        # _pad_or_tile_audio will ensure the segment is exactly target_samples long.
+        return _pad_or_tile_audio(extracted_audio_segment, target_samples)
+
     except Exception as e:
         print(f"Warning: Error during BirdNET chunk extraction: {e}")
         return None
