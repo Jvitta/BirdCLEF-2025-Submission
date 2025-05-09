@@ -7,6 +7,7 @@ timm # PyTorch Image Models
 # Audio Processing
 librosa
 opencv-python
+birdnetlib
 
 # Utilities & Visualization
 tqdm 

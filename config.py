@@ -3,14 +3,14 @@ import os
 import multiprocessing
 
 class Config:
-    seed = 40
+    seed = 42
     debug = False
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # --- Workbench/Local Paths (using gcsfuse mount) --- #
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
-    GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/gcs_mount"
+    GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/data"
 
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
