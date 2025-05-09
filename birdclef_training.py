@@ -63,13 +63,11 @@ class BirdCLEFDataset(Dataset):
     Handles loading pre-computed spectrograms from a pre-loaded dictionary
     or generating them on-the-fly.
     """
-    def __init__(self, df, config, mode="train", all_spectrograms=None, target_samplenames_to_log=None, logged_samplenames_shared_list=None):
+    def __init__(self, df, config, mode="train", all_spectrograms=None):
         self.df = df.copy()
         self.config = config
         self.mode = mode
         self.all_spectrograms = all_spectrograms
-        self.target_samplenames_to_log = target_samplenames_to_log if target_samplenames_to_log is not None else set()
-        self.logged_samplenames_shared_list = logged_samplenames_shared_list
 
         # Load taxonomy to map labels to indices
         try:
@@ -186,35 +184,6 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
-        # --- Log sample spectrogram to wandb ---
-        log_id_to_check = samplename.split('-')[0]
-        if self.logged_samplenames_shared_list is not None and wandb.run is not None and \
-           log_id_to_check in self.target_samplenames_to_log and \
-           log_id_to_check not in list(self.logged_samplenames_shared_list) and \
-           len(self.logged_samplenames_shared_list) < self.config.NUM_SPECTROGRAM_SAMPLES_TO_LOG:
-            try:
-                # PLOT 'spec' DIRECTLY (it's a 2D NumPy array)
-                img_to_log = spec 
-                fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-                ax.imshow(img_to_log, aspect='auto', origin='lower', cmap='viridis') # Or 'magma' etc.
-                caption = f"Spec: {samplename} (ID: {log_id_to_check}), Lbl: {primary_label}, Mode: {self.mode}"
-                if self.mode == "train":
-                    caption += " (Augmented)"
-                ax.set_title(caption, fontsize=9)
-                ax.axis('off')
-                plt.tight_layout()
-
-                wandb.log({
-                    "sample_spectrograms": [
-                        wandb.Image(fig, caption=caption)
-                    ]
-                }, commit=False)
-                
-                plt.close(fig)
-                self.logged_samplenames_shared_list.append(log_id_to_check)
-            except Exception as e:
-                print(f"Warning (W&B Log Spec): Failed for {samplename}: {e}")
-
         # Convert to tensor, add channel dimension, repeat AFTER potential logging
         spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
 
@@ -242,7 +211,8 @@ class BirdCLEFDataset(Dataset):
         return {
             'melspec': spec_tensor,
             'target': torch.tensor(target, dtype=torch.float32),
-            'filename': filename_for_error 
+            'filename': filename_for_error,
+            'samplename': samplename
         }
 
     def apply_spec_augmentations(self, spec_np):
@@ -492,7 +462,9 @@ def calculate_auc(targets, outputs):
 
     return np.mean(aucs) if aucs else 0.0
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler, scheduler=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler, 
+                      logged_original_samplenames_for_spectrograms, num_samples_to_log,
+                      scheduler=None):
     """Runs one epoch of training with optional mixed precision."""
     model.train()
     losses = []
@@ -566,6 +538,56 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
         all_targets.append(targets_np)
         losses.append(loss.item())
 
+        # --- Log Spectrograms (New Logic) ---
+        if wandb.run is not None and len(logged_original_samplenames_for_spectrograms) < num_samples_to_log:
+            with torch.no_grad(): # Ensure no gradients are calculated for this section
+                for j in range(inputs.size(0)): # Iterate through batch
+                    if len(logged_original_samplenames_for_spectrograms) >= num_samples_to_log:
+                        break # Stop if we've logged enough globally
+
+                    original_samplename = batch['samplename'][j] # Assuming 'samplename' is in batch output from collate_fn
+                    
+                    if original_samplename not in logged_original_samplenames_for_spectrograms:
+                        try:
+                            # inputs[j] is (3, H, W), normalized. Plot first channel.
+                            # We need to denormalize or be aware colors might be off, or just plot as is.
+                            # For simplicity, plot as is. It shows what model gets before backbone.
+                            img_tensor_first_channel = inputs[j, 0, :, :].cpu()
+                            
+                            # If you want to try to roughly denormalize for viewing (optional, can be complex):
+                            # mean = torch.tensor([0.485]).view(1, 1).to(img_tensor_first_channel.device)
+                            # std = torch.tensor([0.229]).view(1, 1).to(img_tensor_first_channel.device)
+                            # img_to_plot_denorm = img_tensor_first_channel * std + mean
+                            # img_to_plot_np = torch.clamp(img_to_plot_denorm, 0, 1).numpy()
+                            img_to_plot_np = img_tensor_first_channel.numpy()
+
+                            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                            ax.imshow(img_to_plot_np, aspect='auto', origin='lower', cmap='viridis')
+                            
+                            caption = f"Sample: {original_samplename}"
+                            if apply_mixup or apply_cutmix:
+                                if j < len(targets_a) and hasattr(targets_a[j], 'cpu'): # Check if valid tensor for original ID
+                                    # To get the ID of the mixed sample, we need to trace back through `indices`
+                                    # original_samplename_b might not be straightforward if `indices` is not available here
+                                    # For simplicity, just indicate it's mixed.
+                                    caption += f" (Mixed, lam: {lam:.2f} approx for batch)"
+                                else: # Fallback if targets_a is not as expected
+                                    caption += f" (Mixed)"
+                            caption += " \n(1st chan, post-all-augs & norm)"
+                            
+                            ax.set_title(caption, fontsize=8)
+                            ax.axis('off')
+                            plt.tight_layout()
+
+                            wandb.log({
+                                f"training_augmented_spectrograms/sample_{original_samplename}": wandb.Image(fig)
+                            }, commit=True) # Commit immediately for simplicity
+                            
+                            plt.close(fig)
+                            logged_original_samplenames_for_spectrograms.append(original_samplename)
+                        except Exception as e_log_spec:
+                            print(f"Warning (W&B Log Spec in train_one_epoch): Failed for {original_samplename}: {e_log_spec}")
+        
         pbar.set_postfix({
             'train_loss': np.mean(losses[-10:]) if losses else 0,
             'lr': optimizer.param_groups[0]['lr']
@@ -714,12 +736,10 @@ def run_training(df, config, trial=None, all_spectrograms=None):
         wandb.config.update(trial.params, allow_val_change=True)
 
     # --- Prepare for Spectrogram Logging using Multiprocessing Manager ---
-    manager = multiprocessing.Manager()
-    # Use a manager.list() to share the logged IDs across processes
-    logged_samplenames_shared_list = manager.list()
-    target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578'])
+    # manager = multiprocessing.Manager()
+    # logged_samplenames_shared_list = manager.list()
+    # target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578'])
     
-    print(f"Targeting {len(target_samplenames_to_log_this_run)} specific samplenames for W&B logging using a shared list.")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
@@ -767,9 +787,12 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
    
     all_folds_history = []
-    # New: Store details from the best epoch of each fold for OOF and per-class analysis
     best_epoch_details_all_folds = [] 
     single_fold_best_auc = 0.0 
+    overall_species_ids_for_run = None # Initialize to store species_ids
+    
+    # New tracker for spectrograms logged in train_one_epoch
+    logged_original_samplenames_for_spectrograms = [] # Using a list to preserve order of first N logged
     
     try: # Wrap the main training loop in try/finally for wandb.finish()
         for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
@@ -805,13 +828,13 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             print(f'Validation set: {len(val_df_fold)} samples (main data only)')
 
             # Pass the pre-loaded dictionary (or None) to the Dataset
-            # NOW, pass both the hardcoded targets AND the shared tracking set
-            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms,
-                                            target_samplenames_to_log=target_samplenames_to_log_this_run,
-                                            logged_samplenames_shared_list=logged_samplenames_shared_list)
-            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms,
-                                          target_samplenames_to_log=target_samplenames_to_log_this_run,
-                                          logged_samplenames_shared_list=logged_samplenames_shared_list)
+            # NOW, pass both the hardcoded targets AND the shared tracking set (REMOVED THESE)
+            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms) # Removed target_samplenames_to_log, logged_samplenames_shared_list
+            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms) # Removed target_samplenames_to_log, logged_samplenames_shared_list
+
+            # Get species_ids from the first validation dataset instance created
+            if overall_species_ids_for_run is None and hasattr(val_dataset, 'species_ids'):
+                overall_species_ids_for_run = val_dataset.species_ids
 
             train_loader = DataLoader(
                 train_dataset,
@@ -860,6 +883,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                     criterion,
                     config.device,
                     scaler,
+                    logged_original_samplenames_for_spectrograms,
+                    config.NUM_SPECTROGRAM_SAMPLES_TO_LOG,
                     scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
                 )
 
@@ -1045,96 +1070,102 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             # --- New: Aggregate and Log Per-Class Metrics and OOF Metrics ---
             if best_epoch_details_all_folds:
                 print("\n--- Aggregating and Logging Per-Class & OOF Metrics ---")
-                species_ids = val_loader.dataset.species_ids # Get species_ids from the last val_loader
-                num_classes = len(species_ids)
-
-                # 1. Average Per-Class Metrics from Best Epoch of Each Fold
-                # Initialize a dictionary to sum metrics for each class across folds
-                sum_per_class_metrics = {sid: {m: 0.0 for m in ['auc', 'precision', 'recall', 'f1', 'tp', 'fp', 'fn', 'tn']} for sid in species_ids}
-                num_folds_with_details = len(best_epoch_details_all_folds)
-
-                for fold_details in best_epoch_details_all_folds:
-                    for class_metric in fold_details['per_class_metrics']:
-                        sid = class_metric['species_id']
-                        if sid in sum_per_class_metrics:
-                            sum_per_class_metrics[sid]['auc'] += class_metric['auc']
-                            sum_per_class_metrics[sid]['precision'] += class_metric['precision']
-                            sum_per_class_metrics[sid]['recall'] += class_metric['recall']
-                            sum_per_class_metrics[sid]['f1'] += class_metric['f1']
-                            sum_per_class_metrics[sid]['tp'] += class_metric['tp']
-                            sum_per_class_metrics[sid]['fp'] += class_metric['fp']
-                            sum_per_class_metrics[sid]['fn'] += class_metric['fn']
-                            sum_per_class_metrics[sid]['tn'] += class_metric['tn']
                 
-                avg_per_class_metrics_list = []
-                if num_folds_with_details > 0:
-                    for sid in species_ids:
-                        avg_metrics = {metric: val / num_folds_with_details for metric, val in sum_per_class_metrics[sid].items()}
-                        avg_metrics['species_id'] = sid
-                        avg_per_class_metrics_list.append(avg_metrics)
-                
-                if avg_per_class_metrics_list:
-                    avg_per_class_df = pd.DataFrame(avg_per_class_metrics_list)
-                    if wandb_run:
-                        try:
-                            wandb.log({"avg_best_epoch_per_class_metrics": wandb.Table(dataframe=avg_per_class_df)})
-                            print("  Logged average best epoch per-class metrics to W&B table.")
-                        except Exception as e_wandb_table:
-                            print(f"  Error logging avg_best_epoch_per_class_metrics table to W&B: {e_wandb_table}")
+                # Use the stored overall_species_ids_for_run
+                if overall_species_ids_for_run is None:
+                    print("ERROR: Could not determine species_ids for metric aggregation. Skipping.")
+                    # Potentially skip the rest of this block or handle error appropriately
+                else:
+                    species_ids = overall_species_ids_for_run
+                    num_classes = len(species_ids)
 
-                # 2. Calculate OOF Per-Class Metrics
-                oof_all_targets = []
-                oof_all_outputs = [] # logits
-                for fold_details in best_epoch_details_all_folds:
-                    if fold_details['targets'] is not None and fold_details['outputs'] is not None:
-                        oof_all_targets.append(fold_details['targets'])
-                        oof_all_outputs.append(fold_details['outputs'])
+                    # 1. Average Per-Class Metrics from Best Epoch of Each Fold
+                    # Initialize a dictionary to sum metrics for each class across folds
+                    sum_per_class_metrics = {sid: {m: 0.0 for m in ['auc', 'precision', 'recall', 'f1', 'tp', 'fp', 'fn', 'tn']} for sid in species_ids}
+                    num_folds_with_details = len(best_epoch_details_all_folds)
 
-                if oof_all_targets and oof_all_outputs:
-                    oof_targets_cat = np.concatenate(oof_all_targets)
-                    oof_outputs_cat = np.concatenate(oof_all_outputs) # These are logits
+                    for fold_details in best_epoch_details_all_folds:
+                        for class_metric in fold_details['per_class_metrics']:
+                            sid = class_metric['species_id']
+                            if sid in sum_per_class_metrics:
+                                sum_per_class_metrics[sid]['auc'] += class_metric['auc']
+                                sum_per_class_metrics[sid]['precision'] += class_metric['precision']
+                                sum_per_class_metrics[sid]['recall'] += class_metric['recall']
+                                sum_per_class_metrics[sid]['f1'] += class_metric['f1']
+                                sum_per_class_metrics[sid]['tp'] += class_metric['tp']
+                                sum_per_class_metrics[sid]['fp'] += class_metric['fp']
+                                sum_per_class_metrics[sid]['fn'] += class_metric['fn']
+                                sum_per_class_metrics[sid]['tn'] += class_metric['tn']
                     
-                    oof_per_class_metrics_list = []
-                    oof_probabilities_cat = 1 / (1 + np.exp(-oof_outputs_cat)) # Sigmoid probabilities
-                    oof_predictions_binary_cat = (oof_probabilities_cat >= 0.5).astype(int)
-
-                    try:
-                        oof_mcm = multilabel_confusion_matrix(oof_targets_cat, oof_predictions_binary_cat, labels=list(range(num_classes)))
-                    except Exception as e_oof_mcm:
-                        print(f"  Error calculating OOF multilabel_confusion_matrix: {e_oof_mcm}. TP/FP/FN/TN will be zero.")
-                        oof_mcm = np.zeros((num_classes, 2, 2), dtype=int) # Fallback
-
-                    for i in range(num_classes):
-                        class_targets = oof_targets_cat[:, i]
-                        class_probs = oof_probabilities_cat[:, i]
-                        class_preds_binary = oof_predictions_binary_cat[:, i]
-                        species_name = species_ids[i]
-
-                        class_auc = 0.0
-                        if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0:
-                            try: class_auc = roc_auc_score(class_targets, class_probs)
-                            except ValueError: class_auc = 0.0
-                        
-                        precision, recall, f1_score, _ = precision_recall_fscore_support(
-                            class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
-                        )
-                        tn, fp, fn, tp = oof_mcm[i].ravel()
-
-                        oof_per_class_metrics_list.append({
-                            'species_id': species_name, 'auc': class_auc, 'precision': precision,
-                            'recall': recall, 'f1': f1_score, 'tp': int(tp), 'fp': int(fp), 'fn': int(fn), 'tn': int(tn)
-                        })
+                    avg_per_class_metrics_list = []
+                    if num_folds_with_details > 0:
+                        for sid in species_ids:
+                            avg_metrics = {metric: val / num_folds_with_details for metric, val in sum_per_class_metrics[sid].items()}
+                            avg_metrics['species_id'] = sid
+                            avg_per_class_metrics_list.append(avg_metrics)
                     
-                    if oof_per_class_metrics_list:
-                        oof_per_class_df = pd.DataFrame(oof_per_class_metrics_list)
+                    if avg_per_class_metrics_list:
+                        avg_per_class_df = pd.DataFrame(avg_per_class_metrics_list)
                         if wandb_run:
                             try:
-                                wandb.log({"oof_per_class_metrics": wandb.Table(dataframe=oof_per_class_df)})
-                                print("  Logged OOF per-class metrics to W&B table.")
+                                wandb.log({"avg_best_epoch_per_class_metrics": wandb.Table(dataframe=avg_per_class_df)})
+                                print("  Logged average best epoch per-class metrics to W&B table.")
                             except Exception as e_wandb_table:
-                                print(f"  Error logging oof_per_class_metrics table to W&B: {e_wandb_table}")
-                else:
-                    print("  No OOF details found, skipping OOF per-class metrics calculation.")
+                                print(f"  Error logging avg_best_epoch_per_class_metrics table to W&B: {e_wandb_table}")
+
+                    # 2. Calculate OOF Per-Class Metrics
+                    oof_all_targets = []
+                    oof_all_outputs = [] # logits
+                    for fold_details in best_epoch_details_all_folds:
+                        if fold_details['targets'] is not None and fold_details['outputs'] is not None:
+                            oof_all_targets.append(fold_details['targets'])
+                            oof_all_outputs.append(fold_details['outputs'])
+
+                    if oof_all_targets and oof_all_outputs:
+                        oof_targets_cat = np.concatenate(oof_all_targets)
+                        oof_outputs_cat = np.concatenate(oof_all_outputs) # These are logits
+                        
+                        oof_per_class_metrics_list = []
+                        oof_probabilities_cat = 1 / (1 + np.exp(-oof_outputs_cat)) # Sigmoid probabilities
+                        oof_predictions_binary_cat = (oof_probabilities_cat >= 0.5).astype(int)
+
+                        try:
+                            oof_mcm = multilabel_confusion_matrix(oof_targets_cat, oof_predictions_binary_cat, labels=list(range(num_classes)))
+                        except Exception as e_oof_mcm:
+                            print(f"  Error calculating OOF multilabel_confusion_matrix: {e_oof_mcm}. TP/FP/FN/TN will be zero.")
+                            oof_mcm = np.zeros((num_classes, 2, 2), dtype=int) # Fallback
+
+                        for i in range(num_classes):
+                            class_targets = oof_targets_cat[:, i]
+                            class_probs = oof_probabilities_cat[:, i]
+                            class_preds_binary = oof_predictions_binary_cat[:, i]
+                            species_name = species_ids[i]
+
+                            class_auc = 0.0
+                            if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0:
+                                try: class_auc = roc_auc_score(class_targets, class_probs)
+                                except ValueError: class_auc = 0.0
+                            
+                            precision, recall, f1_score, _ = precision_recall_fscore_support(
+                                class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
+                            )
+                            tn, fp, fn, tp = oof_mcm[i].ravel()
+
+                            oof_per_class_metrics_list.append({
+                                'species_id': species_name, 'auc': class_auc, 'precision': precision,
+                                'recall': recall, 'f1': f1_score, 'tp': int(tp), 'fp': int(fp), 'fn': int(fn), 'tn': int(tn)
+                            })
+                        
+                        if oof_per_class_metrics_list:
+                            oof_per_class_df = pd.DataFrame(oof_per_class_metrics_list)
+                            if wandb_run:
+                                try:
+                                    wandb.log({"oof_per_class_metrics": wandb.Table(dataframe=oof_per_class_df)})
+                                    print("  Logged OOF per-class metrics to W&B table.")
+                                except Exception as e_wandb_table:
+                                    print(f"  Error logging oof_per_class_metrics table to W&B: {e_wandb_table}")
+                    else:
+                        print("  No OOF details found, skipping OOF per-class metrics calculation.")
             else:
                 print("\nNo best_epoch_details recorded, skipping per-class & OOF metric aggregation.")
 
