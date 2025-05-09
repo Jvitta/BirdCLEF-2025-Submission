@@ -151,13 +151,11 @@ def _pad_or_tile_audio(audio_data, target_samples):
     else: 
         return audio_data[:target_samples]
 
-def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples):
+def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples_5s):
     """
-    Extracts a chunk of `target_samples` length from `audio_long`.
-    If the BirdNET detection is near a boundary, the window is shifted to capture
-    `target_samples` worth of continuous audio if possible.
-    If `audio_long` itself is shorter than the duration corresponding to `target_samples`,
-    the full audio is taken and `_pad_or_tile_audio` will handle making it `target_samples` long.
+    Extracts a 5s audio chunk centered around a BirdNET detection.
+    Pads if necessary to ensure target_samples_5s length.
+    Returns None on failure or if resulting chunk is too short before padding.
     """
     try:
         birdnet_start_sec = detection.get('start_time', 0)
@@ -165,51 +163,22 @@ def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_sa
         center_sec = (birdnet_start_sec + birdnet_end_sec) / 2.0
 
         audio_len_samples = len(audio_long)
-        audio_duration_sec = audio_len_samples / config.FS
         
-        # target_duration_sec is derived from the passed target_samples
-        # For Aves, target_samples will correspond to ~6s. For other fallbacks, it might be 5s.
-        current_target_duration_sec = target_samples / config.FS
+        chunk_start_sec = center_sec - (config.TARGET_DURATION / 2.0) # config.TARGET_DURATION is 5s
+        chunk_end_sec = center_sec + (config.TARGET_DURATION / 2.0)
 
-        final_start_sec = 0.0
-        final_end_sec = 0.0
-
-        if audio_duration_sec < current_target_duration_sec:
-            # If the entire audio is shorter than our current target, take all of it.
-            final_start_sec = 0.0
-            final_end_sec = audio_duration_sec
-        else:
-            # Audio is long enough for a full current_target_duration_sec chunk.
-            # Calculate ideal window and adjust if it goes out of bounds.
-            ideal_start_sec = center_sec - (current_target_duration_sec / 2.0)
-            ideal_end_sec = center_sec + (current_target_duration_sec / 2.0)
-
-            if ideal_start_sec < 0:
-                final_start_sec = 0.0
-                final_end_sec = current_target_duration_sec
-            elif ideal_end_sec > audio_duration_sec:
-                final_end_sec = audio_duration_sec
-                final_start_sec = audio_duration_sec - current_target_duration_sec
-            else:
-                # The ideal window is fully within bounds
-                final_start_sec = ideal_start_sec
-                final_end_sec = ideal_end_sec
+        final_start_idx = max(0, int(chunk_start_sec * config.FS))
+        final_end_idx = min(audio_len_samples, int(chunk_end_sec * config.FS))
         
-        final_start_idx = max(0, int(final_start_sec * config.FS))
-        final_end_idx = min(audio_len_samples, int(final_end_sec * config.FS))
-        
-        if final_start_idx >= final_end_idx:
-            pass
-
         extracted_audio_segment = audio_long[final_start_idx:final_end_idx]
 
         if len(extracted_audio_segment) < min_samples:
             return None 
         
-        return _pad_or_tile_audio(extracted_audio_segment, target_samples)
+        return _pad_or_tile_audio(extracted_audio_segment, target_samples_5s)
 
     except Exception as e:
-        print(f"Warning: Error during BirdNET chunk extraction: {e}")
+        # print(f"Warning: Error during BirdNET 5s chunk extraction: {e}")
         return None
 
 def _extract_random_chunk(audio_long, target_samples):
@@ -221,26 +190,20 @@ def _extract_random_chunk(audio_long, target_samples):
     start_idx_5s = random.randint(0, max_start_idx_5s)
     return audio_long[start_idx_5s : start_idx_5s + target_samples]
 
-def _generate_spectrogram_from_chunk(audio_chunk_5s, config, resize_to_target_shape: bool):
+def _generate_spectrogram_from_chunk(audio_chunk_5s, config):
     """Generates a mel spectrogram from an audio chunk, optionally resizes."""
     try:
         raw_spec_chunk = utils.audio2melspec(audio_chunk_5s, config)
         if raw_spec_chunk is None:
             return None
         
-        if resize_to_target_shape:
-            # Resize to target shape for BirdNET chunks or if explicitly needed
-            resized_spec = cv2.resize(raw_spec_chunk, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
-            if resized_spec.shape == tuple(config.TARGET_SHAPE):
-                return resized_spec.astype(np.float32)
-            else:
-                print(f"Warning: Resized spec has wrong shape {resized_spec.shape} (expected {config.TARGET_SHAPE})")
-                return None
+        resized_spec = cv2.resize(raw_spec_chunk, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+        if resized_spec.shape == tuple(config.TARGET_SHAPE):
+            return resized_spec.astype(np.float32)
         else:
-            # Return raw spec (H_mels, W_variable) for full audio strategy
-            return raw_spec_chunk.astype(np.float32)
-            
-    except Exception as e_spec_chunk:
+            print(f"Warning: Resized spec has wrong shape {resized_spec.shape} (expected {config.TARGET_SHAPE})")
+            return None
+    except Exception as e:
         return None
 
 def _process_primary_for_chunking(args):
@@ -248,8 +211,7 @@ def _process_primary_for_chunking(args):
     primary_filepath, samplename, config, fabio_intervals, vad_intervals, primary_filename, \
         class_name, scientific_name, birdnet_dets_for_file, UNCOVERED_AVES_SCIENTIFIC_NAME = args
 
-    target_samples_5s_final_model = int(config.TARGET_DURATION * config.FS)
-    target_samples_extended_aves = int((config.TARGET_DURATION + 1.0) * config.FS)
+    target_samples = int(config.TARGET_DURATION * config.FS)
     min_samples = int(0.5 * config.FS)
 
     try:
@@ -260,7 +222,10 @@ def _process_primary_for_chunking(args):
         if error_msg:
             return samplename, None, error_msg
 
-        MAX_AUDIO_SAMPLES_FOR_FULL_SPEC = int(config.MAX_DURATION_FOR_FULL_SPEC_SEC * config.FS)
+        relevant_duration = len(relevant_audio)
+        # 1 chunk if audio is too short, otherwise PRECOMPUTE_VERSIONS chunks
+        num_versions_to_generate = 1 if relevant_duration < target_samples else config.PRECOMPUTE_VERSIONS
+
         use_birdnet_strategy = (
             class_name == 'Aves' and
             scientific_name != UNCOVERED_AVES_SCIENTIFIC_NAME and
@@ -268,34 +233,20 @@ def _process_primary_for_chunking(args):
             len([d for d in birdnet_dets_for_file if isinstance(d, dict)]) > 0
         )
 
-        if not use_birdnet_strategy and MAX_AUDIO_SAMPLES_FOR_FULL_SPEC is not None:
-            if len(relevant_audio) > MAX_AUDIO_SAMPLES_FOR_FULL_SPEC:
-                relevant_audio = relevant_audio[:MAX_AUDIO_SAMPLES_FOR_FULL_SPEC]
-
-        original_relevant_len = len(relevant_audio)
-        is_originally_short_for_5s_model = original_relevant_len < target_samples_5s_final_model
-        is_originally_short_for_6s_aves = original_relevant_len < target_samples_extended_aves
-
-        final_specs_list = [] # Will collect float32 specs
+        final_specs_list = []
 
         if not use_birdnet_strategy:
-            # Strategy 1: Non-BirdNET
-            # Current logic: if short, pads to 5s, resizes, keeps float32.
-            #                if long (up to 25s), generates native spec (float32), then was quantized.
-            # CHANGE: Keep it float32.
-            if is_originally_short_for_5s_model: 
-                audio_for_spec_gen = _pad_or_tile_audio(relevant_audio, target_samples_5s_final_model)
-                spec_float32_resized = _generate_spectrogram_from_chunk(audio_for_spec_gen, config, resize_to_target_shape=True)
-                if spec_float32_resized is not None:
-                    final_specs_list.append(spec_float32_resized.astype(np.float32)) # Ensure float32
-            else:
-                spec_float32_native = _generate_spectrogram_from_chunk(relevant_audio, config, resize_to_target_shape=False)
-                if spec_float32_native is not None:
-                    final_specs_list.append(spec_float32_native.astype(np.float32)) # Save as float32, no quantization
+            # Non-BirdNET / Aves without sufficient detections / UNCOVERED_AVES: 
+            # Generate random 5-second chunks from the (potentially full) relevant_audio.
+            for _ in range(num_versions_to_generate):
+                audio_chunk = _extract_random_chunk(relevant_audio, target_samples)
+                
+                if audio_chunk is not None:
+                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                    if spec is not None:
+                        final_specs_list.append(spec) 
         else:
             # Strategy 2: BirdNET (Aves with detections)
-            # Current logic: extracts ~6s audio, generates native spec (float32), then was quantized.
-            # CHANGE: Keep it float32.
             sorted_detections = []
             try:
                 sorted_detections = sorted(
@@ -306,32 +257,43 @@ def _process_primary_for_chunking(args):
             except Exception as e_sort:
                 print(f"Warning: Error sorting BirdNET detections for {samplename}: {e_sort}.")
 
-            num_versions_to_generate = config.PRECOMPUTE_VERSIONS
             for i in range(num_versions_to_generate):
-                chunk_extended_audio = None 
+                audio_chunk = None 
                 if i < len(sorted_detections):
-                    chunk_extended_audio = _extract_birdnet_chunk(
-                        relevant_audio, sorted_detections[i], config, min_samples, target_samples_extended_aves
+                    # Call _extract_birdnet_chunk, now aiming for 5s target samples
+                    audio_chunk = _extract_birdnet_chunk(
+                        relevant_audio, sorted_detections[i], config, min_samples, target_samples 
                     )
-                if chunk_extended_audio is None and not is_originally_short_for_6s_aves:
-                    chunk_extended_audio = _extract_random_chunk(relevant_audio, target_samples_extended_aves)
-                elif chunk_extended_audio is None and is_originally_short_for_6s_aves:
-                    chunk_extended_audio = _pad_or_tile_audio(relevant_audio, target_samples_extended_aves)
+                
+                # Fallback to random 5s chunk if BirdNET extraction failed or not enough detections
+                if audio_chunk is None:
+                    if len(relevant_audio) >= target_samples:
+                        audio_chunk = _extract_random_chunk(relevant_audio, target_samples)
+                    else: # If relevant_audio is too short for a random 5s chunk, pad/tile it once.
+                        audio_chunk = _pad_or_tile_audio(relevant_audio, target_samples)
+                        # To avoid making multiple identical padded chunks for short audio, break after the first if random fallback is hit for short audio.
+                        if i > 0 and len(relevant_audio) < target_samples:
+                            break 
 
-                if chunk_extended_audio is not None:
-                    spec_float32_native = _generate_spectrogram_from_chunk(
-                        chunk_extended_audio, config, resize_to_target_shape=False
-                    )
-                    if spec_float32_native is not None:
-                        final_specs_list.append(spec_float32_native.astype(np.float32)) # Save as float32, no quantization
+                if audio_chunk is not None:
+                    # _generate_spectrogram_from_chunk already ensures TARGET_SHAPE and float32
+                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                    if spec is not None:
+                        final_specs_list.append(spec)
+            
+            # If relevant_audio was very short and BirdNET detections failed, ensure at least one chunk for Aves.
+            if not final_specs_list and len(relevant_audio) < target_samples:
+                audio_chunk = _pad_or_tile_audio(relevant_audio, target_samples)
+                if audio_chunk is not None:
+                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                    if spec is not None:
+                        final_specs_list.append(spec)
 
         if not final_specs_list:
             return samplename, None, "No valid spectrograms generated."
 
         try:
-            # Ensure all elements are float32 before stacking, just in case.
-            # Though the appends above should already handle it.
-            final_specs_list = [spec.astype(np.float32) for spec in final_specs_list]
+            final_specs_list = [spec.astype(np.float32) for spec in final_specs_list] # Redundant if helpers ensure it, but safe.
             final_specs_array = np.stack(final_specs_list, axis=0)
             return samplename, final_specs_array, None
         except Exception as e_stack:

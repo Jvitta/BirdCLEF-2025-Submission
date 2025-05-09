@@ -3,7 +3,7 @@ import os
 import multiprocessing
 
 class Config:
-    seed = 42
+    seed = 40
     debug = False
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -59,7 +59,6 @@ class Config:
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
     NUM_SPECTROGRAM_SAMPLES_TO_LOG = 6
-    MAX_DURATION_FOR_FULL_SPEC_SEC = 25.0
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
@@ -100,7 +99,7 @@ class Config:
     max_time_mask_width = 30     # Maximum width of time mask
     max_freq_mask_height = 26    # Maximum height of frequency mask
 
-    inference_batch_size = 16
+    inference_batch_size = 64
     use_tta = False
     tta_count = 3
     # Threshold for generating pseudo labels
@@ -121,6 +120,3 @@ class Config:
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
 config = Config()
-
-# Optional: Add another print here to confirm the final config object shape if needed
-# print(f"[Config Instance] TARGET_SHAPE: {config.TARGET_SHAPE}")
