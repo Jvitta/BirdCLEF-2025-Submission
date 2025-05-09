@@ -10,6 +10,7 @@ import sys
 import glob
 import io
 import argparse
+import multiprocessing
 
 import numpy as np
 import pandas as pd
@@ -62,13 +63,13 @@ class BirdCLEFDataset(Dataset):
     Handles loading pre-computed spectrograms from a pre-loaded dictionary
     or generating them on-the-fly.
     """
-    def __init__(self, df, config, mode="train", all_spectrograms=None, target_samplenames_to_log=None, logged_samplenames_in_current_run=None):
+    def __init__(self, df, config, mode="train", all_spectrograms=None, target_samplenames_to_log=None, logged_samplenames_shared_list=None):
         self.df = df.copy()
         self.config = config
         self.mode = mode
         self.all_spectrograms = all_spectrograms
         self.target_samplenames_to_log = target_samplenames_to_log if target_samplenames_to_log is not None else set()
-        self.logged_samplenames_in_current_run = logged_samplenames_in_current_run if logged_samplenames_in_current_run is not None else set()
+        self.logged_samplenames_shared_list = logged_samplenames_shared_list
 
         # Load taxonomy to map labels to indices
         try:
@@ -103,13 +104,13 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         samplename = row['samplename']
+        
         primary_label = row['primary_label']
         secondary_labels = row.get('secondary_labels', [])
         filename_for_error = row.get('filename', samplename) # Use filename if available
         
         spec = None # This will hold the final (H_5s, W_5s) processed chunk
-        target_h_5s, target_w_5s = self.config.TARGET_SHAPE # Expected final shape, e.g., (256, 256)
-
+        
         if samplename in self.all_spectrograms:
             spec_data_from_npz = self.all_spectrograms[samplename]
             raw_selected_chunk_2d = None # This will be the 2D chunk selected, potentially >5s wide
@@ -215,16 +216,17 @@ class BirdCLEFDataset(Dataset):
             spec = self.apply_spec_augmentations(spec)
 
         # --- Log sample spectrogram to wandb ---
-        if wandb.run is not None and \
-           samplename in self.target_samplenames_to_log and \
-           samplename not in self.logged_samplenames_in_current_run and \
-           len(self.logged_samplenames_in_current_run) < self.config.NUM_SPECTROGRAM_SAMPLES_TO_LOG:
+        log_id_to_check = samplename.split('-')[0]
+        if self.logged_samplenames_shared_list is not None and wandb.run is not None and \
+           log_id_to_check in self.target_samplenames_to_log and \
+           log_id_to_check not in list(self.logged_samplenames_shared_list) and \
+           len(self.logged_samplenames_shared_list) < self.config.NUM_SPECTROGRAM_SAMPLES_TO_LOG:
             try:
                 # PLOT 'spec' DIRECTLY (it's a 2D NumPy array)
                 img_to_log = spec 
                 fig, ax = plt.subplots(1, 1, figsize=(6, 4))
                 ax.imshow(img_to_log, aspect='auto', origin='lower', cmap='viridis') # Or 'magma' etc.
-                caption = f"Spec: {samplename}, Lbl: {primary_label}, Mode: {self.mode}"
+                caption = f"Spec: {samplename} (ID: {log_id_to_check}), Lbl: {primary_label}, Mode: {self.mode}"
                 if self.mode == "train":
                     caption += " (Augmented)"
                 ax.set_title(caption, fontsize=9)
@@ -238,7 +240,7 @@ class BirdCLEFDataset(Dataset):
                 }, commit=False)
                 
                 plt.close(fig)
-                self.logged_samplenames_in_current_run.add(samplename)
+                self.logged_samplenames_shared_list.append(log_id_to_check)
             except Exception as e:
                 print(f"Warning (W&B Log Spec): Failed for {samplename}: {e}")
 
@@ -688,11 +690,13 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     if is_hpo_trial:
         wandb.config.update(trial.params, allow_val_change=True)
 
-    # --- Prepare for Spectrogram Logging ---
-    target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578']) 
-    logged_samplenames_in_current_run = set() 
+    # --- Prepare for Spectrogram Logging using Multiprocessing Manager ---
+    manager = multiprocessing.Manager()
+    # Use a manager.list() to share the logged IDs across processes
+    logged_samplenames_shared_list = manager.list()
+    target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578'])
     
-    print(f"Targeting {len(target_samplenames_to_log_this_run)} specific samplenames to attempt logging spectrograms for wandb.")
+    print(f"Targeting {len(target_samplenames_to_log_this_run)} specific samplenames for W&B logging using a shared list.")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
@@ -778,10 +782,10 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             # NOW, pass both the hardcoded targets AND the shared tracking set
             train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms,
                                             target_samplenames_to_log=target_samplenames_to_log_this_run,
-                                            logged_samplenames_in_current_run=logged_samplenames_in_current_run)
+                                            logged_samplenames_shared_list=logged_samplenames_shared_list)
             val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms,
                                           target_samplenames_to_log=target_samplenames_to_log_this_run,
-                                          logged_samplenames_in_current_run=logged_samplenames_in_current_run)
+                                          logged_samplenames_shared_list=logged_samplenames_shared_list)
 
             train_loader = DataLoader(
                 train_dataset,

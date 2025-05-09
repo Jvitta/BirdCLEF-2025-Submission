@@ -63,7 +63,7 @@ class Config:
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
-    epochs = 11
+    epochs = 10
     train_batch_size = 32
     val_batch_size = 64
     use_amp = False
