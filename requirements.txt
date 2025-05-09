@@ -1,4 +1,6 @@
-numpy
+numpy~=1.26.0
+resampy
+tflite-runtime
 pandas
 scikit-learn
 # torch # See note below regarding manual installation!
@@ -7,6 +9,7 @@ timm # PyTorch Image Models
 # Audio Processing
 librosa
 opencv-python
+birdnetlib
 
 # Utilities & Visualization
 tqdm 

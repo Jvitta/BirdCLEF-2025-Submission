@@ -10,11 +10,12 @@ import sys
 import glob
 import io
 import argparse
+import multiprocessing
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
 
 import torch
 import torch.nn as nn
@@ -22,8 +23,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast
-from torch.amp import GradScaler
 from losses import FocalLossBCE
 import torchvision.transforms as transforms
 
@@ -32,14 +31,17 @@ from tqdm.auto import tqdm
 import timm
 import matplotlib.pyplot as plt
 import optuna
+import wandb
 
 from config import config
 import birdclef_utils as utils
-from google.cloud import storage
 import cv2
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+def config_to_dict(cfg):
+    return {key: value for key, value in cfg.__dict__.items() if not key.startswith('__') and not callable(value)}
 
 def set_seed(seed=42):
     """
@@ -100,12 +102,12 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         samplename = row['samplename']
+        
         primary_label = row['primary_label']
         secondary_labels = row.get('secondary_labels', [])
         filename_for_error = row.get('filename', samplename) # Use filename if available
         
         spec = None # This will hold the final (H_5s, W_5s) processed chunk
-        target_h_5s, target_w_5s = self.config.TARGET_SHAPE # Expected final shape, e.g., (256, 256)
 
         if samplename in self.all_spectrograms:
             spec_data_from_npz = self.all_spectrograms[samplename]
@@ -133,49 +135,31 @@ class BirdCLEFDataset(Dataset):
                 print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
 
             # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
-            # Crop it if it's wider than the target 5s width.
+            # If preprocessing is correct, it should already be config.TARGET_SHAPE.
             if raw_selected_chunk_2d is not None:
-                # NEW LOGIC TO PROCESS raw_selected_chunk_2d INTO spec
-                final_target_shape_tuple = tuple(self.config.TARGET_SHAPE)
-                native_5s_frames = math.ceil(self.config.TARGET_DURATION * self.config.FS / self.config.HOP_LENGTH)
-                
-                current_h, current_w = raw_selected_chunk_2d.shape
-                processed_intermediate_spec = None
-
-                if current_h == self.config.N_MELS: # Native mel spec (e.g., 136, W_variable)
-                    img_5s_native = None
-                    if current_w > native_5s_frames: # Wider than 5s native, needs crop
-                        if self.mode == 'train':
-                            max_offset = current_w - native_5s_frames
-                            offset = random.randint(0, max_offset)
-                            img_5s_native = raw_selected_chunk_2d[:, offset:offset + native_5s_frames]
-                        else: # eval/test: center crop
-                            offset = (current_w - native_5s_frames) // 2
-                            img_5s_native = raw_selected_chunk_2d[:, offset:offset + native_5s_frames]
-                    elif current_w == native_5s_frames: # Already 5s native width
-                        img_5s_native = raw_selected_chunk_2d
-                    else: # Narrower than 5s native width, needs padding
-                        padding_width = native_5s_frames - current_w
-                        background_val = self.config.BACKGROUND_VALUE_MELSPEC if hasattr(self.config, 'BACKGROUND_VALUE_MELSPEC') else 0.0
-                        img_5s_native = np.pad(raw_selected_chunk_2d, ((0,0), (0, padding_width)), mode='constant', constant_values=background_val)
-                    
-                    # Resize this (N_MELS, native_5s_frames) segment to TARGET_SHAPE.
-                    if img_5s_native.shape != final_target_shape_tuple: 
-                        processed_intermediate_spec = cv2.resize(img_5s_native, (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
-                    else:
-                        processed_intermediate_spec = img_5s_native # Should be TARGET_SHAPE if N_MELS was already TARGET_SHAPE[0] and width was TARGET_SHAPE[1]
-
-                elif current_h == self.config.TARGET_SHAPE[0]: # Already height-resized chunk (e.g., 256, W_target_shape)
-                    if raw_selected_chunk_2d.shape == final_target_shape_tuple:
-                        processed_intermediate_spec = raw_selected_chunk_2d
-                    else: # Fallback: width might not match, so resize to be sure
-                        processed_intermediate_spec = cv2.resize(raw_selected_chunk_2d, (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+                expected_shape = tuple(self.config.TARGET_SHAPE)
+                if raw_selected_chunk_2d.shape == expected_shape:
+                    spec = raw_selected_chunk_2d
                 else:
-                    print(f"ERROR: Chunk for '{samplename}' (shape {raw_selected_chunk_2d.shape}) has unexpected height {current_h}. Expected {self.config.N_MELS} or {self.config.TARGET_SHAPE[0]}. Using zeros.")
-                    processed_intermediate_spec = np.zeros(final_target_shape_tuple, dtype=np.float32)
-                
-                spec = processed_intermediate_spec # Assign to the 'spec' variable
-                # END OF NEW LOGIC
+                    # This case indicates an issue with preprocessing or an unexpected NPZ format.
+                    # A warning and a fallback resize is a safe approach.
+                    current_samplename = self.labels_df.iloc[idx]['samplename'] # Use self.labels_df
+                    print(f"WARNING: Samplename '{current_samplename}' - "
+                          f"loaded chunk shape {raw_selected_chunk_2d.shape} "
+                          f"does not match TARGET_SHAPE {expected_shape}. Attempting resize.")
+                    spec = cv2.resize(raw_selected_chunk_2d,
+                                      (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]),
+                                      interpolation=cv2.INTER_LINEAR)
+            else:
+                # This implies select_version_for_training returned None, or an issue during loading from NPZ for this sample.
+                # This is an error condition.
+                current_samplename = self.labels_df.iloc[idx]['samplename'] # Use self.labels_df
+                print(f"ERROR: Samplename '{current_samplename}' - "
+                      f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
+                spec = np.zeros(tuple(self.config.TARGET_SHAPE), dtype=np.float32)
+
+            # Ensure spec is float32, as augmentations might change it if not careful
+            spec = spec.astype(np.float32)
             
             # Fallback if spec is still None or issues occurred during processing
             if spec is None or spec.shape != self.config.TARGET_SHAPE:
@@ -200,7 +184,7 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
-        # Convert to tensor, add channel dimension, repeat
+        # Convert to tensor, add channel dimension, repeat AFTER potential logging
         spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
 
         # Normalize the (potentially augmented) tensor
@@ -227,7 +211,8 @@ class BirdCLEFDataset(Dataset):
         return {
             'melspec': spec_tensor,
             'target': torch.tensor(target, dtype=torch.float32),
-            'filename': filename_for_error 
+            'filename': filename_for_error,
+            'samplename': samplename
         }
 
     def apply_spec_augmentations(self, spec_np):
@@ -477,7 +462,9 @@ def calculate_auc(targets, outputs):
 
     return np.mean(aucs) if aucs else 0.0
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler, scheduler=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler, 
+                      logged_original_samplenames_for_spectrograms, num_samples_to_log,
+                      scheduler=None):
     """Runs one epoch of training with optional mixed precision."""
     model.train()
     losses = []
@@ -551,6 +538,56 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, schedul
         all_targets.append(targets_np)
         losses.append(loss.item())
 
+        # --- Log Spectrograms (New Logic) ---
+        if wandb.run is not None and len(logged_original_samplenames_for_spectrograms) < num_samples_to_log:
+            with torch.no_grad(): # Ensure no gradients are calculated for this section
+                for j in range(inputs.size(0)): # Iterate through batch
+                    if len(logged_original_samplenames_for_spectrograms) >= num_samples_to_log:
+                        break # Stop if we've logged enough globally
+
+                    original_samplename = batch['samplename'][j] # Assuming 'samplename' is in batch output from collate_fn
+                    
+                    if original_samplename not in logged_original_samplenames_for_spectrograms:
+                        try:
+                            # inputs[j] is (3, H, W), normalized. Plot first channel.
+                            # We need to denormalize or be aware colors might be off, or just plot as is.
+                            # For simplicity, plot as is. It shows what model gets before backbone.
+                            img_tensor_first_channel = inputs[j, 0, :, :].cpu()
+                            
+                            # If you want to try to roughly denormalize for viewing (optional, can be complex):
+                            # mean = torch.tensor([0.485]).view(1, 1).to(img_tensor_first_channel.device)
+                            # std = torch.tensor([0.229]).view(1, 1).to(img_tensor_first_channel.device)
+                            # img_to_plot_denorm = img_tensor_first_channel * std + mean
+                            # img_to_plot_np = torch.clamp(img_to_plot_denorm, 0, 1).numpy()
+                            img_to_plot_np = img_tensor_first_channel.numpy()
+
+                            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                            ax.imshow(img_to_plot_np, aspect='auto', origin='lower', cmap='viridis')
+                            
+                            caption = f"Sample: {original_samplename}"
+                            if apply_mixup or apply_cutmix:
+                                if j < len(targets_a) and hasattr(targets_a[j], 'cpu'): # Check if valid tensor for original ID
+                                    # To get the ID of the mixed sample, we need to trace back through `indices`
+                                    # original_samplename_b might not be straightforward if `indices` is not available here
+                                    # For simplicity, just indicate it's mixed.
+                                    caption += f" (Mixed, lam: {lam:.2f} approx for batch)"
+                                else: # Fallback if targets_a is not as expected
+                                    caption += f" (Mixed)"
+                            caption += " \n(1st chan, post-all-augs & norm)"
+                            
+                            ax.set_title(caption, fontsize=8)
+                            ax.axis('off')
+                            plt.tight_layout()
+
+                            wandb.log({
+                                f"training_augmented_spectrograms/sample_{original_samplename}": wandb.Image(fig)
+                            }, commit=True) # Commit immediately for simplicity
+                            
+                            plt.close(fig)
+                            logged_original_samplenames_for_spectrograms.append(original_samplename)
+                        except Exception as e_log_spec:
+                            print(f"Warning (W&B Log Spec in train_one_epoch): Failed for {original_samplename}: {e_log_spec}")
+        
         pbar.set_postfix({
             'train_loss': np.mean(losses[-10:]) if losses else 0,
             'lr': optimizer.param_groups[0]['lr']
@@ -575,9 +612,11 @@ def validate(model, loader, criterion, device):
     """Runs validation with optional mixed precision for inference."""
     model.eval()
     losses = []
-    all_targets = []
-    all_outputs = []
+    all_targets_list = [] # Changed name to avoid confusion later
+    all_outputs_list = [] # Changed name
     use_amp = config.use_amp
+    species_ids = loader.dataset.species_ids # Get species IDs for labeling
+    num_classes = len(species_ids)
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
@@ -596,25 +635,75 @@ def validate(model, loader, criterion, device):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
 
-            all_outputs.append(outputs.float().cpu().numpy())
-            all_targets.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
+            all_outputs_list.append(outputs.float().cpu().numpy())
+            all_targets_list.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
             losses.append(loss.item())
 
             if config.debug and (step + 1) >= config.debug_limit_batches:
                 print(f"DEBUG: Stopping validation early after {config.debug_limit_batches} batches.")
                 break
 
-    if not all_targets or not all_outputs:
+    if not all_targets_list or not all_outputs_list:
         print("Warning: No targets or outputs collected during validation.")
-        return 0.0, 0.0
+        # Return empty structures or zeros for all expected values
+        per_class_metrics = [{'species_id': sid, 'auc': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for sid in species_ids]
+        return 0.0, 0.0, per_class_metrics, np.array([]), np.array([])
 
-    all_outputs_cat = np.concatenate(all_outputs)
-    all_targets_cat = np.concatenate(all_targets)
+    all_outputs_cat = np.concatenate(all_outputs_list)
+    all_targets_cat = np.concatenate(all_targets_list)
+    
+    macro_auc = calculate_auc(all_targets_cat, all_outputs_cat) # Existing macro AUC calculation
+    avg_loss = np.mean(losses) if losses else 0.0
 
-    auc = calculate_auc(all_targets_cat, all_outputs_cat)
-    avg_loss = np.mean(losses)
+    # --- Per-Class Metrics Calculation ---
+    per_class_metrics_list = []
+    probabilities_cat = 1 / (1 + np.exp(-all_outputs_cat)) # Sigmoid probabilities
+    predictions_binary_cat = (probabilities_cat >= 0.5).astype(int)
 
-    return avg_loss, auc
+    # Get TP, FP, FN, TN for all classes using multilabel_confusion_matrix
+    try:
+        mcm = multilabel_confusion_matrix(all_targets_cat, predictions_binary_cat, labels=list(range(num_classes)))
+    except Exception as e_mcm:
+        print(f"Error calculating multilabel_confusion_matrix: {e_mcm}. Per-class TP/FP/FN/TN will be zero.")
+        mcm = np.zeros((num_classes, 2, 2), dtype=int) # Fallback
+
+    for i in range(num_classes):
+        class_targets = all_targets_cat[:, i]
+        class_probs = probabilities_cat[:, i]
+        class_preds_binary = predictions_binary_cat[:, i]
+        species_name = species_ids[i]
+
+        class_auc = 0.0
+        if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0: # Ensure both classes are present for AUC
+            try:
+                class_auc = roc_auc_score(class_targets, class_probs)
+            except ValueError:
+                class_auc = 0.0 # Or handle as NaN, but 0.0 is simpler for aggregation
+        
+        # Calculate precision, recall, F1 for the positive class (label 1)
+        # average=None and labels=[1] gives metrics specifically for the positive class
+        # If class_targets are all 0, precision/recall/f1 for label 1 will be 0 due to zero_division=0
+        precision, recall, f1_score, _ = precision_recall_fscore_support(
+            class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
+        )
+
+        # Extract TP, FP, FN, TN from mcm
+        # mcm[i] is [[TN, FP], [FN, TP]] for class i
+        tn, fp, fn, tp = mcm[i].ravel()
+
+        per_class_metrics_list.append({
+            'species_id': species_name,
+            'auc': class_auc,
+            'precision': precision, # Directly use the scalar value for pos_label=1
+            'recall': recall,       # Directly use the scalar value for pos_label=1
+            'f1': f1_score,         # Directly use the scalar value for pos_label=1
+            'tp': int(tp),
+            'fp': int(fp),
+            'fn': int(fn),
+            'tn': int(tn)
+        })
+
+    return avg_loss, macro_auc, per_class_metrics_list, all_outputs_cat, all_targets_cat
 
 def run_training(df, config, trial=None, all_spectrograms=None):
     """Runs the training loop. 
@@ -629,11 +718,28 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     (can be multiple) without pruning and returns the mean OOF AUC.
     """
     is_hpo_trial = trial is not None
+    
+    # --- wandb initialization ---
+    run_name = f"trial_{trial.number}" if is_hpo_trial else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+    group_name = "hpo" if is_hpo_trial else "full_training"
+    
+    wandb_run = wandb.init(
+        project="BirdCLEF-2025", # Or your preferred project name
+        config=config_to_dict(config),
+        name=run_name,
+        group=group_name,
+        job_type="train",
+        reinit=True # Allows re-initialization if running multiple times in one script (e.g. HPO)
+    )
+    # Log specific HPO trial parameters if applicable
     if is_hpo_trial:
-        print("\n--- Starting HPO Training Trial --- (Pruning Enabled)")
-    else:
-        print("\n--- Starting Standard Training Run --- (No Pruning)")
-        
+        wandb.config.update(trial.params, allow_val_change=True)
+
+    # --- Prepare for Spectrogram Logging using Multiprocessing Manager ---
+    # manager = multiprocessing.Manager()
+    # logged_samplenames_shared_list = manager.list()
+    # target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578'])
+    
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
@@ -681,254 +787,454 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
    
     all_folds_history = []
+    best_epoch_details_all_folds = [] 
     single_fold_best_auc = 0.0 
+    overall_species_ids_for_run = None # Initialize to store species_ids
     
-    for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
-        if fold not in config.selected_folds: continue
+    # New tracker for spectrograms logged in train_one_epoch
+    logged_original_samplenames_for_spectrograms = [] # Using a list to preserve order of first N logged
+    
+    try: # Wrap the main training loop in try/finally for wandb.finish()
+        for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
+            if fold not in config.selected_folds:
+                continue
 
-        print(f'\n{"="*30} Fold {fold} {"="*30}')
-        # --- Initialize history for the CURRENT fold --- #
-        fold_history = {
-            'epochs': [],
-            'train_loss': [], 'val_loss': [],
-            'train_auc': [], 'val_auc': []
-        }
+            # --- wandb: Define custom step for this fold's metrics ---
+            if wandb_run: # Check if wandb run is active
+                wandb.define_metric(f"fold_{fold}/epoch")
+                wandb.define_metric(f"fold_{fold}/*", step_metric=f"fold_{fold}/epoch")
 
-        train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
-        val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
+            print(f'\n{"="*30} Fold {fold} {"="*30}')
+            # --- Initialize history for the CURRENT fold --- #
+            fold_history = {
+                'epochs': [],
+                'train_loss': [], 'val_loss': [],
+                'train_auc': [], 'val_auc': []
+            }
 
-        # --- Filter Validation Set: Ensure only 'main' data source is used --- 
-        original_val_count = len(val_df_fold)
-        if 'data_source' in val_df_fold.columns:
-            val_df_fold = val_df_fold[val_df_fold['data_source'] == 'main'].reset_index(drop=True)
-            print(f"Filtered validation set to include only 'main' data source.")
-            print(f"  Original val count: {original_val_count}, Filtered val count: {len(val_df_fold)}")
-        else:
-            print("Warning: 'data_source' column not found in validation fold. Cannot filter.")
+            train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
+            val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
 
-        print(f'Training set: {len(train_df_fold)} samples (includes main and potentially pseudo)')
-        print(f'Validation set: {len(val_df_fold)} samples (main data only)')
+            # --- Filter Validation Set: Ensure only 'main' data source is used ---
+            original_val_count = len(val_df_fold)
+            if 'data_source' in val_df_fold.columns:
+                val_df_fold = val_df_fold[val_df_fold['data_source'] == 'main'].reset_index(drop=True)
+                print(f"Filtered validation set to include only 'main' data source.")
+                print(f"  Original val count: {original_val_count}, Filtered val count: {len(val_df_fold)}")
+            else:
+                print("Warning: 'data_source' column not found in validation fold. Cannot filter.")
 
-        # Pass the pre-loaded dictionary (or None) to the Dataset
-        train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
-        val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms)
+            print(f'Training set: {len(train_df_fold)} samples (includes main and potentially pseudo)')
+            print(f'Validation set: {len(val_df_fold)} samples (main data only)')
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.train_batch_size,
-            shuffle=True,
-            num_workers=config.num_workers, 
-            pin_memory=True,
-            collate_fn=collate_fn,
-            drop_last=True
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.val_batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            drop_last=False
-        )
+            # Pass the pre-loaded dictionary (or None) to the Dataset
+            # NOW, pass both the hardcoded targets AND the shared tracking set (REMOVED THESE)
+            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms) # Removed target_samplenames_to_log, logged_samplenames_shared_list
+            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms) # Removed target_samplenames_to_log, logged_samplenames_shared_list
 
-        print("\nSetting up model, optimizer, criterion, scheduler...")
-        model = BirdCLEFModel(config).to(config.device)
-        optimizer = get_optimizer(model, config)
-        criterion = get_criterion(config)
-        scheduler = get_scheduler(optimizer, config)
+            # Get species_ids from the first validation dataset instance created
+            if overall_species_ids_for_run is None and hasattr(val_dataset, 'species_ids'):
+                overall_species_ids_for_run = val_dataset.species_ids
 
-        scaler = torch.amp.GradScaler(device='cuda', enabled=config.use_amp)
-        print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
-
-
-        best_val_auc = 0.0
-        best_epoch = 0
-
-        # --- Epoch Loop --- #
-        for epoch in range(config.epochs):
-            print(f"\nEpoch {epoch + 1}/{config.epochs}")
-
-            train_loss, train_auc = train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                config.device,
-                scaler,
-                scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=config.train_batch_size,
+                shuffle=True,
+                num_workers=config.num_workers,
+                pin_memory=True,
+                collate_fn=collate_fn,
+                drop_last=True
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.val_batch_size,
+                shuffle=False,
+                num_workers=config.num_workers,
+                pin_memory=True,
+                collate_fn=collate_fn,
+                drop_last=False
             )
 
-            val_loss, val_auc = validate(
-                model,
-                val_loader,
-                criterion,
-                config.device
-            )
+            print("\nSetting up model, optimizer, criterion, scheduler...")
+            model = BirdCLEFModel(config).to(config.device)
+            optimizer = get_optimizer(model, config)
+            criterion = get_criterion(config)
+            scheduler = get_scheduler(optimizer, config)
 
-            if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
-                if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_loss)
-                else:
-                    scheduler.step()
+            scaler = torch.amp.GradScaler(device='cuda', enabled=config.use_amp)
+            print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
-            print(f"Epoch {epoch+1} Summary:")
-            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            print(f"Val Loss:   {val_loss:.4f}, Val AUC:   {val_auc:.4f}")
+            best_val_auc = 0.0
+            best_epoch = 0
+            # New: Store metrics from the best epoch of the current fold
+            best_epoch_val_per_class_metrics = None
+            best_epoch_val_all_outputs = None
+            best_epoch_val_all_targets = None
+            # current_fold_best_model_path = None # This was already there
 
-            # --- Append metrics for the CURRENT fold's history --- #
-            fold_history['epochs'].append(epoch + 1)
-            fold_history['train_loss'].append(train_loss)
-            fold_history['val_loss'].append(val_loss)
-            fold_history['train_auc'].append(train_auc)
-            fold_history['val_auc'].append(val_auc)
+            # --- Epoch Loop --- #
+            for epoch in range(config.epochs):
+                print(f"\nEpoch {epoch + 1}/{config.epochs}")
 
-            # --- HPO Pruning --- #
-            if is_hpo_trial:
-                trial.report(val_auc, epoch) # Report intermediate val_auc
-                if trial.should_prune():
-                    print(f"  Pruning trial based on intermediate value at epoch {epoch+1}.")
-                    raise optuna.TrialPruned() # Raise exception to stop training
-            
-            # --- Model Checkpointing ---
-            if val_auc > best_val_auc:
-                best_val_auc = val_auc
-                best_epoch = epoch + 1
-                print(f"✨ New best AUC: {best_val_auc:.4f} at epoch {best_epoch}. Saving model...")
+                train_loss, train_auc = train_one_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    criterion,
+                    config.device,
+                    scaler,
+                    logged_original_samplenames_for_spectrograms,
+                    config.NUM_SPECTROGRAM_SAMPLES_TO_LOG,
+                    scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
+                )
 
-                checkpoint = {
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'epoch': epoch,
-                    'val_auc': best_val_auc,
-                    'train_auc': train_auc,
+                # Modified to receive new metrics
+                val_loss, val_auc, val_per_class_metrics, val_all_outputs, val_all_targets = validate(
+                    model,
+                    val_loader,
+                    criterion,
+                    config.device
+                )
+
+                if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
+                    if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+                        scheduler.step(val_loss)
+                    else:
+                        scheduler.step()
+
+                print(f"Epoch {epoch+1} Summary:")
+                print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
+                print(f"Val Loss:   {val_loss:.4f}, Val AUC:   {val_auc:.4f}")
+
+                # --- Append metrics for the CURRENT fold's history --- #
+                fold_history['epochs'].append(epoch + 1)
+                fold_history['train_loss'].append(train_loss)
+                fold_history['val_loss'].append(val_loss)
+                fold_history['train_auc'].append(train_auc)
+                fold_history['val_auc'].append(val_auc)
+
+                # --- wandb logging for epoch metrics ---
+                log_metrics = {
+                    f'fold_{fold}/epoch': epoch, # Log the actual epoch number for this fold
+                    f'fold_{fold}/train_loss': train_loss,
+                    f'fold_{fold}/train_auc': train_auc,
+                    f'fold_{fold}/val_loss': val_loss,
+                    f'fold_{fold}/val_auc': val_auc,
+                    f'fold_{fold}/lr': optimizer.param_groups[0]['lr']
                 }
-                save_path = os.path.join(config.MODEL_OUTPUT_DIR, f"{config.model_name}_fold{fold}_best.pth")
+                if wandb_run: # Check if wandb run is active
+                    wandb.log(log_metrics) # Let wandb use the defined step_metric
+
+                # --- HPO Pruning --- #
+                if is_hpo_trial:
+                    trial.report(val_auc, epoch) # Report intermediate val_auc
+                    if trial.should_prune():
+                        print(f"  Pruning trial based on intermediate value at epoch {epoch+1}.")
+                        raise optuna.TrialPruned() # Raise exception to stop training
+
+                # --- Model Checkpointing --- #
+                if val_auc > best_val_auc:
+                    best_val_auc = val_auc
+                    best_epoch = epoch + 1
+                    # New: Store detailed metrics for the best epoch
+                    best_epoch_val_per_class_metrics = val_per_class_metrics
+                    best_epoch_val_all_outputs = val_all_outputs
+                    best_epoch_val_all_targets = val_all_targets
+                    
+                    print(f"✨ New best AUC: {best_val_auc:.4f} at epoch {best_epoch}. Saving model...")
+
+                    checkpoint = {
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                        'epoch': epoch,
+                        'val_auc': best_val_auc,
+                        'train_auc': train_auc,
+                        # Optionally, store per-class metrics in checkpoint if desired, though it can make files large
+                        # 'val_per_class_metrics': val_per_class_metrics 
+                    }
+                    save_path = os.path.join(config.MODEL_OUTPUT_DIR, f"{config.model_name}_fold{fold}_best.pth")
+                    try:
+                        torch.save(checkpoint, save_path)
+                        print(f"  Model saved to {save_path}")
+                        current_fold_best_model_path = save_path # Update best model path for this fold
+                    except Exception as e:
+                        print(f"  Error saving model checkpoint: {e}") # Removed artifact logging from here
+
+                # --- EPOCH LOOP ENDS HERE ---
+
+            # --- Code to run AFTER all epochs for the current FOLD are done ---
+            print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
+            
+            # New: Store the best epoch details for this fold for later OOF aggregation
+            if best_epoch_val_per_class_metrics is not None: # Ensure we have data from a best epoch
+                best_epoch_details_all_folds.append({
+                    'fold': fold,
+                    'best_val_auc': best_val_auc,
+                    'best_epoch': best_epoch,
+                    'per_class_metrics': best_epoch_val_per_class_metrics,
+                    'outputs': best_epoch_val_all_outputs,
+                    'targets': best_epoch_val_all_targets
+                })
+
+            # Log best AUC for this fold to wandb summary for easy viewing
+            if wandb_run: # Check if wandb run is active
+                wandb.summary[f'fold_{fold}_best_val_auc'] = best_val_auc
+            single_fold_best_auc = best_val_auc
+
+            all_folds_history.append(fold_history)
+
+            # Clean up resources for the current fold before starting the next one
+            del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
+            del train_df_fold, val_df_fold
+            torch.cuda.empty_cache()
+            gc.collect()
+            # --- End of FOLD specific cleanup ---
+
+        # --- FOLD LOOP ENDS HERE (or continues to next fold) ---
+
+        # --- Code to run AFTER ALL SELECTED FOLDS are done ---
+        if not is_hpo_trial:
+            # --- Averaged Training History Plot (existing code) ---
+            if all_folds_history:
+                print("\n--- Generating Average Training History Plot Across Folds ---")
+
+                # Calculate average metrics per epoch
+                num_epochs = config.epochs
+                avg_train_loss = np.zeros(num_epochs)
+                avg_val_loss = np.zeros(num_epochs)
+                avg_train_auc = np.zeros(num_epochs)
+                avg_val_auc = np.zeros(num_epochs)
+                counts_per_epoch = np.zeros(num_epochs, dtype=int)
+
+                for fold_hist in all_folds_history:
+                    # Use the actual number of epochs recorded in the history for this fold
+                    epochs_ran = len(fold_hist['epochs'])
+                    for i in range(epochs_ran):
+                        epoch_idx = i
+                        if epoch_idx < num_epochs:
+                            avg_train_loss[epoch_idx] += fold_hist['train_loss'][i]
+                            avg_val_loss[epoch_idx] += fold_hist['val_loss'][i]
+                            avg_train_auc[epoch_idx] += fold_hist['train_auc'][i]
+                            avg_val_auc[epoch_idx] += fold_hist['val_auc'][i]
+                            counts_per_epoch[epoch_idx] += 1
+
+                # Avoid division by zero if no folds ran or epochs were skipped
+                valid_counts_mask = counts_per_epoch > 0
+                avg_train_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+                avg_val_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+                avg_train_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+                avg_val_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+
+                epochs_axis = list(range(1, num_epochs + 1))
+
+                # Generate Plot
+                fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+
+                # Loss Plot
+                ax[0].plot(epochs_axis, avg_train_loss, label='Avg Train Loss')
+                ax[0].plot(epochs_axis, avg_val_loss, label='Avg Validation Loss')
+                ax[0].set_title('Average Loss vs. Epochs Across Folds')
+                ax[0].set_xlabel('Epoch')
+                ax[0].set_ylabel('Loss')
+                ax[0].legend()
+                ax[0].grid(True)
+
+                # AUC Plot
+                ax[1].plot(epochs_axis, avg_train_auc, label='Avg Train AUC')
+                ax[1].plot(epochs_axis, avg_val_auc, label='Avg Validation AUC')
+                ax[1].set_title('Average AUC vs. Epochs Across Folds')
+                ax[1].set_xlabel('Epoch')
+                ax[1].set_ylabel('AUC')
+                ax[1].legend()
+                ax[1].grid(True)
+
+                plt.tight_layout()
+
+                plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
+                os.makedirs(plot_dir, exist_ok=True)
+                plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
+
                 try:
-                    torch.save(checkpoint, save_path)
-                    print(f"  Model saved to {save_path}")
+                    plt.savefig(plot_save_path)
+                    print(f"Saved average plot to: {plot_save_path}")
+                    # --- wandb log training plot ---
+                    if wandb_run: # Check if wandb run is active
+                        wandb.log({"training_plot": wandb.Image(plot_save_path)})
                 except Exception as e:
-                    print(f"  Error saving model checkpoint: {e}")
+                    print(f"Error saving average plot to {plot_save_path}: {e}")
+                plt.close(fig)
+            else:
+                print("\nNo fold histories recorded, skipping average plot generation.")
 
-        print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
-        single_fold_best_auc = best_val_auc 
+            # --- New: Aggregate and Log Per-Class Metrics and OOF Metrics ---
+            if best_epoch_details_all_folds:
+                print("\n--- Aggregating and Logging Per-Class & OOF Metrics ---")
+                
+                # Use the stored overall_species_ids_for_run
+                if overall_species_ids_for_run is None:
+                    print("ERROR: Could not determine species_ids for metric aggregation. Skipping.")
+                    # Potentially skip the rest of this block or handle error appropriately
+                else:
+                    species_ids = overall_species_ids_for_run
+                    num_classes = len(species_ids)
 
-        all_folds_history.append(fold_history)
+                    # 1. Average Per-Class Metrics from Best Epoch of Each Fold
+                    # Initialize a dictionary to sum metrics for each class across folds
+                    sum_per_class_metrics = {sid: {m: 0.0 for m in ['auc', 'precision', 'recall', 'f1', 'tp', 'fp', 'fn', 'tn']} for sid in species_ids}
+                    num_folds_with_details = len(best_epoch_details_all_folds)
 
-        del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
-        del train_df_fold, val_df_fold 
-        torch.cuda.empty_cache()
-        gc.collect()
+                    for fold_details in best_epoch_details_all_folds:
+                        for class_metric in fold_details['per_class_metrics']:
+                            sid = class_metric['species_id']
+                            if sid in sum_per_class_metrics:
+                                sum_per_class_metrics[sid]['auc'] += class_metric['auc']
+                                sum_per_class_metrics[sid]['precision'] += class_metric['precision']
+                                sum_per_class_metrics[sid]['recall'] += class_metric['recall']
+                                sum_per_class_metrics[sid]['f1'] += class_metric['f1']
+                                sum_per_class_metrics[sid]['tp'] += class_metric['tp']
+                                sum_per_class_metrics[sid]['fp'] += class_metric['fp']
+                                sum_per_class_metrics[sid]['fn'] += class_metric['fn']
+                                sum_per_class_metrics[sid]['tn'] += class_metric['tn']
+                    
+                    avg_per_class_metrics_list = []
+                    if num_folds_with_details > 0:
+                        for sid in species_ids:
+                            avg_metrics = {metric: val / num_folds_with_details for metric, val in sum_per_class_metrics[sid].items()}
+                            avg_metrics['species_id'] = sid
+                            avg_per_class_metrics_list.append(avg_metrics)
+                    
+                    if avg_per_class_metrics_list:
+                        avg_per_class_df = pd.DataFrame(avg_per_class_metrics_list)
+                        if wandb_run:
+                            try:
+                                wandb.log({"avg_best_epoch_per_class_metrics": wandb.Table(dataframe=avg_per_class_df)})
+                                print("  Logged average best epoch per-class metrics to W&B table.")
+                            except Exception as e_wandb_table:
+                                print(f"  Error logging avg_best_epoch_per_class_metrics table to W&B: {e_wandb_table}")
 
-    if not is_hpo_trial:
-        if all_folds_history:
-            print("\n--- Generating Average Training History Plot Across Folds ---")
+                    # 2. Calculate OOF Per-Class Metrics
+                    oof_all_targets = []
+                    oof_all_outputs = [] # logits
+                    for fold_details in best_epoch_details_all_folds:
+                        if fold_details['targets'] is not None and fold_details['outputs'] is not None:
+                            oof_all_targets.append(fold_details['targets'])
+                            oof_all_outputs.append(fold_details['outputs'])
 
-            # Calculate average metrics per epoch
-            num_epochs = config.epochs
-            avg_train_loss = np.zeros(num_epochs)
-            avg_val_loss = np.zeros(num_epochs)
-            avg_train_auc = np.zeros(num_epochs)
-            avg_val_auc = np.zeros(num_epochs)
-            counts_per_epoch = np.zeros(num_epochs, dtype=int)
+                    if oof_all_targets and oof_all_outputs:
+                        oof_targets_cat = np.concatenate(oof_all_targets)
+                        oof_outputs_cat = np.concatenate(oof_all_outputs) # These are logits
+                        
+                        oof_per_class_metrics_list = []
+                        oof_probabilities_cat = 1 / (1 + np.exp(-oof_outputs_cat)) # Sigmoid probabilities
+                        oof_predictions_binary_cat = (oof_probabilities_cat >= 0.5).astype(int)
 
-            for fold_hist in all_folds_history:
-                # Use the actual number of epochs recorded in the history for this fold
-                epochs_ran = len(fold_hist['epochs'])
-                for i in range(epochs_ran):
-                    epoch_idx = i 
-                    if epoch_idx < num_epochs:
-                        avg_train_loss[epoch_idx] += fold_hist['train_loss'][i]
-                        avg_val_loss[epoch_idx] += fold_hist['val_loss'][i]
-                        avg_train_auc[epoch_idx] += fold_hist['train_auc'][i]
-                        avg_val_auc[epoch_idx] += fold_hist['val_auc'][i]
-                        counts_per_epoch[epoch_idx] += 1
+                        try:
+                            oof_mcm = multilabel_confusion_matrix(oof_targets_cat, oof_predictions_binary_cat, labels=list(range(num_classes)))
+                        except Exception as e_oof_mcm:
+                            print(f"  Error calculating OOF multilabel_confusion_matrix: {e_oof_mcm}. TP/FP/FN/TN will be zero.")
+                            oof_mcm = np.zeros((num_classes, 2, 2), dtype=int) # Fallback
 
-            # Avoid division by zero if no folds ran or epochs were skipped
-            valid_counts_mask = counts_per_epoch > 0
-            avg_train_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
-            avg_val_loss[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
-            avg_train_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
-            avg_val_auc[valid_counts_mask] /= counts_per_epoch[valid_counts_mask]
+                        for i in range(num_classes):
+                            class_targets = oof_targets_cat[:, i]
+                            class_probs = oof_probabilities_cat[:, i]
+                            class_preds_binary = oof_predictions_binary_cat[:, i]
+                            species_name = species_ids[i]
 
-            epochs_axis = list(range(1, num_epochs + 1))
+                            class_auc = 0.0
+                            if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0:
+                                try: class_auc = roc_auc_score(class_targets, class_probs)
+                                except ValueError: class_auc = 0.0
+                            
+                            precision, recall, f1_score, _ = precision_recall_fscore_support(
+                                class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
+                            )
+                            tn, fp, fn, tp = oof_mcm[i].ravel()
 
-            # Generate Plot
-            fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+                            oof_per_class_metrics_list.append({
+                                'species_id': species_name, 'auc': class_auc, 'precision': precision,
+                                'recall': recall, 'f1': f1_score, 'tp': int(tp), 'fp': int(fp), 'fn': int(fn), 'tn': int(tn)
+                            })
+                        
+                        if oof_per_class_metrics_list:
+                            oof_per_class_df = pd.DataFrame(oof_per_class_metrics_list)
+                            if wandb_run:
+                                try:
+                                    wandb.log({"oof_per_class_metrics": wandb.Table(dataframe=oof_per_class_df)})
+                                    print("  Logged OOF per-class metrics to W&B table.")
+                                except Exception as e_wandb_table:
+                                    print(f"  Error logging oof_per_class_metrics table to W&B: {e_wandb_table}")
+                    else:
+                        print("  No OOF details found, skipping OOF per-class metrics calculation.")
+            else:
+                print("\nNo best_epoch_details recorded, skipping per-class & OOF metric aggregation.")
 
-            # Loss Plot
-            ax[0].plot(epochs_axis, avg_train_loss, label='Avg Train Loss')
-            ax[0].plot(epochs_axis, avg_val_loss, label='Avg Validation Loss')
-            ax[0].set_title('Average Loss vs. Epochs Across Folds')
-            ax[0].set_xlabel('Epoch')
-            ax[0].set_ylabel('Loss')
-            ax[0].legend()
-            ax[0].grid(True)
+            # --- Non-HPO Summary (existing code, ensure it uses the correct data) ---
+            if all_folds_history: # This check remains for the general OOF AUC from history
+                oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] # Get best AUC from each fold history
+                mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
+                print("\n" + "="*60)
+                print("Cross-Validation Training Summary:")
+                num_folds_run = len(all_folds_history)
+                for i in range(num_folds_run):
+                     fold_num = config.selected_folds[i]
+                     best_fold_auc = max(all_folds_history[i]['val_auc']) if all_folds_history[i]['val_auc'] else 0.0
+                     print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
+                print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
+                print("="*60)
+                if wandb_run: # Check if wandb run is active
+                    wandb.summary['mean_oof_auc'] = mean_oof_auc # Log overall mean OOF AUC
+            else:
+                print("\nNo folds were trained.")
+                print("="*60)
 
-            # AUC Plot
-            ax[1].plot(epochs_axis, avg_train_auc, label='Avg Train AUC')
-            ax[1].plot(epochs_axis, avg_val_auc, label='Avg Validation AUC')
-            ax[1].set_title('Average AUC vs. Epochs Across Folds')
-            ax[1].set_xlabel('Epoch')
-            ax[1].set_ylabel('AUC')
-            ax[1].legend()
-            ax[1].grid(True)
-
-            plt.tight_layout()
-
-            plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
-            os.makedirs(plot_dir, exist_ok=True)
-            plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
-
-            try:
-                plt.savefig(plot_save_path)
-                print(f"Saved average plot to: {plot_save_path}")
-            except Exception as e:
-                print(f"Error saving average plot to {plot_save_path}: {e}")
-            plt.close(fig)
+        if is_hpo_trial:
+            print(f"\nReturning best AUC for HPO Trial (Fold {config.selected_folds[0]}): {single_fold_best_auc:.4f}")
+            # For HPO, wandb.finish() will be called in the finally block
+            return single_fold_best_auc
         else:
-            print("\nNo fold histories recorded, skipping average plot generation.")
-        
-        # --- Non-HPO Summary --- #
-        if all_folds_history:
-            oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] # Get best AUC from each fold history
-            mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
+            # For standard runs, calculate and return the mean OOF AUC if multiple folds ran
+            # (This part is largely for printing, wandb summary already updated)
+            mean_oof_auc_final = 0.0
+            if all_folds_history:
+                oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h.get('val_auc')] # Safer access
+                if oof_scores_from_hist: # Ensure list is not empty before mean
+                    mean_oof_auc_final = np.mean(oof_scores_from_hist)
+
+                # Update summary if the run is still considered active by the W&B library
+                if wandb.run: # wandb.run is the global accessor for the current active run status
+                    try:
+                        wandb.summary['mean_oof_auc'] = mean_oof_auc_final
+                        print(f"DEBUG: Updated wandb.summary['mean_oof_auc'] = {mean_oof_auc_final:.4f}")
+                    except Exception as e_summary:
+                        print(f"DEBUG: Error updating wandb.summary for mean_oof_auc: {e_summary}")
+
+            # Determine return value after the finally block has executed
+            mean_oof_auc_to_return = 0.0
+            if all_folds_history:
+                oof_scores_from_hist_return = [max(h['val_auc']) for h in all_folds_history if h.get('val_auc')] # Safer access
+                if oof_scores_from_hist_return:
+                    mean_oof_auc_to_return = np.mean(oof_scores_from_hist_return)
+
             print("\n" + "="*60)
-            print("Cross-Validation Training Summary:")
-            num_folds_run = len(all_folds_history) 
-            for i in range(num_folds_run):
-                 fold_num = config.selected_folds[i] 
-                 best_fold_auc = max(all_folds_history[i]['val_auc']) if all_folds_history[i]['val_auc'] else 0.0
-                 print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
-            print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
+            if all_folds_history and any(h.get('val_auc') for h in all_folds_history):
+                print("Final Cross-Validation Training Summary:")
+                # Ensure selected_folds has enough elements if all_folds_history is populated
+                num_folds_actually_run = len(all_folds_history)
+                for i in range(num_folds_actually_run):
+                     fold_num_display = config.selected_folds[i] if i < len(config.selected_folds) else f"FoldIndex_{i}"
+                     # Get val_auc history for the current fold, check if it's not empty
+                     current_fold_val_auc_history = all_folds_history[i].get('val_auc', [])
+                     best_fold_auc = max(current_fold_val_auc_history) if current_fold_val_auc_history else 0.0
+                     print(f"  Fold {fold_num_display}: Best Val AUC = {best_fold_auc:.4f}")
+                print(f"\nMean OOF AUC across {len(oof_scores_from_hist_return) if oof_scores_from_hist_return else 0} trained folds: {mean_oof_auc_to_return:.4f}")
+            else:
+                print("No folds were trained or no validation AUCs recorded.")
             print("="*60)
-        else:
-            print("\nNo folds were trained.")
-            print("="*60)
-
-    if is_hpo_trial:
-        print(f"\nReturning best AUC for HPO Trial (Fold {config.selected_folds[0]}): {single_fold_best_auc:.4f}")
-        return single_fold_best_auc
-    else:
-        # For standard runs, calculate and return the mean OOF AUC if multiple folds ran
-        if all_folds_history:
-            # Recalculate mean OOF from the best scores recorded in histories if needed
-            oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] # Get best AUC from each fold history
-            mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
-            print("\n" + "="*60)
-            print("Cross-Validation Training Summary:")
-            for i, fold_hist in enumerate(all_folds_history):
-                 fold_num = config.selected_folds[i]
-                 best_fold_auc = max(fold_hist['val_auc']) if fold_hist['val_auc'] else 0.0
-                 print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
-            print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc:.4f}")
-            print("="*60)
-            return mean_oof_auc
-        else:
-            print("No folds were trained.")
-            print("="*60)
-            return 0.0
+            return mean_oof_auc_to_return
+    finally:
+        if wandb_run:
+            wandb_run.finish() # Ensure wandb run is finished
 
 if __name__ == "__main__":
     print("\n--- Initializing Training Script ---")
@@ -1046,8 +1352,6 @@ if __name__ == "__main__":
          missing_keys = set(training_df['samplename']) - set(all_spectrograms.keys())
          if missing_keys:
               print(f"  WARNING: {len(missing_keys)} samplenames in the final dataframe are missing from the loaded spectrograms!")
-              print(f"    Examples: {list(missing_keys)[:10]}")
-              # Potentially filter df: training_df = training_df[training_df['samplename'].isin(all_spectrograms.keys())]
 
     # --- Filter training_df to only include samples with loaded spectrograms --- #
     if all_spectrograms is not None:

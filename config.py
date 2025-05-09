@@ -3,14 +3,14 @@ import os
 import multiprocessing
 
 class Config:
-    seed = 40
+    seed = 43
     debug = False
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # --- Workbench/Local Paths (using gcsfuse mount) --- #
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
-    GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/gcs_mount"
+    GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/data"
 
     DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
@@ -58,7 +58,7 @@ class Config:
     USE_PSEUDO_LABELS = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
-    MAX_DURATION_FOR_FULL_SPEC_SEC = 25.0
+    NUM_SPECTROGRAM_SAMPLES_TO_LOG = 6
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
@@ -70,7 +70,7 @@ class Config:
     criterion = 'FocalLossBCE'
     focal_loss_alpha = 0.25
     focal_loss_gamma = 2.0
-    focal_loss_bce_weight = 1.0 # Focal weight will be calculated as 2.0 - bce_weight
+    focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
     label_smoothing_factor = 0.1
 
@@ -99,7 +99,7 @@ class Config:
     max_time_mask_width = 30     # Maximum width of time mask
     max_freq_mask_height = 26    # Maximum height of frequency mask
 
-    inference_batch_size = 16
+    inference_batch_size = 64
     use_tta = False
     tta_count = 3
     # Threshold for generating pseudo labels
@@ -115,10 +115,8 @@ class Config:
     smoothing_neighbor_weight = 0.125
 
     # --- BirdNET Preprocessing Config ---
+    BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.25 # Threshold for BirdNET-generated pseudo labels
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
 config = Config()
-
-# Optional: Add another print here to confirm the final config object shape if needed
-# print(f"[Config Instance] TARGET_SHAPE: {config.TARGET_SHAPE}")

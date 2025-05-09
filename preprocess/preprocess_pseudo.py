@@ -40,7 +40,7 @@ def _process_pseudo_label_row(args):
 
         # Load the full audio file
         # Note: Loading the full file repeatedly can be slow. Caching or pre-loading could optimize.
-        audio_data, sr = librosa.load(audio_path, sr=config.FS, mono=True)
+        audio_data, _ = librosa.load(audio_path, sr=config.FS, mono=True)
         
         # Calculate start and end samples
         start_sample = int(start_time * config.FS)
