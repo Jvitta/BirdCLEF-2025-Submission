@@ -15,7 +15,7 @@ import multiprocessing
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
 
 import torch
 import torch.nn as nn
@@ -590,9 +590,11 @@ def validate(model, loader, criterion, device):
     """Runs validation with optional mixed precision for inference."""
     model.eval()
     losses = []
-    all_targets = []
-    all_outputs = []
+    all_targets_list = [] # Changed name to avoid confusion later
+    all_outputs_list = [] # Changed name
     use_amp = config.use_amp
+    species_ids = loader.dataset.species_ids # Get species IDs for labeling
+    num_classes = len(species_ids)
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
@@ -611,25 +613,75 @@ def validate(model, loader, criterion, device):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
 
-            all_outputs.append(outputs.float().cpu().numpy())
-            all_targets.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
+            all_outputs_list.append(outputs.float().cpu().numpy())
+            all_targets_list.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
             losses.append(loss.item())
 
             if config.debug and (step + 1) >= config.debug_limit_batches:
                 print(f"DEBUG: Stopping validation early after {config.debug_limit_batches} batches.")
                 break
 
-    if not all_targets or not all_outputs:
+    if not all_targets_list or not all_outputs_list:
         print("Warning: No targets or outputs collected during validation.")
-        return 0.0, 0.0
+        # Return empty structures or zeros for all expected values
+        per_class_metrics = [{'species_id': sid, 'auc': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for sid in species_ids]
+        return 0.0, 0.0, per_class_metrics, np.array([]), np.array([])
 
-    all_outputs_cat = np.concatenate(all_outputs)
-    all_targets_cat = np.concatenate(all_targets)
+    all_outputs_cat = np.concatenate(all_outputs_list)
+    all_targets_cat = np.concatenate(all_targets_list)
+    
+    macro_auc = calculate_auc(all_targets_cat, all_outputs_cat) # Existing macro AUC calculation
+    avg_loss = np.mean(losses) if losses else 0.0
 
-    auc = calculate_auc(all_targets_cat, all_outputs_cat)
-    avg_loss = np.mean(losses)
+    # --- Per-Class Metrics Calculation ---
+    per_class_metrics_list = []
+    probabilities_cat = 1 / (1 + np.exp(-all_outputs_cat)) # Sigmoid probabilities
+    predictions_binary_cat = (probabilities_cat >= 0.5).astype(int)
 
-    return avg_loss, auc
+    # Get TP, FP, FN, TN for all classes using multilabel_confusion_matrix
+    try:
+        mcm = multilabel_confusion_matrix(all_targets_cat, predictions_binary_cat, labels=list(range(num_classes)))
+    except Exception as e_mcm:
+        print(f"Error calculating multilabel_confusion_matrix: {e_mcm}. Per-class TP/FP/FN/TN will be zero.")
+        mcm = np.zeros((num_classes, 2, 2), dtype=int) # Fallback
+
+    for i in range(num_classes):
+        class_targets = all_targets_cat[:, i]
+        class_probs = probabilities_cat[:, i]
+        class_preds_binary = predictions_binary_cat[:, i]
+        species_name = species_ids[i]
+
+        class_auc = 0.0
+        if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0: # Ensure both classes are present for AUC
+            try:
+                class_auc = roc_auc_score(class_targets, class_probs)
+            except ValueError:
+                class_auc = 0.0 # Or handle as NaN, but 0.0 is simpler for aggregation
+        
+        # Calculate precision, recall, F1 for the positive class (label 1)
+        # average=None and labels=[1] gives metrics specifically for the positive class
+        # If class_targets are all 0, precision/recall/f1 for label 1 will be 0 due to zero_division=0
+        precision, recall, f1_score, _ = precision_recall_fscore_support(
+            class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
+        )
+
+        # Extract TP, FP, FN, TN from mcm
+        # mcm[i] is [[TN, FP], [FN, TP]] for class i
+        tn, fp, fn, tp = mcm[i].ravel()
+
+        per_class_metrics_list.append({
+            'species_id': species_name,
+            'auc': class_auc,
+            'precision': precision, # Directly use the scalar value for pos_label=1
+            'recall': recall,       # Directly use the scalar value for pos_label=1
+            'f1': f1_score,         # Directly use the scalar value for pos_label=1
+            'tp': int(tp),
+            'fp': int(fp),
+            'fn': int(fn),
+            'tn': int(tn)
+        })
+
+    return avg_loss, macro_auc, per_class_metrics_list, all_outputs_cat, all_targets_cat
 
 def run_training(df, config, trial=None, all_spectrograms=None):
     """Runs the training loop. 
@@ -715,6 +767,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
    
     all_folds_history = []
+    # New: Store details from the best epoch of each fold for OOF and per-class analysis
+    best_epoch_details_all_folds = [] 
     single_fold_best_auc = 0.0 
     
     try: # Wrap the main training loop in try/finally for wandb.finish()
@@ -789,6 +843,11 @@ def run_training(df, config, trial=None, all_spectrograms=None):
 
             best_val_auc = 0.0
             best_epoch = 0
+            # New: Store metrics from the best epoch of the current fold
+            best_epoch_val_per_class_metrics = None
+            best_epoch_val_all_outputs = None
+            best_epoch_val_all_targets = None
+            # current_fold_best_model_path = None # This was already there
 
             # --- Epoch Loop --- #
             for epoch in range(config.epochs):
@@ -804,7 +863,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                     scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
                 )
 
-                val_loss, val_auc = validate(
+                # Modified to receive new metrics
+                val_loss, val_auc, val_per_class_metrics, val_all_outputs, val_all_targets = validate(
                     model,
                     val_loader,
                     criterion,
@@ -851,6 +911,11 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                 if val_auc > best_val_auc:
                     best_val_auc = val_auc
                     best_epoch = epoch + 1
+                    # New: Store detailed metrics for the best epoch
+                    best_epoch_val_per_class_metrics = val_per_class_metrics
+                    best_epoch_val_all_outputs = val_all_outputs
+                    best_epoch_val_all_targets = val_all_targets
+                    
                     print(f"✨ New best AUC: {best_val_auc:.4f} at epoch {best_epoch}. Saving model...")
 
                     checkpoint = {
@@ -860,6 +925,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                         'epoch': epoch,
                         'val_auc': best_val_auc,
                         'train_auc': train_auc,
+                        # Optionally, store per-class metrics in checkpoint if desired, though it can make files large
+                        # 'val_per_class_metrics': val_per_class_metrics 
                     }
                     save_path = os.path.join(config.MODEL_OUTPUT_DIR, f"{config.model_name}_fold{fold}_best.pth")
                     try:
@@ -873,6 +940,17 @@ def run_training(df, config, trial=None, all_spectrograms=None):
 
             # --- Code to run AFTER all epochs for the current FOLD are done ---
             print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
+            
+            # New: Store the best epoch details for this fold for later OOF aggregation
+            if best_epoch_val_per_class_metrics is not None: # Ensure we have data from a best epoch
+                best_epoch_details_all_folds.append({
+                    'fold': fold,
+                    'best_val_auc': best_val_auc,
+                    'best_epoch': best_epoch,
+                    'per_class_metrics': best_epoch_val_per_class_metrics,
+                    'outputs': best_epoch_val_all_outputs,
+                    'targets': best_epoch_val_all_targets
+                })
 
             # Log best AUC for this fold to wandb summary for easy viewing
             if wandb_run: # Check if wandb run is active
@@ -892,6 +970,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
 
         # --- Code to run AFTER ALL SELECTED FOLDS are done ---
         if not is_hpo_trial:
+            # --- Averaged Training History Plot (existing code) ---
             if all_folds_history:
                 print("\n--- Generating Average Training History Plot Across Folds ---")
 
@@ -963,8 +1042,104 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             else:
                 print("\nNo fold histories recorded, skipping average plot generation.")
 
-            # --- Non-HPO Summary --- #
-            if all_folds_history:
+            # --- New: Aggregate and Log Per-Class Metrics and OOF Metrics ---
+            if best_epoch_details_all_folds:
+                print("\n--- Aggregating and Logging Per-Class & OOF Metrics ---")
+                species_ids = val_loader.dataset.species_ids # Get species_ids from the last val_loader
+                num_classes = len(species_ids)
+
+                # 1. Average Per-Class Metrics from Best Epoch of Each Fold
+                # Initialize a dictionary to sum metrics for each class across folds
+                sum_per_class_metrics = {sid: {m: 0.0 for m in ['auc', 'precision', 'recall', 'f1', 'tp', 'fp', 'fn', 'tn']} for sid in species_ids}
+                num_folds_with_details = len(best_epoch_details_all_folds)
+
+                for fold_details in best_epoch_details_all_folds:
+                    for class_metric in fold_details['per_class_metrics']:
+                        sid = class_metric['species_id']
+                        if sid in sum_per_class_metrics:
+                            sum_per_class_metrics[sid]['auc'] += class_metric['auc']
+                            sum_per_class_metrics[sid]['precision'] += class_metric['precision']
+                            sum_per_class_metrics[sid]['recall'] += class_metric['recall']
+                            sum_per_class_metrics[sid]['f1'] += class_metric['f1']
+                            sum_per_class_metrics[sid]['tp'] += class_metric['tp']
+                            sum_per_class_metrics[sid]['fp'] += class_metric['fp']
+                            sum_per_class_metrics[sid]['fn'] += class_metric['fn']
+                            sum_per_class_metrics[sid]['tn'] += class_metric['tn']
+                
+                avg_per_class_metrics_list = []
+                if num_folds_with_details > 0:
+                    for sid in species_ids:
+                        avg_metrics = {metric: val / num_folds_with_details for metric, val in sum_per_class_metrics[sid].items()}
+                        avg_metrics['species_id'] = sid
+                        avg_per_class_metrics_list.append(avg_metrics)
+                
+                if avg_per_class_metrics_list:
+                    avg_per_class_df = pd.DataFrame(avg_per_class_metrics_list)
+                    if wandb_run:
+                        try:
+                            wandb.log({"avg_best_epoch_per_class_metrics": wandb.Table(dataframe=avg_per_class_df)})
+                            print("  Logged average best epoch per-class metrics to W&B table.")
+                        except Exception as e_wandb_table:
+                            print(f"  Error logging avg_best_epoch_per_class_metrics table to W&B: {e_wandb_table}")
+
+                # 2. Calculate OOF Per-Class Metrics
+                oof_all_targets = []
+                oof_all_outputs = [] # logits
+                for fold_details in best_epoch_details_all_folds:
+                    if fold_details['targets'] is not None and fold_details['outputs'] is not None:
+                        oof_all_targets.append(fold_details['targets'])
+                        oof_all_outputs.append(fold_details['outputs'])
+
+                if oof_all_targets and oof_all_outputs:
+                    oof_targets_cat = np.concatenate(oof_all_targets)
+                    oof_outputs_cat = np.concatenate(oof_all_outputs) # These are logits
+                    
+                    oof_per_class_metrics_list = []
+                    oof_probabilities_cat = 1 / (1 + np.exp(-oof_outputs_cat)) # Sigmoid probabilities
+                    oof_predictions_binary_cat = (oof_probabilities_cat >= 0.5).astype(int)
+
+                    try:
+                        oof_mcm = multilabel_confusion_matrix(oof_targets_cat, oof_predictions_binary_cat, labels=list(range(num_classes)))
+                    except Exception as e_oof_mcm:
+                        print(f"  Error calculating OOF multilabel_confusion_matrix: {e_oof_mcm}. TP/FP/FN/TN will be zero.")
+                        oof_mcm = np.zeros((num_classes, 2, 2), dtype=int) # Fallback
+
+                    for i in range(num_classes):
+                        class_targets = oof_targets_cat[:, i]
+                        class_probs = oof_probabilities_cat[:, i]
+                        class_preds_binary = oof_predictions_binary_cat[:, i]
+                        species_name = species_ids[i]
+
+                        class_auc = 0.0
+                        if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0:
+                            try: class_auc = roc_auc_score(class_targets, class_probs)
+                            except ValueError: class_auc = 0.0
+                        
+                        precision, recall, f1_score, _ = precision_recall_fscore_support(
+                            class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
+                        )
+                        tn, fp, fn, tp = oof_mcm[i].ravel()
+
+                        oof_per_class_metrics_list.append({
+                            'species_id': species_name, 'auc': class_auc, 'precision': precision,
+                            'recall': recall, 'f1': f1_score, 'tp': int(tp), 'fp': int(fp), 'fn': int(fn), 'tn': int(tn)
+                        })
+                    
+                    if oof_per_class_metrics_list:
+                        oof_per_class_df = pd.DataFrame(oof_per_class_metrics_list)
+                        if wandb_run:
+                            try:
+                                wandb.log({"oof_per_class_metrics": wandb.Table(dataframe=oof_per_class_df)})
+                                print("  Logged OOF per-class metrics to W&B table.")
+                            except Exception as e_wandb_table:
+                                print(f"  Error logging oof_per_class_metrics table to W&B: {e_wandb_table}")
+                else:
+                    print("  No OOF details found, skipping OOF per-class metrics calculation.")
+            else:
+                print("\nNo best_epoch_details recorded, skipping per-class & OOF metric aggregation.")
+
+            # --- Non-HPO Summary (existing code, ensure it uses the correct data) ---
+            if all_folds_history: # This check remains for the general OOF AUC from history
                 oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] # Get best AUC from each fold history
                 mean_oof_auc = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
                 print("\n" + "="*60)

@@ -24,79 +24,87 @@ def _process_pseudo_label_row(args):
     index, row, config = args
     
     filename = row['filename']
-    start_time = row['start_time']
-    end_time = row['end_time']
-    primary_label = row['primary_label']
+    start_time_orig = row['start_time'] # Original BirdNET detection start
+    end_time_orig = row['end_time']   # Original BirdNET detection end
+    # primary_label = row['primary_label'] # Not used in spec generation directly
 
-    # Construct full audio path (assuming pseudo labels refer to files in unlabeled_audio_dir)
     audio_path = os.path.join(config.unlabeled_audio_dir, filename)
-
-    # Unique key for this specific segment
-    segment_key = f"{filename}_{int(start_time)}_{int(end_time)}"
+    segment_key = f"{filename}_{int(start_time_orig)}_{int(end_time_orig)}"
     
     try:
         if not os.path.exists(audio_path):
             return (None, f"Audio file not found: {audio_path}")
 
-        # Load the full audio file
-        # Note: Loading the full file repeatedly can be slow. Caching or pre-loading could optimize.
         audio_data, _ = librosa.load(audio_path, sr=config.FS, mono=True)
-        
-        # Calculate start and end samples
-        start_sample = int(start_time * config.FS)
-        end_sample = int(end_time * config.FS)
-        
-        # Ensure indices are within bounds
-        start_sample = max(0, start_sample)
-        end_sample = min(len(audio_data), end_sample)
-        
-        if start_sample >= end_sample:
-             return (None, f"Invalid time range [{start_time}-{end_time}] for {filename}")
+        audio_len_samples = len(audio_data)
+        expected_samples_5s = int(config.TARGET_DURATION * config.FS)
 
-        # Extract the segment
-        segment_audio = audio_data[start_sample:end_sample]
-        
-        # Check segment length (should be exactly TARGET_DURATION, but allow small tolerance)
-        expected_samples = int(config.TARGET_DURATION * config.FS)
-        if len(segment_audio) < expected_samples * 0.9: # Check if significantly shorter
-             return (None, f"Extracted segment too short ({len(segment_audio)} samples) for {segment_key}")
-        elif len(segment_audio) < expected_samples:
-            # Pad if slightly short
-             segment_audio = np.pad(segment_audio, (0, expected_samples - len(segment_audio)), mode='constant')
-        elif len(segment_audio) > expected_samples:
-            # Truncate if slightly long
-             segment_audio = segment_audio[:expected_samples]
+        # Desired window center is roughly the center of the 3s BirdNET detection
+        # Desired window is 5 seconds: start_time_orig - 1 to end_time_orig + 1
+        desired_start_sec = start_time_orig - 1.0
+        desired_end_sec = end_time_orig + 1.0
 
-        # Generate Mel spectrogram
+        segment_audio = None
+
+        if desired_start_sec < 0:
+            # Case 1: Desired start is before audio begins, take first 5s
+            # print(f"DEBUG {segment_key}: Desired start < 0, taking first 5s")
+            end_sample_for_first_5s = min(audio_len_samples, expected_samples_5s)
+            segment_audio = audio_data[0:end_sample_for_first_5s]
+        elif desired_end_sec * config.FS > audio_len_samples:
+            # Case 2: Desired end is after audio ends, take last 5s
+            # print(f"DEBUG {segment_key}: Desired end > len, taking last 5s")
+            start_sample_for_last_5s = max(0, audio_len_samples - expected_samples_5s)
+            segment_audio = audio_data[start_sample_for_last_5s:audio_len_samples]
+        else:
+            # Case 3: Middle case - desired window is within audio (needs clamping)
+            # print(f"DEBUG {segment_key}: Middle case processing")
+            start_sample = max(0, int(desired_start_sec * config.FS))
+            end_sample = min(audio_len_samples, int(desired_end_sec * config.FS))
+            
+            if start_sample >= end_sample:
+                 return (None, f"Invalid calculated time range for {segment_key} after clamping middle case.")
+            segment_audio = audio_data[start_sample:end_sample]
+
+        # Pad or truncate the extracted segment_audio to be exactly expected_samples_5s
+        current_len_samples = len(segment_audio)
+        if current_len_samples == expected_samples_5s:
+            pass # Already correct length
+        elif current_len_samples < expected_samples_5s:
+            # print(f"DEBUG {segment_key}: Padding from {current_len_samples} to {expected_samples_5s}")
+            padding_needed = expected_samples_5s - current_len_samples
+            # Simple zero padding at the end is common
+            segment_audio = np.pad(segment_audio, (0, padding_needed), mode='constant', constant_values=0.0)
+        else: # current_len_samples > expected_samples_5s
+            # print(f"DEBUG {segment_key}: Truncating from {current_len_samples} to {expected_samples_5s}")
+            # This case should ideally not happen often if logic above is correct for 5s target
+            # but as a safeguard, truncate from the start (or center crop if preferred)
+            segment_audio = segment_audio[:expected_samples_5s]
+        
+        # Final check on segment length after adjustments
+        if len(segment_audio) != expected_samples_5s:
+            return (None, f"Segment for {segment_key} has incorrect final length {len(segment_audio)} after padding/truncation. Expected {expected_samples_5s}.")
+
         mel_spec = utils.audio2melspec(segment_audio, config)
         if mel_spec is None:
             return (None, f"Spectrogram generation failed for {segment_key}")
 
-        # Resize to target shape
         if mel_spec.shape != tuple(config.TARGET_SHAPE):
-             final_spec = cv2.resize(mel_spec, tuple(config.TARGET_SHAPE)[::-1], interpolation=cv2.INTER_LINEAR)
+             final_spec = cv2.resize(mel_spec, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
         else:
              final_spec = mel_spec
              
         return (segment_key, final_spec.astype(np.float32))
 
     except Exception as e:
-        # tb_str = traceback.format_exc() # Uncomment for more detailed errors
         return (None, f"Error processing {segment_key}: {e}")
 
 
 def generate_pseudo_spectrograms(config):
     """Loads pseudo labels, processes segments in parallel, and saves spectrograms to NPZ."""
     print("--- Loading Pseudo Labels --- ")
-    try:
-        pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
-        print(f"Loaded {len(pseudo_df)} pseudo labels from {config.train_pseudo_csv_path}")
-    except FileNotFoundError:
-        print(f"CRITICAL ERROR: Pseudo labels file not found at {config.train_pseudo_csv_path}. Exiting.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"CRITICAL ERROR loading pseudo labels {config.train_pseudo_csv_path}: {e}. Exiting.")
-        sys.exit(1)
+    pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
+    print(f"Loaded {len(pseudo_df)} pseudo labels from {config.train_pseudo_csv_path}")
 
     if pseudo_df.empty:
         print("Pseudo labels dataframe is empty. No spectrograms to generate.")
@@ -197,8 +205,6 @@ def main(config):
     print(f"\nTotal pseudo-label preprocessing pipeline finished in {(overall_end - overall_start):.2f} seconds.")
 
 if __name__ == '__main__':
-    # Set start method for multiprocessing (important for CUDA/GPU if workers use it)
-    # 'spawn' is often safer than 'fork'
     try:
         multiprocessing.set_start_method('spawn', force=True)
         print("Set multiprocessing start method to 'spawn'.")

@@ -63,79 +63,92 @@ def load_and_prepare_metadata(config):
     print(f"Metadata preparation finished in {end_time - start_time:.2f} seconds.")
     return df_working
 
-def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_intervals, 
-                          class_name, scientific_name, UNCOVERED_AVES_SCIENTIFIC_NAME, min_samples):
-    """Loads audio, applies VAD/Fabio speech removal if needed, checks min length."""
+def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_intervals, min_samples):
+    """
+    Loads audio. If REMOVE_SPEECH_INTERVALS is True, also provides a cleaned version for random chunks.
+    Returns:
+        final_primary_audio (np.array): Original audio. None if loading failed or initially too short.
+        audio_for_random_chunks (np.array): Cleaned audio if successful and non-empty, else final_primary_audio. None if final_primary_audio is None.
+        error_msg (str): Error message, or None.
+    """
     try:
-        primary_audio, _ = librosa.load(filepath, sr=config.FS, mono=True)
-        if primary_audio is None or len(primary_audio) < min_samples:
-            return None, f"Primary audio too short/empty: {filepath}"
+        primary_audio_candidate, _ = librosa.load(filepath, sr=config.FS, mono=True)
+        if primary_audio_candidate is None or len(primary_audio_candidate) < min_samples:
+            return None, None, f"Primary audio load failed or too short: {filepath}"
     except Exception as e_load:
-        return None, f"Error loading audio {filepath}: {e_load}"
+        return None, None, f"Error loading audio {filepath}: {e_load}"
 
-    relevant_audio = primary_audio
-    should_apply_vad_fabio = config.REMOVE_SPEECH_INTERVALS and \
-                             (class_name != 'Aves' or scientific_name == UNCOVERED_AVES_SCIENTIFIC_NAME)
+    # Initialize outputs
+    final_primary_audio = primary_audio_candidate
+    # Default audio_for_random_chunks to a copy of final_primary_audio.
+    # It will be replaced if cleaning is successful and applicable.
+    audio_for_random_chunks = final_primary_audio.copy() 
 
-    if should_apply_vad_fabio:
-        cleaned_audio_vad_fabio = None
-        # Apply Fabio speech removal
+    if config.REMOVE_SPEECH_INTERVALS:
+        temp_cleaned_audio = None # This will store the result of VAD/Fabio
+
+        # Attempt Fabio speech removal first (if applicable)
         if filename in fabio_intervals:
             start_time_fabio, stop_time_fabio = fabio_intervals[filename]
             start_idx_fabio = max(0, int(start_time_fabio * config.FS))
-            end_idx_fabio = min(len(primary_audio), int(stop_time_fabio * config.FS))
+            end_idx_fabio = min(len(final_primary_audio), int(stop_time_fabio * config.FS))
 
             if start_idx_fabio < end_idx_fabio:
-                cleaned_audio_vad_fabio = primary_audio[start_idx_fabio:end_idx_fabio]
-        # Apply VAD speech removal
+                temp_cleaned_audio = final_primary_audio[start_idx_fabio:end_idx_fabio]
+        # Else, attempt VAD speech removal (if applicable)
         elif filepath in vad_intervals:
             speech_timestamps = vad_intervals[filepath]
 
-            if speech_timestamps:
+            if speech_timestamps: # Ensure there are timestamps to process
                 non_speech_segments = []
                 current_pos_sec = 0.0
-                audio_duration_sec = len(primary_audio) / config.FS
+                audio_duration_sec = len(final_primary_audio) / config.FS
 
                 try: 
                     speech_timestamps.sort(key=lambda x: x.get('start', 0))
                 except: 
-                    speech_timestamps = []
+                    speech_timestamps = [] # Reset if sorting fails (e.g., malformed data)
 
                 for segment in speech_timestamps:
                     if not isinstance(segment, dict) or 'start' not in segment or 'end' not in segment: 
-                        continue
+                        continue 
                     start_speech_sec = segment['start']
                     end_speech_sec = segment['end']
 
+                    # Add segment before current speech
                     if start_speech_sec > current_pos_sec:
                         start_idx_segment = max(0, int(current_pos_sec * config.FS))
-                        end_idx_segment = min(len(primary_audio), int(start_speech_sec * config.FS))
+                        end_idx_segment = min(len(final_primary_audio), int(start_speech_sec * config.FS))
                         if end_idx_segment > start_idx_segment: 
-                            non_speech_segments.append(primary_audio[start_idx_segment:end_idx_segment])
+                            non_speech_segments.append(final_primary_audio[start_idx_segment:end_idx_segment])
                     
-                    current_pos_sec = max(current_pos_sec, end_speech_sec)
+                    current_pos_sec = max(current_pos_sec, end_speech_sec) # Move past the speech segment
 
+                # Add segment after the last speech segment until end of audio
                 if current_pos_sec < audio_duration_sec:
                     start_idx_segment = max(0, int(current_pos_sec * config.FS))
-                    if start_idx_segment < len(primary_audio): 
-                        non_speech_segments.append(primary_audio[start_idx_segment:])
+                    if start_idx_segment < len(final_primary_audio): 
+                        non_speech_segments.append(final_primary_audio[start_idx_segment:])
 
                 if non_speech_segments:
+                    # Filter out any potentially empty segments before concatenation
                     non_speech_segments = [s for s in non_speech_segments if len(s) > 0]
                     if non_speech_segments: 
-                        cleaned_audio_vad_fabio = np.concatenate(non_speech_segments)
+                        temp_cleaned_audio = np.concatenate(non_speech_segments)
                     else: 
-                        cleaned_audio_vad_fabio = np.array([])
+                        temp_cleaned_audio = np.array([]) # No valid non-speech segments found
                 else: 
-                    cleaned_audio_vad_fabio = np.array([])
+                    # No non-speech segments found (e.g. entire file marked as speech, or no VAD data)
+                    temp_cleaned_audio = np.array([]) 
         
-        if cleaned_audio_vad_fabio is not None and len(cleaned_audio_vad_fabio) >= min_samples:
-            relevant_audio = cleaned_audio_vad_fabio
+        # If cleaning was attempted and resulted in a non-empty audio segment, use it.
+        if temp_cleaned_audio is not None and len(temp_cleaned_audio) > 0:
+            audio_for_random_chunks = temp_cleaned_audio
 
-    if len(relevant_audio) < min_samples: # Check again after VAD
-         return None, f"Primary audio too short after VAD/Fabio: {filepath}"
+    if final_primary_audio is None: # Should not happen if initial check passed, but as safeguard
+        return None, None, "Primary audio became None unexpectedly."
 
-    return relevant_audio, None
+    return final_primary_audio, audio_for_random_chunks, None
 
 def _pad_or_tile_audio(audio_data, target_samples):
     """Pads or tiles audio to target_samples length."""
@@ -212,19 +225,21 @@ def _process_primary_for_chunking(args):
         class_name, scientific_name, birdnet_dets_for_file, UNCOVERED_AVES_SCIENTIFIC_NAME = args
 
     target_samples = int(config.TARGET_DURATION * config.FS)
-    min_samples = int(0.5 * config.FS)
+    min_samples = int(0.5 * config.FS) # Min samples for a segment to be considered usable before padding
 
     try:
-        relevant_audio, error_msg = _load_and_clean_audio(
-            primary_filepath, primary_filename, config, fabio_intervals, vad_intervals,
-            class_name, scientific_name, UNCOVERED_AVES_SCIENTIFIC_NAME, min_samples
+        audio_for_birdnet_base, audio_for_random_base, error_msg = _load_and_clean_audio(
+            primary_filepath, primary_filename, config, fabio_intervals, vad_intervals, min_samples
         )
         if error_msg:
-            return samplename, None, error_msg
+            return samplename, None, error_msg 
 
-        relevant_duration = len(relevant_audio)
+        # Base duration for deciding how many versions to generate is from the primary audio
+        # This ensures that even if cleaned audio is shorter, we might still try to get multiple versions
+        base_duration_for_versions = len(audio_for_birdnet_base) 
+        
         # 1 chunk if audio is too short, otherwise PRECOMPUTE_VERSIONS chunks
-        num_versions_to_generate = 1 if relevant_duration < target_samples else config.PRECOMPUTE_VERSIONS
+        num_versions_to_generate = 1 if base_duration_for_versions < target_samples else config.PRECOMPUTE_VERSIONS
 
         use_birdnet_strategy = (
             class_name == 'Aves' and
@@ -237,16 +252,29 @@ def _process_primary_for_chunking(args):
 
         if not use_birdnet_strategy:
             # Non-BirdNET / Aves without sufficient detections / UNCOVERED_AVES: 
-            # Generate random 5-second chunks from the (potentially full) relevant_audio.
+            if audio_for_random_base is None or len(audio_for_random_base) == 0:
+                 return samplename, None, "Audio for random chunks is unusable (None or empty)."
+
             for _ in range(num_versions_to_generate):
-                audio_chunk = _extract_random_chunk(relevant_audio, target_samples)
+                audio_chunk = _extract_random_chunk(audio_for_random_base, target_samples)
                 
-                if audio_chunk is not None:
+                if audio_chunk is not None and len(audio_chunk) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
                     if spec is not None:
-                        final_specs_list.append(spec) 
+                        final_specs_list.append(spec)
+                    else:
+                        pass
+                else:
+                    pass
         else:
             # Strategy 2: BirdNET (Aves with detections)
+            # Use audio_for_birdnet_base for BirdNET detections.
+            # Use audio_for_random_base for random fallbacks.
+            if audio_for_birdnet_base is None or len(audio_for_birdnet_base) == 0:
+                return samplename, None, "Audio for BirdNet chunks is unusable (None or empty)."
+            if audio_for_random_base is None or len(audio_for_random_base) == 0:
+                print(f"Warning: audio_for_random_base is unusable for {samplename} in BirdNet strategy. Random fallbacks might fail or use primary implicitly if _extract_random_chunk has such logic.")
+
             sorted_detections = []
             try:
                 sorted_detections = sorted(
@@ -258,33 +286,40 @@ def _process_primary_for_chunking(args):
                 print(f"Warning: Error sorting BirdNET detections for {samplename}: {e_sort}.")
 
             for i in range(num_versions_to_generate):
-                audio_chunk = None 
+                audio_chunk_from_birdnet = None 
                 if i < len(sorted_detections):
-                    # Call _extract_birdnet_chunk, now aiming for 5s target samples
-                    audio_chunk = _extract_birdnet_chunk(
-                        relevant_audio, sorted_detections[i], config, min_samples, target_samples 
+                    # Extract BirdNET chunk from the original (uncleaned) audio
+                    audio_chunk_from_birdnet = _extract_birdnet_chunk(
+                        audio_for_birdnet_base, sorted_detections[i], config, min_samples, target_samples 
                     )
                 
-                # Fallback to random 5s chunk if BirdNET extraction failed or not enough detections
-                if audio_chunk is None:
-                    if len(relevant_audio) >= target_samples:
-                        audio_chunk = _extract_random_chunk(relevant_audio, target_samples)
-                    else: # If relevant_audio is too short for a random 5s chunk, pad/tile it once.
-                        audio_chunk = _pad_or_tile_audio(relevant_audio, target_samples)
-                        # To avoid making multiple identical padded chunks for short audio, break after the first if random fallback is hit for short audio.
-                        if i > 0 and len(relevant_audio) < target_samples:
-                            break 
+                current_chunk_to_process = audio_chunk_from_birdnet
 
-                if audio_chunk is not None:
-                    # _generate_spectrogram_from_chunk already ensures TARGET_SHAPE and float32
-                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                # Fallback to random 5s chunk if BirdNET extraction failed or not enough detections
+                if current_chunk_to_process is None:
+                    if audio_for_random_base is not None and len(audio_for_random_base) > 0:
+                        # If audio_for_random_base is shorter than target_samples, _extract_random_chunk handles padding/tiling.
+                        current_chunk_to_process = _extract_random_chunk(audio_for_random_base, target_samples)
+                    else:
+                        # If audio_for_random_base is also bad, try to make a chunk from audio_for_birdnet_base as a last resort for Aves
+                        if len(audio_for_birdnet_base) >= target_samples:
+                             current_chunk_to_process = _extract_random_chunk(audio_for_birdnet_base, target_samples)
+                        else: # If original audio itself is too short, pad/tile it.
+                             current_chunk_to_process = _pad_or_tile_audio(audio_for_birdnet_base, target_samples)
+                        # To avoid making multiple identical padded chunks for short audio, break after the first if random fallback is hit for short audio.
+                        if i > 0 and len(audio_for_birdnet_base) < target_samples:
+                            break 
+                
+                if current_chunk_to_process is not None and len(current_chunk_to_process) == target_samples:
+                    spec = _generate_spectrogram_from_chunk(current_chunk_to_process, config)
                     if spec is not None:
                         final_specs_list.append(spec)
             
-            # If relevant_audio was very short and BirdNET detections failed, ensure at least one chunk for Aves.
-            if not final_specs_list and len(relevant_audio) < target_samples:
-                audio_chunk = _pad_or_tile_audio(relevant_audio, target_samples)
-                if audio_chunk is not None:
+            # If relevant_audio (audio_for_birdnet_base) was very short and BirdNET detections failed,
+            # ensure at least one chunk for Aves. This uses the original audio.
+            if not final_specs_list and len(audio_for_birdnet_base) < target_samples:
+                audio_chunk = _pad_or_tile_audio(audio_for_birdnet_base, target_samples)
+                if audio_chunk is not None and len(audio_chunk) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
                     if spec is not None:
                         final_specs_list.append(spec)
@@ -397,7 +432,7 @@ def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_bir
     """Creates a list of argument tuples for the multiprocessing worker."""
     tasks = []
     skipped_path_count = 0
-    UNCOVERED_AVES_SCIENTIFIC_NAME = 'Chrysuronia goudoti' # Hardcode locally
+    UNCOVERED_AVES_SCIENTIFIC_NAME = 'Chrysuronia goudoti'
 
     for _, row in df.iterrows():
         primary_filename = row['filename']
@@ -476,9 +511,6 @@ def _report_summary(total_tasks, processed_count, error_count, skipped_files, er
     print(f"Attempted to process {total_tasks} files.")
     print(f"Successfully generated spectrograms for {processed_count} primary files.") 
     if processed_count > 0:
-        # This part requires grouped_results, might need adjustment if called separately
-        # total_chunks = sum(arr.shape[0] for arr in grouped_results.values() if arr is not None)
-        # print(f"Total spectrogram chunks generated: {total_chunks}") # Needs grouped_results
         pass # Cannot calculate total chunks without grouped_results here
     print(f"Encountered errors for {error_count} primary files.")
     if skipped_files > 0:

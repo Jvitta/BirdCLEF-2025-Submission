@@ -3,7 +3,7 @@ import os
 import multiprocessing
 
 class Config:
-    seed = 40
+    seed = 43
     debug = False
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
