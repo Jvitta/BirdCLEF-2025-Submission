@@ -65,11 +65,13 @@ class BirdCLEFDataset(Dataset):
     Handles loading pre-computed spectrograms from a pre-loaded dictionary
     or generating them on-the-fly.
     """
-    def __init__(self, df, config, mode="train", all_spectrograms=None):
+    def __init__(self, df, config, mode="train", all_spectrograms=None, target_samplenames_to_log=None, logged_samplenames_in_current_run=None):
         self.df = df.copy()
         self.config = config
         self.mode = mode
         self.all_spectrograms = all_spectrograms
+        self.target_samplenames_to_log = target_samplenames_to_log if target_samplenames_to_log is not None else set()
+        self.logged_samplenames_in_current_run = logged_samplenames_in_current_run if logged_samplenames_in_current_run is not None else set()
 
         # Load taxonomy to map labels to indices
         try:
@@ -215,7 +217,36 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
-        # Convert to tensor, add channel dimension, repeat
+        # --- Log sample spectrogram to wandb ---
+        if wandb.run is not None and \
+           samplename in self.target_samplenames_to_log and \
+           samplename not in self.logged_samplenames_in_current_run and \
+           hasattr(self.config, 'NUM_SPECTROGRAM_SAMPLES_TO_LOG') and \
+           len(self.logged_samplenames_in_current_run) < self.config.NUM_SPECTROGRAM_SAMPLES_TO_LOG:
+            try:
+                # PLOT 'spec' DIRECTLY (it's a 2D NumPy array)
+                img_to_log = spec 
+                fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                ax.imshow(img_to_log, aspect='auto', origin='lower', cmap='viridis') # Or 'magma' etc.
+                caption = f"Spec: {samplename}, Lbl: {primary_label}, Mode: {self.mode}"
+                if self.mode == "train":
+                    caption += " (Augmented)"
+                ax.set_title(caption, fontsize=9)
+                ax.axis('off')
+                plt.tight_layout()
+
+                wandb.log({
+                    "sample_spectrograms": [
+                        wandb.Image(fig, caption=caption)
+                    ]
+                }, commit=False)
+                
+                plt.close(fig)
+                self.logged_samplenames_in_current_run.add(samplename)
+            except Exception as e:
+                print(f"Warning (W&B Log Spec): Failed for {samplename}: {e}")
+
+        # Convert to tensor, add channel dimension, repeat AFTER potential logging
         spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
 
         # Normalize the (potentially augmented) tensor
@@ -661,6 +692,11 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     if is_hpo_trial:
         wandb.config.update(trial.params, allow_val_change=True)
 
+    # --- Prepare for Spectrogram Logging ---
+    target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578']) 
+    logged_samplenames_in_current_run = set() 
+    
+    print(f"Targeting {len(target_samplenames_to_log_this_run)} specific samplenames to attempt logging spectrograms for wandb.")
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
@@ -738,8 +774,13 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             print(f'Validation set: {len(val_df_fold)} samples (main data only)')
 
             # Pass the pre-loaded dictionary (or None) to the Dataset
-            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
-            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms)
+            # NOW, pass both the hardcoded targets AND the shared tracking set
+            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms,
+                                            target_samplenames_to_log=target_samplenames_to_log_this_run,
+                                            logged_samplenames_in_current_run=logged_samplenames_in_current_run)
+            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms,
+                                          target_samplenames_to_log=target_samplenames_to_log_this_run,
+                                          logged_samplenames_in_current_run=logged_samplenames_in_current_run)
 
             train_loader = DataLoader(
                 train_dataset,

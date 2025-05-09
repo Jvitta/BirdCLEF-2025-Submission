@@ -58,6 +58,7 @@ class Config:
     USE_PSEUDO_LABELS = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
+    NUM_SPECTROGRAM_SAMPLES_TO_LOG = 6
     MAX_DURATION_FOR_FULL_SPEC_SEC = 25.0
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
