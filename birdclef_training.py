@@ -746,6 +746,11 @@ def run_training(df, config, trial=None, all_spectrograms=None):
         for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
             if fold not in config.selected_folds: continue
 
+            # --- wandb: Define custom step for this fold's metrics ---
+            if wandb_run: # Check if wandb run is active
+                wandb.define_metric(f"fold_{fold}/epoch")
+                wandb.define_metric(f"fold_{fold}/*", step_metric=f"fold_{fold}/epoch")
+
             print(f'\n{"="*30} Fold {fold} {"="*30}')
             # --- Initialize history for the CURRENT fold --- #
             fold_history = {
@@ -850,13 +855,15 @@ def run_training(df, config, trial=None, all_spectrograms=None):
 
                 # --- wandb logging for epoch metrics ---
                 log_metrics = {
+                    f'fold_{fold}/epoch': epoch, # Log the actual epoch number for this fold
                     f'fold_{fold}/train_loss': train_loss,
                     f'fold_{fold}/train_auc': train_auc,
                     f'fold_{fold}/val_loss': val_loss,
                     f'fold_{fold}/val_auc': val_auc,
                     f'fold_{fold}/lr': optimizer.param_groups[0]['lr']
                 }
-                wandb.log(log_metrics, step=epoch)
+                if wandb_run: # Check if wandb run is active
+                    wandb.log(log_metrics) # Let wandb use the defined step_metric
 
                 # --- HPO Pruning --- #
                 if is_hpo_trial:
