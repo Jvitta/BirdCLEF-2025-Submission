@@ -63,7 +63,7 @@ class Config:
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
-    epochs = 10
+    epochs = 11
     train_batch_size = 32
     val_batch_size = 64
     use_amp = False
@@ -116,6 +116,7 @@ class Config:
     smoothing_neighbor_weight = 0.125
 
     # --- BirdNET Preprocessing Config ---
+    BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.25 # Threshold for BirdNET-generated pseudo labels
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 

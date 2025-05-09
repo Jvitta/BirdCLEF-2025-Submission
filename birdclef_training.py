@@ -900,31 +900,9 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             # --- Code to run AFTER all epochs for the current FOLD are done ---
             print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
             
-            # --- Log the single best model artifact for the fold to wandb ---
-            if current_fold_best_model_path and wandb_run:
-                print(f"  Logging best model for fold {fold} to wandb: {current_fold_best_model_path}")
-                artifact_name = f"{config.model_name}_fold{fold}_final_best"
-                model_artifact = wandb.Artifact(
-                    artifact_name,
-                    type="model",
-                    description=f"Overall best model for fold {fold} (Val AUC: {best_val_auc:.4f} at epoch {best_epoch}).",
-                    metadata={
-                        "fold": fold,
-                        "best_epoch_for_fold": best_epoch,
-                        "best_val_auc_for_fold": best_val_auc,
-                        "model_name": config.model_name,
-                        "seed": config.seed
-                    }
-                )
-                model_artifact.add_file(current_fold_best_model_path)
-                wandb_run.log_artifact(model_artifact)
-                print(f"    Logged artifact {artifact_name} to wandb.")
-            elif not current_fold_best_model_path:
-                print(f"  Warning: No best model path found for fold {fold}, cannot log artifact to wandb.")
-
             # Log best AUC for this fold to wandb summary for easy viewing
-            wandb.summary[f'fold_{fold}_best_val_auc'] = best_val_auc
-            wandb.summary[f'fold_{fold}_best_epoch'] = best_epoch
+            if wandb_run: # Check if wandb run is active
+                wandb.summary[f'fold_{fold}_best_val_auc'] = best_val_auc
             single_fold_best_auc = best_val_auc 
 
             all_folds_history.append(fold_history)
@@ -1037,26 +1015,48 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             # (This part is largely for printing, wandb summary already updated)
             mean_oof_auc_final = 0.0
             if all_folds_history:
-                oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h['val_auc']] 
-                mean_oof_auc_final = np.mean(oof_scores_from_hist) if oof_scores_from_hist else 0.0
-                # Ensure summary is updated if it wasn't before (e.g. if only one fold ran and it wasn't HPO)
-                if 'mean_oof_auc' not in wandb.summary:
-                     wandb.summary['mean_oof_auc'] = mean_oof_auc_final
-                print("\n" + "="*60)
-                print("Final Cross-Validation Training Summary (already printed during training):")
-                for i, fold_hist in enumerate(all_folds_history):
-                     fold_num = config.selected_folds[i]
-                     best_fold_auc = max(fold_hist['val_auc']) if fold_hist['val_auc'] else 0.0
-                     print(f"  Fold {fold_num}: Best Val AUC = {best_fold_auc:.4f}")
-                print(f"\nMean OOF AUC across {len(oof_scores_from_hist)} trained folds: {mean_oof_auc_final:.4f}")
-                print("="*60)
-                return mean_oof_auc_final
+                oof_scores_from_hist = [max(h['val_auc']) for h in all_folds_history if h.get('val_auc')] # Safer access
+                if oof_scores_from_hist: # Ensure list is not empty before mean
+                    mean_oof_auc_final = np.mean(oof_scores_from_hist)
+                
+                # Update summary if the run is still considered active by the W&B library
+                if wandb.run: # wandb.run is the global accessor for the current active run status
+                    try:
+                        wandb.summary['mean_oof_auc'] = mean_oof_auc_final
+                        print(f"DEBUG: Updated wandb.summary['mean_oof_auc'] = {mean_oof_auc_final:.4f}")
+                    except Exception as e_summary:
+                        print(f"DEBUG: Error updating wandb.summary for mean_oof_auc: {e_summary}")
+            
+            try:
+                wandb_run.finish()
+                print("W&B Run Finished.")
+            except Exception as e_finish:
+                print(f"DEBUG: Error during wandb_run.finish(): {e_finish}")
+
+            # Determine return value after the finally block has executed
+            mean_oof_auc_to_return = 0.0
+            if all_folds_history:
+                oof_scores_from_hist_return = [max(h['val_auc']) for h in all_folds_history if h.get('val_auc')] # Safer access
+                if oof_scores_from_hist_return:
+                    mean_oof_auc_to_return = np.mean(oof_scores_from_hist_return)
+            
+            print("\n" + "="*60)
+            if all_folds_history and any(h.get('val_auc') for h in all_folds_history):
+                print("Final Cross-Validation Training Summary:")
+                # Ensure selected_folds has enough elements if all_folds_history is populated
+                num_folds_actually_run = len(all_folds_history)
+                for i in range(num_folds_actually_run):
+                     fold_num_display = config.selected_folds[i] if i < len(config.selected_folds) else f"FoldIndex_{i}"
+                     # Get val_auc history for the current fold, check if it's not empty
+                     current_fold_val_auc_history = all_folds_history[i].get('val_auc', [])
+                     best_fold_auc = max(current_fold_val_auc_history) if current_fold_val_auc_history else 0.0
+                     print(f"  Fold {fold_num_display}: Best Val AUC = {best_fold_auc:.4f}")
+                print(f"\nMean OOF AUC across {len(oof_scores_from_hist_return) if oof_scores_from_hist_return else 0} trained folds: {mean_oof_auc_to_return:.4f}")
             else:
-                print("No folds were trained.")
-                print("="*60)
-                if 'mean_oof_auc' not in wandb.summary:
-                     wandb.summary['mean_oof_auc'] = 0.0
-                return 0.0
+                print("No folds were trained or no validation AUCs recorded.")
+            print("="*60)
+            return mean_oof_auc_to_return
+
     finally:
         if wandb_run:
             wandb_run.finish() # Ensure wandb run is finished
