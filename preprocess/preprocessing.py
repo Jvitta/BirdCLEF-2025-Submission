@@ -248,12 +248,9 @@ def _process_primary_for_chunking(args):
     primary_filepath, samplename, config, fabio_intervals, vad_intervals, primary_filename, \
         class_name, scientific_name, birdnet_dets_for_file, UNCOVERED_AVES_SCIENTIFIC_NAME = args
 
-    # This is the target sample length for the *final* 5s chunk for the model
     target_samples_5s_final_model = int(config.TARGET_DURATION * config.FS)
-    # This is the extended sample length for Aves initial extraction (~6s)
     target_samples_extended_aves = int((config.TARGET_DURATION + 1.0) * config.FS)
-    
-    min_samples = int(0.5 * config.FS) # Minimum audio length to be considered valid
+    min_samples = int(0.5 * config.FS)
 
     try:
         relevant_audio, error_msg = _load_and_clean_audio(
@@ -276,33 +273,29 @@ def _process_primary_for_chunking(args):
                 relevant_audio = relevant_audio[:MAX_AUDIO_SAMPLES_FOR_FULL_SPEC]
 
         original_relevant_len = len(relevant_audio)
-        
-        audio_for_processing = relevant_audio 
-        
         is_originally_short_for_5s_model = original_relevant_len < target_samples_5s_final_model
         is_originally_short_for_6s_aves = original_relevant_len < target_samples_extended_aves
 
-        final_specs_list = []
+        final_specs_list = [] # Will collect float32 specs
 
         if not use_birdnet_strategy:
-            # Strategy 1: Non-BirdNET (or Aves without good detections)
+            # Strategy 1: Non-BirdNET
+            # Current logic: if short, pads to 5s, resizes, keeps float32.
+            #                if long (up to 25s), generates native spec (float32), then was quantized.
+            # CHANGE: Keep it float32.
             if is_originally_short_for_5s_model: 
                 audio_for_spec_gen = _pad_or_tile_audio(relevant_audio, target_samples_5s_final_model)
-                # For these very short ones, pre-resize and keep as float32
                 spec_float32_resized = _generate_spectrogram_from_chunk(audio_for_spec_gen, config, resize_to_target_shape=True)
                 if spec_float32_resized is not None:
-                    final_specs_list.append(spec_float32_resized) 
+                    final_specs_list.append(spec_float32_resized.astype(np.float32)) # Ensure float32
             else:
-                # Generate native spec from (potentially truncated at 25s) full audio, NO resize here.
                 spec_float32_native = _generate_spectrogram_from_chunk(relevant_audio, config, resize_to_target_shape=False)
                 if spec_float32_native is not None:
-                    # Quantize the [0,1] float32 spec to uint16 [0, 65535]
-                    spec_uint16_native = (spec_float32_native * 65535.0).astype(np.uint16)
-                    final_specs_list.append(spec_uint16_native)
+                    final_specs_list.append(spec_float32_native.astype(np.float32)) # Save as float32, no quantization
         else:
             # Strategy 2: BirdNET (Aves with detections)
-            # Extract multiple ~6s audio chunks. Each will become a native-res ~6s spectrogram.
-            # These native-res ~6s spectrograms will be quantized to uint16.
+            # Current logic: extracts ~6s audio, generates native spec (float32), then was quantized.
+            # CHANGE: Keep it float32.
             sorted_detections = []
             try:
                 sorted_detections = sorted(
@@ -315,40 +308,31 @@ def _process_primary_for_chunking(args):
 
             num_versions_to_generate = config.PRECOMPUTE_VERSIONS
             for i in range(num_versions_to_generate):
-                chunk_extended_audio = None # This will be ~6s audio
-                
-                # _extract_birdnet_chunk handles cases where original audio is < 6s.
-                # It will use target_samples_extended_aves for its internal logic.
+                chunk_extended_audio = None 
                 if i < len(sorted_detections):
                     chunk_extended_audio = _extract_birdnet_chunk(
-                        relevant_audio, 
-                        sorted_detections[i], 
-                        config, 
-                        min_samples, 
-                        target_samples_extended_aves
+                        relevant_audio, sorted_detections[i], config, min_samples, target_samples_extended_aves
                     )
-                
-                # Fallback to random ~6s chunk if BirdNET extraction failed or not enough detections
                 if chunk_extended_audio is None and not is_originally_short_for_6s_aves:
                     chunk_extended_audio = _extract_random_chunk(relevant_audio, target_samples_extended_aves)
                 elif chunk_extended_audio is None and is_originally_short_for_6s_aves:
                     chunk_extended_audio = _pad_or_tile_audio(relevant_audio, target_samples_extended_aves)
 
                 if chunk_extended_audio is not None:
-                    # Generate native mel spectrogram (e.g., 136xW_6s) from the ~6s audio chunk.
                     spec_float32_native = _generate_spectrogram_from_chunk(
                         chunk_extended_audio, config, resize_to_target_shape=False
                     )
                     if spec_float32_native is not None:
-                        # Quantize the [0,1] float32 spec to uint16 [0, 65535]
-                        spec_uint16_native = (spec_float32_native * 65535.0).astype(np.uint16)
-                        final_specs_list.append(spec_uint16_native)
+                        final_specs_list.append(spec_float32_native.astype(np.float32)) # Save as float32, no quantization
 
         if not final_specs_list:
             return samplename, None, "No valid spectrograms generated."
 
         try:
-            final_specs_array = np.stack(final_specs_list, axis=0) # Shape (N, H, W)
+            # Ensure all elements are float32 before stacking, just in case.
+            # Though the appends above should already handle it.
+            final_specs_list = [spec.astype(np.float32) for spec in final_specs_list]
+            final_specs_array = np.stack(final_specs_list, axis=0)
             return samplename, final_specs_array, None
         except Exception as e_stack:
             return samplename, None, f"Error stacking specs for {samplename}: {e_stack}"
