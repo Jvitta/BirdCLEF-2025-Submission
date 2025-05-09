@@ -4,6 +4,7 @@ notes
 __pycache__
 
 kaggle_training.py
+wandb/
 
 data/raw_data/
 outputs
