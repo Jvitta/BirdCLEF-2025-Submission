@@ -22,8 +22,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast
-from torch.amp import GradScaler
 from losses import FocalLossBCE
 import torchvision.transforms as transforms
 
@@ -36,7 +34,6 @@ import wandb
 
 from config import config
 import birdclef_utils as utils
-from google.cloud import storage
 import cv2
 
 warnings.filterwarnings("ignore")
@@ -221,7 +218,6 @@ class BirdCLEFDataset(Dataset):
         if wandb.run is not None and \
            samplename in self.target_samplenames_to_log and \
            samplename not in self.logged_samplenames_in_current_run and \
-           hasattr(self.config, 'NUM_SPECTROGRAM_SAMPLES_TO_LOG') and \
            len(self.logged_samplenames_in_current_run) < self.config.NUM_SPECTROGRAM_SAMPLES_TO_LOG:
             try:
                 # PLOT 'spec' DIRECTLY (it's a 2D NumPy array)
@@ -810,9 +806,9 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             scaler = torch.amp.GradScaler(device='cuda', enabled=config.use_amp)
             print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
-
             best_val_auc = 0.0
             best_epoch = 0
+            current_fold_best_model_path = None # Initialize path for the fold's best model
 
             # --- Epoch Loop --- #
             for epoch in range(config.epochs):
@@ -852,6 +848,16 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                 fold_history['train_auc'].append(train_auc)
                 fold_history['val_auc'].append(val_auc)
 
+                # --- wandb logging for epoch metrics ---
+                log_metrics = {
+                    f'fold_{fold}/train_loss': train_loss,
+                    f'fold_{fold}/train_auc': train_auc,
+                    f'fold_{fold}/val_loss': val_loss,
+                    f'fold_{fold}/val_auc': val_auc,
+                    f'fold_{fold}/lr': optimizer.param_groups[0]['lr']
+                }
+                wandb.log(log_metrics, step=epoch)
+
                 # --- HPO Pruning --- #
                 if is_hpo_trial:
                     trial.report(val_auc, epoch) # Report intermediate val_auc
@@ -859,7 +865,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                         print(f"  Pruning trial based on intermediate value at epoch {epoch+1}.")
                         raise optuna.TrialPruned() # Raise exception to stop training
                 
-                # --- Model Checkpointing ---
+                # --- Model Checkpointing --- #
                 if val_auc > best_val_auc:
                     best_val_auc = val_auc
                     best_epoch = epoch + 1
@@ -877,47 +883,55 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                     try:
                         torch.save(checkpoint, save_path)
                         print(f"  Model saved to {save_path}")
-
-                        # --- wandb log model artifact ---
-                        artifact_name = f"{config.model_name}_fold{fold}_best"
-                        model_artifact = wandb.Artifact(
-                            artifact_name,
-                            type="model",
-                            description=f"Best model for fold {fold} based on validation AUC.",
-                            metadata={
-                                "fold": fold,
-                                "epoch": best_epoch,
-                                "val_auc": best_val_auc,
-                                "train_auc": train_auc,
-                                "model_name": config.model_name,
-                                "seed": config.seed
-                            }
-                        )
-                        model_artifact.add_file(save_path)
-                        wandb_run.log_artifact(model_artifact)
-                        print(f"  Logged model artifact {artifact_name} to wandb.")
+                        current_fold_best_model_path = save_path # Update best model path for this fold
 
                     except Exception as e:
-                        print(f"  Error saving model checkpoint or logging artifact: {e}")
+                        print(f"  Error saving model checkpoint: {e}") # Removed artifact logging from here
 
-                print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
-                # Log best AUC for this fold to wandb summary for easy viewing
-                wandb.summary[f'fold_{fold}_best_val_auc'] = best_val_auc
-                wandb.summary[f'fold_{fold}_best_epoch'] = best_epoch
-                single_fold_best_auc = best_val_auc 
+            # --- EPOCH LOOP ENDS HERE ---
 
-                all_folds_history.append(fold_history)
-
-                del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
-                del train_df_fold, val_df_fold 
-                torch.cuda.empty_cache()
-                gc.collect()
-
+            # --- Code to run AFTER all epochs for the current FOLD are done ---
             print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
+            
+            # --- Log the single best model artifact for the fold to wandb ---
+            if current_fold_best_model_path and wandb_run:
+                print(f"  Logging best model for fold {fold} to wandb: {current_fold_best_model_path}")
+                artifact_name = f"{config.model_name}_fold{fold}_final_best"
+                model_artifact = wandb.Artifact(
+                    artifact_name,
+                    type="model",
+                    description=f"Overall best model for fold {fold} (Val AUC: {best_val_auc:.4f} at epoch {best_epoch}).",
+                    metadata={
+                        "fold": fold,
+                        "best_epoch_for_fold": best_epoch,
+                        "best_val_auc_for_fold": best_val_auc,
+                        "model_name": config.model_name,
+                        "seed": config.seed
+                    }
+                )
+                model_artifact.add_file(current_fold_best_model_path)
+                wandb_run.log_artifact(model_artifact)
+                print(f"    Logged artifact {artifact_name} to wandb.")
+            elif not current_fold_best_model_path:
+                print(f"  Warning: No best model path found for fold {fold}, cannot log artifact to wandb.")
+
+            # Log best AUC for this fold to wandb summary for easy viewing
+            wandb.summary[f'fold_{fold}_best_val_auc'] = best_val_auc
+            wandb.summary[f'fold_{fold}_best_epoch'] = best_epoch
             single_fold_best_auc = best_val_auc 
 
             all_folds_history.append(fold_history)
 
+            # Clean up resources for the current fold before starting the next one
+            del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
+            del train_df_fold, val_df_fold 
+            torch.cuda.empty_cache()
+            gc.collect()
+            # --- End of FOLD specific cleanup ---
+
+        # --- FOLD LOOP ENDS HERE (or continues to next fold) ---
+
+        # --- Code to run AFTER ALL SELECTED FOLDS are done ---
         if not is_hpo_trial:
             if all_folds_history:
                 print("\n--- Generating Average Training History Plot Across Folds ---")

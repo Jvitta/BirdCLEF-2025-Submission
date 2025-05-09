@@ -1,0 +1,19 @@
+{"time":"2025-05-09T03:41:16.119083097Z","level":"INFO","msg":"stream: starting","core version":"0.19.11","symlink path":"/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/wandb/run-20250509_034116-p9ekym0b/logs/debug-core.log"}
+{"time":"2025-05-09T03:41:16.255242632Z","level":"INFO","msg":"created new stream","id":"p9ekym0b"}
+{"time":"2025-05-09T03:41:16.25528869Z","level":"INFO","msg":"stream: started","id":"p9ekym0b"}
+{"time":"2025-05-09T03:41:16.255350302Z","level":"INFO","msg":"writer: Do: started","stream_id":"p9ekym0b"}
+{"time":"2025-05-09T03:41:16.255503802Z","level":"INFO","msg":"sender: started","stream_id":"p9ekym0b"}
+{"time":"2025-05-09T03:41:16.256004102Z","level":"INFO","msg":"handler: started","stream_id":"p9ekym0b"}
+{"time":"2025-05-09T03:41:16.433754134Z","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-05-09T03:41:31.437573123Z","level":"ERROR","msg":"monitor: error sampling metrics: strconv.ParseInt: parsing \"2275774705\": value out of range"}
+{"time":"2025-05-09T03:41:46.435446607Z","level":"ERROR","msg":"monitor: error sampling metrics: strconv.ParseInt: parsing \"2275774705\": value out of range"}
+{"time":"2025-05-09T03:42:01.435937678Z","level":"ERROR","msg":"monitor: error sampling metrics: strconv.ParseInt: parsing \"2275774705\": value out of range"}
+{"time":"2025-05-09T03:42:15.810465281Z","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-05-09T03:42:15.810506556Z","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-05-09T03:42:16.81205741Z","level":"INFO","msg":"handler: operation stats","stats":{}}
+{"time":"2025-05-09T03:42:16.84946831Z","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-05-09T03:42:16.965732783Z","level":"INFO","msg":"stream: closing","id":"p9ekym0b"}
+{"time":"2025-05-09T03:42:16.965752189Z","level":"INFO","msg":"handler: closed","stream_id":"p9ekym0b"}
+{"time":"2025-05-09T03:42:16.965760472Z","level":"INFO","msg":"writer: Close: closed","stream_id":"p9ekym0b"}
+{"time":"2025-05-09T03:42:16.965815065Z","level":"INFO","msg":"sender: closed","stream_id":"p9ekym0b"}
+{"time":"2025-05-09T03:42:16.965850671Z","level":"INFO","msg":"stream: closed","id":"p9ekym0b"}

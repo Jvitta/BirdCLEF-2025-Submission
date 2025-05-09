@@ -1,0 +1,42 @@
+{
+  "os": "Linux-5.10.0-34-cloud-amd64-x86_64-with-glibc2.31",
+  "python": "CPython 3.11.12",
+  "startedAt": "2025-05-09T03:41:16.116943Z",
+  "program": "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/birdclef_training.py",
+  "codePath": "birdclef_training.py",
+  "git": {
+    "remote": "https://github.com/Jvitta/BirdCLEF-2025-Submission.git",
+    "commit": "5b167310afc140770d178674e11ae4648c69aa26"
+  },
+  "email": "jvittimberga@gmail.com",
+  "root": "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission",
+  "host": "workbench-maskgct-semantic-codec-v2",
+  "executable": "/opt/conda/envs/audio/bin/python",
+  "codePathLocal": "birdclef_training.py",
+  "cpu_count": 6,
+  "cpu_count_logical": 12,
+  "gpu": "NVIDIA A100-SXM4-40GB",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "316802146304",
+      "used": "94265094144"
+    }
+  },
+  "memory": {
+    "total": "89638764544"
+  },
+  "cpu": {
+    "count": 6,
+    "countLogical": 12
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA A100-SXM4-40GB",
+      "memoryTotal": "42949672960",
+      "cudaCores": 6912,
+      "architecture": "Ampere"
+    }
+  ],
+  "cudaVersion": "12.4"
+}

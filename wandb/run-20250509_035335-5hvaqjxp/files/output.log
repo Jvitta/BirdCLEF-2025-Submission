@@ -1,0 +1,104 @@
+Targeting 6 specific samplenames to attempt logging spectrograms for wandb.
+Using Device: cuda
+Debug Mode: False
+Using Seed: 42
+Load Preprocessed Data: True
+run_training received 28564 pre-loaded samples.
+
+============================== Fold 0 ==============================
+Filtered validation set to include only 'main' data source.
+  Original val count: 5713, Filtered val count: 5713
+Training set: 22851 samples (includes main and potentially pseudo)
+Validation set: 5713 samples (main data only)
+Dataset mode 'train': Using pre-loaded spectrogram dictionary.
+Found 28564 samplenames with precomputed chunks.
+Dataset mode 'valid': Using pre-loaded spectrogram dictionary.
+Found 28564 samplenames with precomputed chunks.
+
+Setting up model, optimizer, criterion, scheduler...
+Mixup enabled with alpha=0.3901120986458487
+INFO: Using FocalLossBCE with parameters hardcoded in losses.py
+Automatic Mixed Precision (AMP): Disabled
+
+Epoch 1/10
+Training: 100%|█████████████████████████████████████████████████████████████████| 714/714 [00:40<00:00, 17.65it/s, train_loss=0.0215, lr=0.000576]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:10<00:00,  8.72it/s]
+Epoch 1 Summary:
+Train Loss: 0.0285, Train AUC: 0.5221
+Val Loss:   0.0198, Val AUC:   0.8403
+✨ New best AUC: 0.8403 at epoch 1. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 2/10
+Training: 100%|█████████████████████████████████████████████████████████████████| 714/714 [00:39<00:00, 17.94it/s, train_loss=0.0175, lr=0.000562]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.16it/s]
+Epoch 2 Summary:
+Train Loss: 0.0190, Train AUC: 0.6680
+Val Loss:   0.0137, Val AUC:   0.9268
+✨ New best AUC: 0.9268 at epoch 2. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 3/10
+Training: 100%|█████████████████████████████████████████████████████████████████| 714/714 [00:39<00:00, 17.91it/s, train_loss=0.0146, lr=0.000521]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.38it/s]
+Epoch 3 Summary:
+Train Loss: 0.0162, Train AUC: 0.7032
+Val Loss:   0.0114, Val AUC:   0.9508
+✨ New best AUC: 0.9508 at epoch 3. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 4/10
+Training: 100%|█████████████████████████████████████████████████████████████████| 714/714 [00:39<00:00, 17.87it/s, train_loss=0.0138, lr=0.000457]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.33it/s]
+Epoch 4 Summary:
+Train Loss: 0.0147, Train AUC: 0.7341
+Val Loss:   0.0104, Val AUC:   0.9545
+✨ New best AUC: 0.9545 at epoch 4. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 5/10
+Training: 100%|█████████████████████████████████████████████████████████████████| 714/714 [00:39<00:00, 18.01it/s, train_loss=0.0116, lr=0.000377]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.37it/s]
+Epoch 5 Summary:
+Train Loss: 0.0137, Train AUC: 0.7464
+Val Loss:   0.0095, Val AUC:   0.9643
+✨ New best AUC: 0.9643 at epoch 5. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 6/10
+Training: 100%|█████████████████████████████████████████████████████████████████| 714/714 [00:40<00:00, 17.82it/s, train_loss=0.0135, lr=0.000288]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.31it/s]
+Epoch 6 Summary:
+Train Loss: 0.0133, Train AUC: 0.7424
+Val Loss:   0.0089, Val AUC:   0.9696
+✨ New best AUC: 0.9696 at epoch 6. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 7/10
+Training: 100%|███████████████████████████████████████████████████████████████████| 714/714 [00:40<00:00, 17.83it/s, train_loss=0.0123, lr=0.0002]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.22it/s]
+Epoch 7 Summary:
+Train Loss: 0.0126, Train AUC: 0.7716
+Val Loss:   0.0085, Val AUC:   0.9705
+✨ New best AUC: 0.9705 at epoch 7. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 8/10
+Training: 100%|██████████████████████████████████████████████████████████████████| 714/714 [00:39<00:00, 18.00it/s, train_loss=0.0116, lr=0.00012]
+Validation: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 90/90 [00:09<00:00,  9.31it/s]
+Epoch 8 Summary:
+Train Loss: 0.0120, Train AUC: 0.7710
+Val Loss:   0.0083, Val AUC:   0.9728
+✨ New best AUC: 0.9728 at epoch 8. Saving model...
+  Model saved to /home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/outputs/models/efficientnet_b0_fold0_best.pth
+  Logged model artifact efficientnet_b0_fold0_best to wandb.
+
+Epoch 9/10
+Training:  78%|███████████████████████████████████████████████████▋              | 559/714 [00:31<00:08, 17.23it/s, train_loss=0.0144, lr=5.59e-5]
