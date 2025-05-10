@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 import sys
 import numpy as np
+import librosa
 
 PROJECT_ROOT_APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT_APP not in sys.path:
@@ -75,24 +76,88 @@ except Exception as e:
 
 # --- Annotation Data Handling ---
 # Define columns for the new annotation structure
-ANNOTATION_COLUMNS = ["filename", "center_time_s", "primary_label", "annotation_time"]
+ANNOTATION_COLUMNS = ["filename", "center_time_s", "primary_label", "annotation_time", "is_low_quality"]
 
 if os.path.exists(OUTPUT_ANNOTATIONS_FILE):
     try:
         annotations_df = pd.read_csv(OUTPUT_ANNOTATIONS_FILE)
-        if not all(col in annotations_df.columns for col in ANNOTATION_COLUMNS): # Check if columns match
-            print(f"Warning: Annotation file columns mismatch. Re-initializing {OUTPUT_ANNOTATIONS_FILE}.")
-            annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
+        # Ensure all defined columns exist
+        for col in ANNOTATION_COLUMNS:
+            if col not in annotations_df.columns:
+                if col == "is_low_quality":
+                    annotations_df[col] = False  # Default for the new column
+                else:
+                    # For other columns that might be missing (e.g. in very old files)
+                    # provide a sensible default or np.nan.
+                    # For this setup, assume they would be object/float types if they held data.
+                    annotations_df[col] = np.nan
+        
+        # Ensure 'is_low_quality' column is boolean and NaNs are False
+        if 'is_low_quality' in annotations_df.columns:
+            annotations_df['is_low_quality'] = annotations_df['is_low_quality'].fillna(False).astype(bool)
+        else: # Should be created by the loop above if missing
+            annotations_df['is_low_quality'] = False
+            annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
+
         # Ensure filename column is string type for consistent matching
         if 'filename' in annotations_df.columns:
             annotations_df['filename'] = annotations_df['filename'].astype(str)
+
     except pd.errors.EmptyDataError:
+        print(f"Info: Annotation file {OUTPUT_ANNOTATIONS_FILE} is empty. Initializing with defined columns.")
         annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
+        # Ensure correct dtypes for an empty DataFrame, especially for boolean
+        for col in ANNOTATION_COLUMNS:
+            if col == "is_low_quality":
+                annotations_df[col] = pd.Series(dtype='bool')
+            elif col in ["center_time_s"]:
+                annotations_df[col] = pd.Series(dtype='float')
+            else: # filename, primary_label, annotation_time
+                annotations_df[col] = pd.Series(dtype='object')
+        # Explicitly ensure is_low_quality is boolean after creation for safety
+        annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
+
+
     except Exception as e:
-        print(f"Error loading existing annotations: {e}. Re-initializing.")
+        print(f"Error loading existing annotations: {e}. Re-initializing with defined columns.")
         annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
+        for col in ANNOTATION_COLUMNS: # Duplicate dtype setup as above for safety
+            if col == "is_low_quality":
+                annotations_df[col] = pd.Series(dtype='bool')
+            elif col in ["center_time_s"]:
+                annotations_df[col] = pd.Series(dtype='float')
+            else:
+                annotations_df[col] = pd.Series(dtype='object')
+        annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
 else:
+    print(f"Info: Annotation file {OUTPUT_ANNOTATIONS_FILE} not found. Initializing with defined columns.")
     annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
+    for col in ANNOTATION_COLUMNS: # Duplicate dtype setup as above for safety
+        if col == "is_low_quality":
+            annotations_df[col] = pd.Series(dtype='bool')
+        elif col in ["center_time_s"]:
+            annotations_df[col] = pd.Series(dtype='float')
+        else:
+            annotations_df[col] = pd.Series(dtype='object')
+    annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
+
+
+# Ensure filename is string, even if DF was just created
+if 'filename' in annotations_df.columns:
+    annotations_df['filename'] = annotations_df['filename'].astype(str)
+else: # if annotations_df was created totally empty from an exception path without columns
+    annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS) # Re-initialize to be safe with all columns
+    # And repeat dtype logic one last time if reinitialized
+    for col in ANNOTATION_COLUMNS:
+        if col == "is_low_quality":
+            annotations_df[col] = pd.Series(dtype='bool')
+        elif col in ["center_time_s"]:
+            annotations_df[col] = pd.Series(dtype='float')
+        else:
+            annotations_df[col] = pd.Series(dtype='object')
+    annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
+    annotations_df['filename'] = annotations_df['filename'].astype(str)
+
 
 def save_annotation(selected_species_folder, selected_audio_basename, center_time_str):
     global annotations_df
@@ -114,7 +179,8 @@ def save_annotation(selected_species_folder, selected_audio_basename, center_tim
             "filename": filename_relative,
             "center_time_s": center_s,
             "primary_label": primary_label,
-            "annotation_time": datetime.now().isoformat()
+            "annotation_time": datetime.now().isoformat(),
+            "is_low_quality": False # Explicitly False for normal annotations
         }])
         
         annotations_df = pd.concat([annotations_df, new_annotation], ignore_index=True)
@@ -153,6 +219,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             scientific_name_md = gr.Markdown("**Scientific Name:** N/A")
             common_name_md = gr.Markdown("**Common Name:** N/A")
             class_name_md = gr.Markdown("**Class:** N/A")
+            file_annotation_count_md = gr.Markdown("**Annotations for this file:** N/A")
             birdnet_detections_md = gr.Markdown("#### Top BirdNET Detections:\nN/A")
     
     audio_player = gr.Audio(label="Audio Player", type="filepath", interactive=False, elem_id="audio_player_element")
@@ -170,22 +237,48 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         audio_player_update = None
         center_time_update = ""
         birdnet_detections_text = "#### Top BirdNET Detections:\nN/A"
+        file_annotations_text = "**Annotations for this file:** N/A"
 
         if selected_species_folder and selected_species_folder in audio_data_structure:
             all_files_in_folder = audio_data_structure[selected_species_folder]
             
-            annotated_files_in_current_folder_set = set()
+            file_annotation_counts_in_folder = pd.Series(dtype=int)
+            low_quality_files_in_folder_set = set()
+
             if not annotations_df.empty and 'filename' in annotations_df.columns:
                 prefix_to_check = selected_species_folder + os.path.sep
                 relevant_annotations = annotations_df[annotations_df['filename'].str.startswith(prefix_to_check, na=False)]
-                annotated_files_in_current_folder_set = set(relevant_annotations['filename'])
+                if not relevant_annotations.empty:
+                    # Get files that have ANY 'is_low_quality' == True entry
+                    if 'is_low_quality' in relevant_annotations.columns:
+                         low_quality_files_in_folder_set = set(relevant_annotations[relevant_annotations['is_low_quality'] == True]['filename'])
+                    
+                    # Count all annotations for files not in the low_quality_set for the "max 3" rule
+                    # This count will be used for files that are NOT low quality.
+                    file_annotation_counts_in_folder = relevant_annotations['filename'].value_counts()
             
             files_to_consider_for_dropdowns = []
             for file_basename in all_files_in_folder:
                 relative_path = os.path.join(selected_species_folder, file_basename)
-                if relative_path in annotated_files_in_current_folder_set:
-                    continue 
-                files_to_consider_for_dropdowns.append(file_basename)
+
+                # Filter 0: If marked as low quality (any entry for this file is LQ), skip
+                if relative_path in low_quality_files_in_folder_set:
+                    continue
+
+                # Filter 1: Check annotation count (for non-low-quality files)
+                if file_annotation_counts_in_folder.get(relative_path, 0) < 3:
+                    full_file_path = os.path.join(config.train_audio_dir, relative_path)
+                    try:
+                        duration = librosa.get_duration(path=full_file_path)
+                        # Filter 2: Check duration
+                        if duration < 5.0:
+                            # Optional: print(f"Skipping {relative_path} due to duration {duration:.2f}s < 5s")
+                            continue 
+                    except Exception as e:
+                        print(f"Warning: Could not get duration for {relative_path}: {e}. Skipping file.")
+                        continue
+                    
+                    files_to_consider_for_dropdowns.append(file_basename)
             
             choices_no_bn = []
             choices_with_bn_intermediate = [] # Store (basename, max_confidence) for sorting
@@ -246,7 +339,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             audio_choices_no_bn_update, audio_choices_with_bn_update, 
             audio_player_update, center_time_update, 
             sci_name_text, com_name_text, cls_name_text, 
-            birdnet_detections_text
+            birdnet_detections_text, file_annotations_text
         )
 
     species_folder_dropdown.change(
@@ -256,7 +349,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             audio_file_dropdown_no_bn, audio_file_dropdown_with_bn, 
             audio_player, center_time_js_output, 
             scientific_name_md, common_name_md, class_name_md,
-            birdnet_detections_md
+            birdnet_detections_md, file_annotation_count_md
         ]
     )
 
@@ -264,12 +357,20 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         audio_player_path = None
         center_time_val = ""
         bn_info_text = "#### Top BirdNET Detections:\nN/A"
+        current_file_annotation_count_text = "**Annotations for this file:** N/A"
 
         if sel_species_folder and sel_audio_basename:
             relative_path = os.path.join(sel_species_folder, sel_audio_basename)
             full_path = os.path.join(config.train_audio_dir, relative_path)
             audio_player_path = full_path
             center_time_val = "" # Clear time textbox
+
+            # Calculate current annotations for this file
+            if not annotations_df.empty and 'filename' in annotations_df.columns:
+                count = annotations_df[annotations_df['filename'] == relative_path].shape[0]
+                current_file_annotation_count_text = f"**Annotations for this file:** {count}"
+            else:
+                current_file_annotation_count_text = "**Annotations for this file:** 0"
 
             # Fetch and format BirdNET detections
             lookup_key_for_birdnet = relative_path.replace(os.path.sep, '/')
@@ -307,13 +408,13 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             else:
                 bn_info_text = "#### Top BirdNET Detections:\nFile not found in BirdNET detection records."
 
-        return audio_player_path, center_time_val, bn_info_text
+        return audio_player_path, center_time_val, bn_info_text, current_file_annotation_count_text
 
     # Event handler for the 'No BirdNET' dropdown
     audio_file_dropdown_no_bn.change(
         fn=update_audio_player_and_bn_info, # Use new function
         inputs=[species_folder_dropdown, audio_file_dropdown_no_bn], 
-        outputs=[audio_player, center_time_js_output, birdnet_detections_md] # Added birdnet_detections_md
+        outputs=[audio_player, center_time_js_output, birdnet_detections_md, file_annotation_count_md] # Added file_annotation_count_md
     ).then(
         fn=lambda: gr.update(value=None), # Clear the other dropdown
         inputs=None,
@@ -324,7 +425,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
     audio_file_dropdown_with_bn.change(
         fn=update_audio_player_and_bn_info, # Use new function
         inputs=[species_folder_dropdown, audio_file_dropdown_with_bn], 
-        outputs=[audio_player, center_time_js_output, birdnet_detections_md] # Added birdnet_detections_md
+        outputs=[audio_player, center_time_js_output, birdnet_detections_md, file_annotation_count_md] # Added file_annotation_count_md
     ).then(
         fn=lambda: gr.update(value=None), # Clear the other dropdown
         inputs=None,
@@ -458,6 +559,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
     )
         
     save_button = gr.Button("Save Annotation")
+    mark_low_quality_button = gr.Button("Mark File as Low Quality / Unusable") # New Button
     
     status_message = gr.Markdown()
     gr.Markdown("### Recent Annotations:")
@@ -493,7 +595,8 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
                 "filename": filename_relative,
                 "center_time_s": center_s,
                 "primary_label": primary_label,
-                "annotation_time": datetime.now().isoformat()
+                "annotation_time": datetime.now().isoformat(),
+                "is_low_quality": False # Explicitly False for normal annotations
             }])
             
             annotations_df = pd.concat([annotations_df, new_annotation], ignore_index=True)
@@ -524,6 +627,63 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         inputs=None, 
         outputs=[center_time_js_output]
     )
+
+    # --- Handler for marking file as low quality ---
+    def handle_mark_low_quality(selected_species_folder, audio_file_no_bn, audio_file_with_bn):
+        global annotations_df
+        
+        selected_audio_basename = None
+        if audio_file_no_bn:
+            selected_audio_basename = audio_file_no_bn
+        elif audio_file_with_bn:
+            selected_audio_basename = audio_file_with_bn
+        else:
+            return "Please select an audio file to mark as low quality.", annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+
+        if not selected_species_folder:
+            return "Please select a species folder first.", annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+
+        filename_relative = os.path.join(selected_species_folder, selected_audio_basename)
+        
+        # Check if already marked as low quality to prevent duplicate low quality entries
+        # The dropdown filtering should prevent this, but as a safeguard:
+        if not annotations_df[(annotations_df['filename'] == filename_relative) & (annotations_df['is_low_quality'] == True)].empty:
+            return f"File {filename_relative} is already marked as low quality.", annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+
+        new_low_quality_mark = pd.DataFrame([{
+            "filename": filename_relative,
+            "center_time_s": np.nan,
+            "primary_label": np.nan, # Per request
+            "annotation_time": np.nan, # Per request
+            "is_low_quality": True
+        }])
+        
+        annotations_df = pd.concat([annotations_df, new_low_quality_mark], ignore_index=True)
+        
+        output_dir = os.path.dirname(OUTPUT_ANNOTATIONS_FILE)
+        os.makedirs(output_dir, exist_ok=True)
+        annotations_df.to_csv(OUTPUT_ANNOTATIONS_FILE, index=False)
+        
+        msg = f"File {filename_relative} marked as low quality."
+        # Clear dropdowns after marking
+        return msg, annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+
+    mark_low_quality_button.click(
+        fn=handle_mark_low_quality,
+        inputs=[species_folder_dropdown, audio_file_dropdown_no_bn, audio_file_dropdown_with_bn],
+        outputs=[status_message, annotations_table, audio_file_dropdown_no_bn, audio_file_dropdown_with_bn] # Clear dropdowns
+    ).then(
+        # Also refresh species folder to re-filter dropdowns
+        fn=update_audio_file_choices_and_species_info,
+        inputs=species_folder_dropdown,
+        outputs=[
+            audio_file_dropdown_no_bn, audio_file_dropdown_with_bn,
+            audio_player, center_time_js_output,
+            scientific_name_md, common_name_md, class_name_md,
+            birdnet_detections_md, file_annotation_count_md
+        ]
+    )
+
 
 # --- Launch the UI ---
 # Remove old save_annotation if it's still there globally (it's now save_annotation_revised)

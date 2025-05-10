@@ -55,7 +55,7 @@ class Config:
     LOAD_PREPROCESSED_DATA = True
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
-    USE_PSEUDO_LABELS = True
+    USE_PSEUDO_LABELS = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
     NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
