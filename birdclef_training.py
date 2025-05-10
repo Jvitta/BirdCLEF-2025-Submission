@@ -34,7 +34,7 @@ import optuna
 import wandb
 
 from config import config
-import birdclef_utils as utils
+import utils as utils
 import cv2
 
 warnings.filterwarnings("ignore")
@@ -106,6 +106,7 @@ class BirdCLEFDataset(Dataset):
         primary_label = row['primary_label']
         secondary_labels = row.get('secondary_labels', [])
         filename_for_error = row.get('filename', samplename) # Use filename if available
+        data_source = row['data_source'] # <--- ADDED
         
         spec = None # This will hold the final (H_5s, W_5s) processed chunk
 
@@ -212,7 +213,8 @@ class BirdCLEFDataset(Dataset):
             'melspec': spec_tensor,
             'target': torch.tensor(target, dtype=torch.float32),
             'filename': filename_for_error,
-            'samplename': samplename
+            'samplename': samplename,
+            'source': data_source # <--- ADDED
         }
 
     def apply_spec_augmentations(self, spec_np):
@@ -326,15 +328,33 @@ class BirdCLEFModel(nn.Module):
         logits = self.classifier(features)
         return logits
 
-def mixup_data(x, targets, alpha, device):
-    """Applies mixup augmentation.
+def mixup_data(x, targets, sources, alpha, device):
+    """Applies mixup augmentation, ensuring mixing only occurs between samples from the same source.
     Returns mixed inputs, targets_a, targets_b, and lambda.
+    'sources' is a list of strings indicating the data source for each sample in the batch.
     """
     batch_size = x.size(0)
     lam = np.random.beta(alpha, alpha)
-    indices = torch.randperm(batch_size, device=device)
-    mixed_x = lam * x + (1 - lam) * x[indices]
-    targets_a, targets_b = targets, targets[indices]
+    
+    # Create new_indices for permutation, initialized to self-loops
+    new_indices = list(range(batch_size))
+    unique_sources_in_batch = set(sources)
+
+    for source_type in unique_sources_in_batch:
+        # Get original indices of samples belonging to the current source_type
+        indices_of_this_source = [i for i, src in enumerate(sources) if src == source_type]
+        
+        if len(indices_of_this_source) > 1:
+            # Shuffle these specific indices to find mixup partners from the same source
+            shuffled_partners_for_this_source = random.sample(indices_of_this_source, len(indices_of_this_source))
+            for i, original_idx in enumerate(indices_of_this_source):
+                new_indices[original_idx] = shuffled_partners_for_this_source[i]
+        # If len(indices_of_this_source) <= 1, new_indices[original_idx] remains original_idx (mix with self)
+
+    permuted_indices = torch.tensor(new_indices, device=device)
+
+    mixed_x = lam * x + (1 - lam) * x[permuted_indices]
+    targets_a, targets_b = targets, targets[permuted_indices]
     return mixed_x, targets_a, targets_b, lam
 
 def rand_bbox(size, lam):
@@ -357,27 +377,35 @@ def rand_bbox(size, lam):
 
     return bbx1, bby1, bbx2, bby2
 
-def cutmix_data(x, targets, alpha, device):
-    """Applies CutMix augmentation.
+def cutmix_data(x, targets, sources, alpha, device):
+    """Applies CutMix augmentation, ensuring mixing only occurs between samples from the same source.
     Returns mixed inputs, targets_a, targets_b, and lambda.
+    'sources' is a list of strings indicating the data source for each sample in the batch.
     """
     batch_size = x.size(0)
-    indices = torch.randperm(batch_size, device=device)
-    targets_a, targets_b = targets, targets[indices]
 
-    # Generate lambda using beta distribution
+    # Create new_indices for permutation, initialized to self-loops
+    new_indices = list(range(batch_size))
+    unique_sources_in_batch = set(sources)
+
+    for source_type in unique_sources_in_batch:
+        indices_of_this_source = [i for i, src in enumerate(sources) if src == source_type]
+        if len(indices_of_this_source) > 1:
+            shuffled_partners_for_this_source = random.sample(indices_of_this_source, len(indices_of_this_source))
+            for i, original_idx in enumerate(indices_of_this_source):
+                new_indices[original_idx] = shuffled_partners_for_this_source[i]
+    
+    permuted_indices = torch.tensor(new_indices, device=device)
+    targets_a, targets_b = targets, targets[permuted_indices]
+
     lam = np.random.beta(alpha, alpha)
-
-    # Get bounding box coordinates
     bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
 
-    # Create mixed inputs by pasting the patch
     mixed_x = x.clone()
-    mixed_x[:, :, bbx1:bbx2, bby1:bby2] = x[indices, :, bbx1:bbx2, bby1:bby2]
+    # Apply CutMix using the permuted indices from the same source
+    mixed_x[:, :, bbx1:bbx2, bby1:bby2] = x[permuted_indices, :, bbx1:bbx2, bby1:bby2]
 
-    # Adjust lambda based on actual patch area relative to image area
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
-
     return mixed_x, targets_a, targets_b, lam
 
 def get_optimizer(model, config):
@@ -484,6 +512,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
         try:
             inputs_orig = batch['melspec'].to(device)
             targets_orig = batch['target'].to(device)
+            sources_orig = batch['source'] # List of strings, no .to(device)
         except (AttributeError, TypeError) as e:
             print(f"Error: Skipping batch {step} due to unexpected format: {e}")
             continue
@@ -503,12 +532,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
 
             if use_mixup_decision:
                 inputs, targets_a, targets_b, lam = mixup_data(
-                    inputs_orig, targets_orig, config.mixup_alpha, device
+                    inputs_orig, targets_orig, sources_orig, config.mixup_alpha, device
                 )
                 apply_mixup = True
             else:
                 inputs, targets_a, targets_b, lam = cutmix_data(
-                    inputs_orig, targets_orig, config.cutmix_alpha, device
+                    inputs_orig, targets_orig, sources_orig, config.cutmix_alpha, device
                 )
                 apply_cutmix = True
         else:

@@ -23,8 +23,8 @@ import torchvision.transforms as transforms
 
 # Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
 from config import config # Import central config
-import birdclef_utils as utils # Import utils
-from birdclef_utils import _preprocess_audio_file_worker # Import the worker
+import utils as utils # Import utils
+from utils import _preprocess_audio_file_worker # Import the worker
 
 # Suppress warnings and limit logging output
 warnings.filterwarnings("ignore")

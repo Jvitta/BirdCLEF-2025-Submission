@@ -58,7 +58,7 @@ class Config:
     USE_PSEUDO_LABELS = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
-    NUM_SPECTROGRAM_SAMPLES_TO_LOG = 6
+    NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
@@ -89,8 +89,8 @@ class Config:
     # Batch-level augmentations (Mixup/CutMix)
     batch_augment_prob = 1.0     # Probability of applying Mixup OR CutMix to a batch
     mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
-    mixup_alpha = 0.3901120986458487 # Mixup alpha parameter (higher means more similar mixes)
-    cutmix_alpha = 1.0           # CutMix alpha parameter (controls patch size distribution)
+    mixup_alpha = 0.3901120986458487 
+    cutmix_alpha = 1.0           
 
     # Spectrogram Augmentation (applied manually in Dataset)
     time_mask_prob = 0.446875227279031 # Probability of applying time masking
@@ -104,7 +104,7 @@ class Config:
     tta_count = 3
     # Threshold for generating pseudo labels
     threshold = 0.75
-    pseudo_label_usage_threshold = 0.80
+    pseudo_label_usage_threshold = 0.90
     use_specific_folds_inference = False
     inference_folds = [0, 1]
 

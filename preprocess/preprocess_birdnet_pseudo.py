@@ -15,7 +15,7 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from config import config 
-import birdclef_utils as utils 
+import utils as utils 
 
 warnings.filterwarnings("ignore")
 
@@ -90,11 +90,14 @@ def _process_pseudo_label_row(args):
             return (None, f"Spectrogram generation failed for {segment_key}")
 
         if mel_spec.shape != tuple(config.TARGET_SHAPE):
-             final_spec = cv2.resize(mel_spec, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+             final_spec_2d = cv2.resize(mel_spec, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
         else:
-             final_spec = mel_spec
-             
-        return (segment_key, final_spec.astype(np.float32))
+             final_spec_2d = mel_spec
+        
+        # Add a new dimension at the beginning to make it (1, H, W)
+        final_spec_3d = np.expand_dims(final_spec_2d, axis=0)
+
+        return (segment_key, final_spec_3d.astype(np.float32))
 
     except Exception as e:
         return (None, f"Error processing {segment_key}: {e}")
@@ -104,6 +107,7 @@ def generate_pseudo_spectrograms(config):
     """Loads pseudo labels, processes segments in parallel, and saves spectrograms to NPZ."""
     print("--- Loading Pseudo Labels --- ")
     pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
+    pseudo_df = pseudo_df[pseudo_df['confidence'] >= 0.90]
     print(f"Loaded {len(pseudo_df)} pseudo labels from {config.train_pseudo_csv_path}")
 
     if pseudo_df.empty:

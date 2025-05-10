@@ -17,7 +17,7 @@ import torchvision.transforms as transforms
 
 # Assuming 'config.py' and 'birdclef_training.py' are accessible
 from config import config
-from birdclef_training import BirdCLEFModel # Use the model definition from training
+from train import BirdCLEFModel # Use the model definition from training
 
 # Suppress warnings and limit logging output
 warnings.filterwarnings("ignore")
