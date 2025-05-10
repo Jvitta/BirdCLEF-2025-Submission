@@ -6,8 +6,8 @@ from torchvision.ops.misc import ConvNormActivation
 from torch.hub import load_state_dict_from_url
 import urllib.parse
 
-from models.dymn.dy_block import DynamicInvertedResidualConfig, DY_Block, DynamicConv, DyReLUB
-from models.mn.block_types import InvertedResidualConfig, InvertedResidual
+from .dy_block import DynamicInvertedResidualConfig, DY_Block, DynamicConv, DyReLUB
+from ..mn.block_types import InvertedResidualConfig, InvertedResidual
 
 # points to github releases
 model_url = "https://github.com/fschmid56/EfficientAT/releases/download/v0.0.1/"

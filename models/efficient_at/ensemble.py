@@ -1,8 +1,8 @@
 import torch.nn as nn
 
-from models.mn.model import get_model as get_mobilenet
-from models.dymn.model import get_model as get_dymn
-from helpers.utils import NAME_TO_WIDTH
+from .mn.model import get_model as get_mobilenet
+from .dymn.model import get_model as get_dymn
+from .helpers.utils import NAME_TO_WIDTH
 
 
 class EnsemblerModel(nn.Module):

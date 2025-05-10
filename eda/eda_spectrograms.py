@@ -18,7 +18,7 @@ project_root = current_dir.parent
 sys.path.append(str(project_root))
 
 from config import config
-import birdclef_utils as utils # Assuming utils has audio2melspec or similar
+import utils as utils # Assuming utils has audio2melspec or similar
 
 # --- Configuration ---
 NUM_EXAMPLES_TO_VISUALIZE = 5 # How many random chunks to analyze
