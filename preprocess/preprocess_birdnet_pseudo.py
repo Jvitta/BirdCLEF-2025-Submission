@@ -104,6 +104,7 @@ def generate_pseudo_spectrograms(config):
     """Loads pseudo labels, processes segments in parallel, and saves spectrograms to NPZ."""
     print("--- Loading Pseudo Labels --- ")
     pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
+    pseudo_df = pseudo_df[pseudo_df['confidence'] >= 0.90]
     print(f"Loaded {len(pseudo_df)} pseudo labels from {config.train_pseudo_csv_path}")
 
     if pseudo_df.empty:

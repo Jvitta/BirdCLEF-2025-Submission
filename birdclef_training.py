@@ -25,6 +25,7 @@ from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from losses import FocalLossBCE
 import torchvision.transforms as transforms
+import torchaudio.transforms as T_audio
 
 from tqdm.auto import tqdm
 
@@ -177,19 +178,12 @@ class BirdCLEFDataset(Dataset):
              print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
              spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
 
-        # Ensure spec is float32 before augmentations/tensor conversion
+        # Ensure spec is float32 and in [0,1] range if not already (assuming utils.audio2melspec might not guarantee it)
+        # This step is crucial for the new augmentation pipeline.
         spec = spec.astype(np.float32)
-
-        # Apply manual SpecAugment (Time/Freq Mask, Contrast) on NumPy array
-        if self.mode == "train":
-            spec = self.apply_spec_augmentations(spec)
-
-        # Convert to tensor, add channel dimension, repeat AFTER potential logging
-        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
-
-        # Normalize the (potentially augmented) tensor
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        spec_tensor = normalize(spec_tensor)
+ 
+        # Convert to SINGLE-CHANNEL tensor, [0,1] range. NO 3-channel repeat, NO ImageNet norm here.
+        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0) # Shape: (1, H, W)
 
         # Encode labels retrieved from the dataframe row
         target = self.encode_label(primary_label)
@@ -327,14 +321,28 @@ class BirdCLEFModel(nn.Module):
         return logits
 
 def mixup_data(x, targets, alpha, device):
-    """Applies mixup augmentation.
-    Returns mixed inputs, targets_a, targets_b, and lambda.
+    """Applies mixup augmentation with per-sample lambda values.
+    Returns mixed inputs, targets_a, targets_b, and lambda (per-sample).
+    Lambda is a 1D tensor of shape (batch_size,).
     """
     batch_size = x.size(0)
-    lam = np.random.beta(alpha, alpha)
+    
+    # Generate per-sample lambdas using torch.distributions
+    # Ensure alpha is a tensor for Beta distribution
+    alpha_tensor = torch.tensor(alpha, device=device, dtype=torch.float32) 
+    beta_dist = torch.distributions.beta.Beta(alpha_tensor, alpha_tensor)
+    
+    # lam will be a 1D tensor of shape (batch_size,)
+    lam = beta_dist.sample((batch_size,))
+    
+    # Reshape lam to (batch_size, 1, 1, 1) for broadcasting with images x
+    lam_x_broadcast = lam.view(batch_size, 1, 1, 1)
+
     indices = torch.randperm(batch_size, device=device)
-    mixed_x = lam * x + (1 - lam) * x[indices]
+    mixed_x = lam_x_broadcast * x + (1 - lam_x_broadcast) * x[indices]
     targets_a, targets_b = targets, targets[indices]
+    
+    # Return lam as 1D tensor (batch_size,) for loss calculation
     return mixed_x, targets_a, targets_b, lam
 
 def rand_bbox(size, lam):
@@ -379,6 +387,77 @@ def cutmix_data(x, targets, alpha, device):
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
 
     return mixed_x, targets_a, targets_b, lam
+
+# New PyTorch-based batch augmentation function
+def apply_batch_spec_augment_pytorch(batch_tensor, config, device):
+    """Apply spec augmentations (time mask, freq mask, contrast) to a batch of spectrograms.
+    Decisions for applying each augmentation type are made on a per-sample basis using vectorized operations.
+    If masking is applied, a fixed number of masks (from config) is used.
+    
+    Args:
+        batch_tensor (torch.Tensor): Input batch of shape (B, 1, H, W), values in [0,1].
+        config: Configuration object with augmentation parameters.
+        device: PyTorch device.
+        
+    Returns:
+        torch.Tensor: Augmented batch_tensor, same shape and value range [0,1].
+    """
+    augmented_batch = batch_tensor.clone() # Work on a clone
+    B, C, H, W = augmented_batch.shape
+    
+    if C != 1:
+        print(f"Warning: apply_batch_spec_augment_pytorch expects single channel input, got {C} channels. Processing as is, but designed for C=1.")
+
+    # Initialize maskers. They apply diverse masks to each sample in a batch by default.
+    # Setting iid_masks=True explicitly ensures this independent behavior.
+    time_masker = T_audio.TimeMasking(time_mask_param=config.max_time_mask_width, iid_masks=True).to(device)
+    freq_masker = T_audio.FrequencyMasking(freq_mask_param=config.max_freq_mask_height, iid_masks=True).to(device)
+
+    # --- Time Masking (up to N attempts) ---
+    if config.time_mask_prob > 0:
+        NUM_TIME_MASK_ATTEMPTS = 3
+        for _ in range(NUM_TIME_MASK_ATTEMPTS):
+            # Per-sample decision for THIS attempt
+            apply_tm_decision_attempt = torch.rand(B, 1, 1, 1, device=device) < config.time_mask_prob
+            
+            if apply_tm_decision_attempt.any(): # Proceed if any sample needs masking in this attempt
+                # Create a version of the CURRENT augmented_batch to apply masking to
+                samples_to_mask_tm_attempt = augmented_batch.clone() 
+                samples_to_mask_tm_attempt = time_masker(samples_to_mask_tm_attempt) # Apply one mask
+                
+                # Update augmented_batch where this attempt's decision is true
+                augmented_batch = torch.where(apply_tm_decision_attempt, samples_to_mask_tm_attempt, augmented_batch)
+
+    # --- Frequency Masking (up to N attempts) ---
+    if config.freq_mask_prob > 0:
+        NUM_FREQ_MASK_ATTEMPTS = 3 
+        for _ in range(NUM_FREQ_MASK_ATTEMPTS):
+            apply_fm_decision_attempt = torch.rand(B, 1, 1, 1, device=device) < config.freq_mask_prob
+
+            if apply_fm_decision_attempt.any():
+                samples_to_mask_fm_attempt = augmented_batch.clone()
+                samples_to_mask_fm_attempt = freq_masker(samples_to_mask_fm_attempt)
+
+                augmented_batch = torch.where(apply_fm_decision_attempt, samples_to_mask_fm_attempt, augmented_batch)
+            
+    # --- Random Brightness/Contrast ---    
+    if hasattr(config, 'contrast_prob') and config.contrast_prob > 0:
+        # Per-sample decision whether to apply contrast adjustment
+        apply_contrast_decision = torch.rand(B, 1, 1, 1, device=device) < config.contrast_prob
+        
+        if apply_contrast_decision.any():
+            # Generate gain and bias for ALL samples (these are unique per sample due to torch.rand)
+            gain_for_all = (torch.rand(B, 1, 1, 1, device=device) * 0.4) + 0.8  # [0.8, 1.2]
+            bias_for_all = (torch.rand(B, 1, 1, 1, device=device) * 0.2) - 0.1  # [-0.1, 0.1]
+            
+            # Apply contrast transformation to all samples to get a potential version
+            contrasted_samples_version = augmented_batch * gain_for_all + bias_for_all
+            contrasted_samples_version = torch.clamp(contrasted_samples_version, 0, 1)
+            
+            # Use torch.where to apply contrast only to selected samples
+            augmented_batch = torch.where(apply_contrast_decision, contrasted_samples_version, augmented_batch)
+        
+    return augmented_batch
 
 def get_optimizer(model, config):
     """Creates optimizer based on config settings."""
@@ -437,10 +516,10 @@ def get_scheduler(optimizer, config):
 def get_criterion(config):
     """Creates loss criterion based on config settings."""
     if config.criterion == 'BCEWithLogitsLoss':
-        criterion = nn.BCEWithLogitsLoss()
+        criterion = nn.BCEWithLogitsLoss(reduction='none') # Ensure per-sample losses are returned
     elif config.criterion == 'FocalLossBCE':
-        print("INFO: Using FocalLossBCE with parameters hardcoded in losses.py")
-        criterion = FocalLossBCE(config=config)
+        # The FocalLossBCE class in losses.py is confirmed to accept and use the 'reduction' parameter.
+        criterion = FocalLossBCE(config=config, reduction='none') 
     else:
         raise NotImplementedError(f"Criterion '{config.criterion}' not implemented")
     return criterion
@@ -474,6 +553,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
     # Check if batch augmentation is globally enabled
     batch_augment_active = config.batch_augment_prob > 0
 
+    # Define ImageNet normalization transform (can be defined once outside epoch loop too if preferred)
+    imagenet_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
 
     for step, batch in pbar:
@@ -482,7 +564,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
             continue
 
         try:
-            inputs_orig = batch['melspec'].to(device)
+            # inputs_orig is now (B, 1, H, W), values in [0,1]
+            inputs_orig_1chan = batch['melspec'].to(device) 
             targets_orig = batch['target'].to(device)
         except (AttributeError, TypeError) as e:
             print(f"Error: Skipping batch {step} due to unexpected format: {e}")
@@ -502,29 +585,59 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
             use_mixup_decision = random.random() < config.mixup_vs_cutmix_ratio
 
             if use_mixup_decision:
-                inputs, targets_a, targets_b, lam = mixup_data(
-                    inputs_orig, targets_orig, config.mixup_alpha, device
+                # mixup_data expects (B, C, H, W) - our single channel (B, 1, H, W) is fine
+                mixed_inputs_1chan, targets_a, targets_b, lam = mixup_data(
+                    inputs_orig_1chan, targets_orig, config.mixup_alpha, device
                 )
                 apply_mixup = True
             else:
-                inputs, targets_a, targets_b, lam = cutmix_data(
-                    inputs_orig, targets_orig, config.cutmix_alpha, device
+                # cutmix_data expects (B, C, H, W) - our single channel (B, 1, H, W) is fine
+                mixed_inputs_1chan, targets_a, targets_b, lam = cutmix_data(
+                    inputs_orig_1chan, targets_orig, config.cutmix_alpha, device
                 )
                 apply_cutmix = True
+            current_batch_1chan_for_specaug = mixed_inputs_1chan
         else:
-            # No augmentation for this batch
-            inputs = inputs_orig
-            targets_a = targets_orig
+            # No batch augmentation for this batch
+            current_batch_1chan_for_specaug = inputs_orig_1chan
+            targets_a = targets_orig # Ensure targets_a is assigned for loss calculation
             lam = 1.0 # Ensure lambda is 1 when no augmentation
+
+        # --- Apply PyTorch-based Spec Augmentations ---
+        if model.training: # Only apply these spec augmentations during training
+            augmented_batch_1chan = apply_batch_spec_augment_pytorch(current_batch_1chan_for_specaug, config, device)
+        else: # Should not happen if this function is train_one_epoch, but good practice
+            augmented_batch_1chan = current_batch_1chan_for_specaug
+
+        # --- Repeat to 3 Channels and ImageNet Normalize ---
+        final_inputs_3chan_unnorm = augmented_batch_1chan.repeat(1, 3, 1, 1)
+        final_inputs_3chan_norm = imagenet_normalize(final_inputs_3chan_unnorm)
 
         # --- Forward pass and Loss Calculation --- #
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            logits = model(inputs)
+            logits = model(final_inputs_3chan_norm) # Use the fully processed tensor
 
             if apply_mixup or apply_cutmix:
-                loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
+                # lam from mixup_data is (B,), lam from cutmix_data is a scalar.
+                # Criterion returns per-sample losses: (B, num_classes)
+                per_sample_loss_a = criterion(logits, targets_a)
+                per_sample_loss_b = criterion(logits, targets_b)
+
+                if lam.ndim == 0: # Scalar lambda (e.g., from CutMix or if MixUp failed to be per-sample)
+                    lam_broadcast = lam # Will broadcast correctly with (B, num_classes)
+                elif lam.ndim == 1 and lam.size(0) == logits.size(0): # Per-sample lambda (B,)
+                    lam_broadcast = lam.unsqueeze(1) # Reshape to (B, 1) for broadcasting
+                else:
+                    # Fallback or error for unexpected lam shape
+                    print(f"Warning: Unexpected lam_mix shape: {lam.shape if hasattr(lam, 'shape') else type(lam)}. Using 0.5 for weighting.")
+                    lam_broadcast = 0.5
+                
+                weighted_loss_components = lam_broadcast * per_sample_loss_a + (1 - lam_broadcast) * per_sample_loss_b
+                loss = weighted_loss_components.mean() # Mean over batch and classes
             else:
-                loss = criterion(logits, targets_a) # targets_a is targets_orig here
+                # Standard loss calculation when no MixUp/CutMix
+                loss_no_mix = criterion(logits, targets_a) # targets_a is targets_orig here
+                loss = loss_no_mix.mean() # Mean over batch and classes
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -541,7 +654,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
         # --- Log Spectrograms (New Logic) ---
         if wandb.run is not None and len(logged_original_samplenames_for_spectrograms) < num_samples_to_log:
             with torch.no_grad(): # Ensure no gradients are calculated for this section
-                for j in range(inputs.size(0)): # Iterate through batch
+                for j in range(inputs_orig_1chan.size(0)): # Iterate through batch
                     if len(logged_original_samplenames_for_spectrograms) >= num_samples_to_log:
                         break # Stop if we've logged enough globally
 
@@ -549,31 +662,21 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
                     
                     if original_samplename not in logged_original_samplenames_for_spectrograms:
                         try:
-                            # inputs[j] is (3, H, W), normalized. Plot first channel.
-                            # We need to denormalize or be aware colors might be off, or just plot as is.
-                            # For simplicity, plot as is. It shows what model gets before backbone.
-                            img_tensor_first_channel = inputs[j, 0, :, :].cpu()
-                            
-                            # If you want to try to roughly denormalize for viewing (optional, can be complex):
-                            # mean = torch.tensor([0.485]).view(1, 1).to(img_tensor_first_channel.device)
-                            # std = torch.tensor([0.229]).view(1, 1).to(img_tensor_first_channel.device)
-                            # img_to_plot_denorm = img_tensor_first_channel * std + mean
-                            # img_to_plot_np = torch.clamp(img_to_plot_denorm, 0, 1).numpy()
-                            img_to_plot_np = img_tensor_first_channel.numpy()
+                            # Log the single-channel, [0,1] range, post-MixUp, post-SpecAug tensor
+                            # This is `augmented_batch_1chan[j, 0, :, :]`
+                            img_tensor_to_log = augmented_batch_1chan[j, 0, :, :].cpu()
+                            img_to_plot_np = img_tensor_to_log.numpy()
 
                             fig, ax = plt.subplots(1, 1, figsize=(6, 4))
                             ax.imshow(img_to_plot_np, aspect='auto', origin='lower', cmap='viridis')
                             
                             caption = f"Sample: {original_samplename}"
-                            if apply_mixup or apply_cutmix:
-                                if j < len(targets_a) and hasattr(targets_a[j], 'cpu'): # Check if valid tensor for original ID
-                                    # To get the ID of the mixed sample, we need to trace back through `indices`
-                                    # original_samplename_b might not be straightforward if `indices` is not available here
-                                    # For simplicity, just indicate it's mixed.
-                                    caption += f" (Mixed, lam: {lam:.2f} approx for batch)"
-                                else: # Fallback if targets_a is not as expected
-                                    caption += f" (Mixed)"
-                            caption += " \n(1st chan, post-all-augs & norm)"
+                            if apply_mixup: # lam is a tensor (B,)
+                                lambda_val_for_sample = lam[j].item() # Get scalar for current sample
+                                caption += f" (Mixed, lam: {lambda_val_for_sample:.2f})"
+                            elif apply_cutmix: # lam is a scalar
+                                caption += f" (Mixed, lam: {lam:.2f} for batch)" # lam is batch-wide for CutMix
+                            caption += " \n(1ch, post-mixup-specaug, pre-norm)"
                             
                             ax.set_title(caption, fontsize=8)
                             ax.axis('off')
@@ -618,6 +721,9 @@ def validate(model, loader, criterion, device):
     species_ids = loader.dataset.species_ids # Get species IDs for labeling
     num_classes = len(species_ids)
 
+    # Define ImageNet normalization transform (mirroring train_one_epoch)
+    imagenet_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
             if batch is None:
@@ -625,15 +731,22 @@ def validate(model, loader, criterion, device):
                 continue
 
             try:
-                inputs = batch['melspec'].to(device)
+                # inputs_1chan is (B, 1, H, W), values in [0,1] from DataLoader
+                inputs_1chan = batch['melspec'].to(device)
                 targets = batch['target'].to(device)
             except (AttributeError, TypeError) as e:
                 print(f"Error: Skipping validation batch {step} due to unexpected format: {e}")
                 continue
 
+            # --- Repeat to 3 Channels and ImageNet Normalize ---
+            final_inputs_3chan_unnorm = inputs_1chan.repeat(1, 3, 1, 1)
+            final_inputs_3chan_norm = imagenet_normalize(final_inputs_3chan_unnorm)
+
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                outputs = model(final_inputs_3chan_norm) # Use the processed 3-channel tensor
+                # Criterion now returns per-element losses (B, num_classes) due to reduction='none'
+                per_element_loss = criterion(outputs, targets)
+                loss = per_element_loss.mean() # Explicitly take the mean to get a scalar loss
 
             all_outputs_list.append(outputs.float().cpu().numpy())
             all_targets_list.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
