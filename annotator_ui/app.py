@@ -3,6 +3,7 @@ import os
 import pandas as pd
 from datetime import datetime
 import sys
+import numpy as np
 
 PROJECT_ROOT_APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT_APP not in sys.path:
@@ -49,6 +50,29 @@ except Exception as e:
     print(f"Warning: Could not load main train metadata {config.train_csv_path}: {e}")
     main_train_df = None
 
+# Load taxonomy data
+taxonomy_df = None
+try:
+    taxonomy_df = pd.read_csv(config.taxonomy_path)
+    if 'primary_label' in taxonomy_df.columns:
+        taxonomy_df['primary_label'] = taxonomy_df['primary_label'].astype(str)
+    else:
+        print(f"Warning: 'primary_label' column not found in {config.taxonomy_path}")
+        taxonomy_df = None
+except Exception as e:
+    print(f"Error loading taxonomy data from {config.taxonomy_path}: {e}")
+
+# Load BirdNET detections
+all_birdnet_detections = {}
+try:
+    with np.load(config.BIRDNET_DETECTIONS_NPZ_PATH, allow_pickle=True) as data:
+        all_birdnet_detections = {key: data[key] for key in data.files}
+    print(f"Successfully loaded BirdNET detections for {len(all_birdnet_detections)} files.")
+except FileNotFoundError:
+    print(f"Warning: BirdNET detections file not found at {config.BIRDNET_DETECTIONS_NPZ_PATH}. Proceeding without BirdNET filtering.")
+except Exception as e:
+    print(f"Warning: Error loading BirdNET detections NPZ from {config.BIRDNET_DETECTIONS_NPZ_PATH}: {e}. Proceeding without BirdNET filtering.")
+
 # --- Annotation Data Handling ---
 # Define columns for the new annotation structure
 ANNOTATION_COLUMNS = ["filename", "center_time_s", "primary_label", "annotation_time"]
@@ -59,6 +83,9 @@ if os.path.exists(OUTPUT_ANNOTATIONS_FILE):
         if not all(col in annotations_df.columns for col in ANNOTATION_COLUMNS): # Check if columns match
             print(f"Warning: Annotation file columns mismatch. Re-initializing {OUTPUT_ANNOTATIONS_FILE}.")
             annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
+        # Ensure filename column is string type for consistent matching
+        if 'filename' in annotations_df.columns:
+            annotations_df['filename'] = annotations_df['filename'].astype(str)
     except pd.errors.EmptyDataError:
         annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
     except Exception as e:
@@ -117,36 +144,191 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
     )
 
     with gr.Row():
-        species_folder_dropdown = gr.Dropdown(choices=species_folders_list, label="Select Species Folder")
-        audio_file_dropdown = gr.Dropdown(choices=[], label="Select Audio File From Folder", interactive=True)
+        with gr.Column(scale=2):
+            species_folder_dropdown = gr.Dropdown(choices=species_folders_list, label="Select Species Folder")
+            audio_file_dropdown_no_bn = gr.Dropdown(choices=[], label="Select Audio File (No BirdNET Detections)", interactive=True)
+            audio_file_dropdown_with_bn = gr.Dropdown(choices=[], label="Select Audio File (Has BirdNET Detections)", interactive=True)
+        with gr.Column(scale=1):
+            gr.Markdown("### Species Information")
+            scientific_name_md = gr.Markdown("**Scientific Name:** N/A")
+            common_name_md = gr.Markdown("**Common Name:** N/A")
+            class_name_md = gr.Markdown("**Class:** N/A")
+            birdnet_detections_md = gr.Markdown("#### Top BirdNET Detections:\nN/A")
     
     audio_player = gr.Audio(label="Audio Player", type="filepath", interactive=False, elem_id="audio_player_element")
     
     center_time_js_output = gr.Textbox(label="Segment Center Time (JS)", interactive=True, elem_id="center_time_js_output_elem")
 
-    def update_audio_file_choices(selected_species_folder):
+    def update_audio_file_choices_and_species_info(selected_species_folder):
+        # Defaults for species info
+        sci_name_text = "**Scientific Name:** N/A"
+        com_name_text = "**Common Name:** N/A"
+        cls_name_text = "**Class:** N/A"
+        # Initialize updates for two dropdowns
+        audio_choices_no_bn_update = gr.update(choices=[], value=None, interactive=True)
+        audio_choices_with_bn_update = gr.update(choices=[], value=None, interactive=True)
+        audio_player_update = None
+        center_time_update = ""
+        birdnet_detections_text = "#### Top BirdNET Detections:\nN/A"
+
         if selected_species_folder and selected_species_folder in audio_data_structure:
-            files_in_folder = audio_data_structure[selected_species_folder]
-            return gr.update(choices=files_in_folder, value=None, interactive=True), None, "" # Clear time textbox
-        return gr.update(choices=[], value=None, interactive=True), None, "" # Clear time textbox
+            all_files_in_folder = audio_data_structure[selected_species_folder]
+            
+            annotated_files_in_current_folder_set = set()
+            if not annotations_df.empty and 'filename' in annotations_df.columns:
+                prefix_to_check = selected_species_folder + os.path.sep
+                relevant_annotations = annotations_df[annotations_df['filename'].str.startswith(prefix_to_check, na=False)]
+                annotated_files_in_current_folder_set = set(relevant_annotations['filename'])
+            
+            files_to_consider_for_dropdowns = []
+            for file_basename in all_files_in_folder:
+                relative_path = os.path.join(selected_species_folder, file_basename)
+                if relative_path in annotated_files_in_current_folder_set:
+                    continue 
+                files_to_consider_for_dropdowns.append(file_basename)
+            
+            choices_no_bn = []
+            choices_with_bn_intermediate = [] # Store (basename, max_confidence) for sorting
+
+            for file_basename in files_to_consider_for_dropdowns:
+                relative_path_os_specific = os.path.join(selected_species_folder, file_basename)
+                lookup_key_for_birdnet = relative_path_os_specific.replace(os.path.sep, '/')
+                
+                has_any_birdnet_detection = False
+                max_confidence_for_file = 0.0 # Default for sorting if no valid dets
+
+                if lookup_key_for_birdnet in all_birdnet_detections:
+                    bn_dets_raw = all_birdnet_detections[lookup_key_for_birdnet]
+                    if bn_dets_raw is not None: 
+                        # Process bn_dets_raw to a list of detection dicts to find max confidence
+                        actual_detections = []
+                        if isinstance(bn_dets_raw, np.ndarray):
+                            actual_detections = [item for item in bn_dets_raw if isinstance(item, dict)]
+                        elif isinstance(bn_dets_raw, list):
+                            actual_detections = [d for d in bn_dets_raw if isinstance(d, dict)]
+                        
+                        if actual_detections: # If we have a list of dicts
+                            has_any_birdnet_detection = True
+                            confidences = [det.get('confidence', 0.0) for det in actual_detections if isinstance(det.get('confidence'), (int, float))]
+                            if confidences:
+                                max_confidence_for_file = max(confidences)
+                
+                if has_any_birdnet_detection:
+                    choices_with_bn_intermediate.append((file_basename, max_confidence_for_file))
+                else:
+                    choices_no_bn.append(file_basename) 
+            
+            # Sort choices_with_bn_intermediate by max_confidence (descending)
+            choices_with_bn_intermediate.sort(key=lambda x: x[1], reverse=True)
+            # Extract just the basenames for the dropdown
+            final_choices_with_bn = [basename for basename, conf in choices_with_bn_intermediate]
+
+            audio_choices_no_bn_update = gr.update(choices=sorted(choices_no_bn), value=None, interactive=True)
+            audio_choices_with_bn_update = gr.update(choices=final_choices_with_bn, value=None, interactive=True)
+            
+            if taxonomy_df is not None and 'primary_label' in taxonomy_df.columns:
+                species_info = taxonomy_df[taxonomy_df['primary_label'] == str(selected_species_folder)]
+                if not species_info.empty:
+                    sci_name = species_info['scientific_name'].iloc[0] if 'scientific_name' in species_info else "N/A"
+                    com_name = species_info['common_name'].iloc[0] if 'common_name' in species_info else "N/A"
+                    cls_name = species_info['class_name'].iloc[0] if 'class_name' in species_info else "N/A"
+                    
+                    sci_name_text = f"**Scientific Name:** {sci_name}"
+                    com_name_text = f"**Common Name:** {com_name}"
+                    cls_name_text = f"**Class:** {cls_name}"
+                else:
+                    print(f"Info: Species folder '{selected_species_folder}' not found in taxonomy_df.")
+            else:
+                print("Info: taxonomy_df is not loaded or 'primary_label' column is missing.")
+        
+        # Return updates for both dropdowns and the new markdown
+        return (
+            audio_choices_no_bn_update, audio_choices_with_bn_update, 
+            audio_player_update, center_time_update, 
+            sci_name_text, com_name_text, cls_name_text, 
+            birdnet_detections_text
+        )
 
     species_folder_dropdown.change(
-        fn=update_audio_file_choices, 
+        fn=update_audio_file_choices_and_species_info,
         inputs=species_folder_dropdown, 
-        outputs=[audio_file_dropdown, audio_player, center_time_js_output] # Updated outputs
+        outputs=[
+            audio_file_dropdown_no_bn, audio_file_dropdown_with_bn, 
+            audio_player, center_time_js_output, 
+            scientific_name_md, common_name_md, class_name_md,
+            birdnet_detections_md
+        ]
     )
 
-    def update_audio_player_on_file_select(sel_species_folder, sel_audio_basename):
+    def update_audio_player_and_bn_info(sel_species_folder, sel_audio_basename):
+        audio_player_path = None
+        center_time_val = ""
+        bn_info_text = "#### Top BirdNET Detections:\nN/A"
+
         if sel_species_folder and sel_audio_basename:
             relative_path = os.path.join(sel_species_folder, sel_audio_basename)
             full_path = os.path.join(config.train_audio_dir, relative_path)
-            return full_path, "" # Clear time textbox
-        return None, "" # Clear time textbox
+            audio_player_path = full_path
+            center_time_val = "" # Clear time textbox
 
-    audio_file_dropdown.change(
-        fn=update_audio_player_on_file_select, 
-        inputs=[species_folder_dropdown, audio_file_dropdown], 
-        outputs=[audio_player, center_time_js_output] # Updated outputs
+            # Fetch and format BirdNET detections
+            lookup_key_for_birdnet = relative_path.replace(os.path.sep, '/')
+
+            if lookup_key_for_birdnet in all_birdnet_detections:
+                bn_dets = all_birdnet_detections[lookup_key_for_birdnet]
+
+                if bn_dets is not None and ((isinstance(bn_dets, np.ndarray) and bn_dets.size > 0) or (isinstance(bn_dets, list) and len(bn_dets) > 0)):
+                    detections_to_sort = []
+                    if isinstance(bn_dets, np.ndarray):
+                        # If bn_dets is a numpy array, assume its elements are the dicts
+                        # Convert to list of dicts, filtering for actual dicts just in case
+                        detections_to_sort = [item for item in bn_dets if isinstance(item, dict)]
+                    elif isinstance(bn_dets, list):
+                        # If it's already a list, filter for dicts
+                        detections_to_sort = [d for d in bn_dets if isinstance(d, dict)]
+                    
+                    if detections_to_sort: # Check if we have a non-empty list of dictionaries
+                        valid_dets = sorted(detections_to_sort, key=lambda x: x.get('confidence', 0), reverse=True)
+                        
+                        bn_info_text = "#### Top BirdNET Detections (Top 5):\n"
+                        for i, det in enumerate(valid_dets[:5]):
+                            start = det.get('start_time', 'N/A')
+                            end = det.get('end_time', 'N/A')
+                            conf = det.get('confidence', 0)
+                            # Ensure start/end are numbers before formatting, otherwise use 'N/A'
+                            start_str = f"{start:.1f}s" if isinstance(start, (int, float)) else str(start)
+                            end_str = f"{end:.1f}s" if isinstance(end, (int, float)) else str(end)
+                            conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else str(conf)
+                            bn_info_text += f"{i+1}. Start: {start_str}, End: {end_str}, Conf: {conf_str}\n"
+                    else:
+                        bn_info_text = "#### Top BirdNET Detections:\nNo valid dictionary-formatted detections found."
+                else:
+                    bn_info_text = "#### Top BirdNET Detections:\nNo detections listed for this file (data is None or empty)."
+            else:
+                bn_info_text = "#### Top BirdNET Detections:\nFile not found in BirdNET detection records."
+
+        return audio_player_path, center_time_val, bn_info_text
+
+    # Event handler for the 'No BirdNET' dropdown
+    audio_file_dropdown_no_bn.change(
+        fn=update_audio_player_and_bn_info, # Use new function
+        inputs=[species_folder_dropdown, audio_file_dropdown_no_bn], 
+        outputs=[audio_player, center_time_js_output, birdnet_detections_md] # Added birdnet_detections_md
+    ).then(
+        fn=lambda: gr.update(value=None), # Clear the other dropdown
+        inputs=None,
+        outputs=[audio_file_dropdown_with_bn]
+    )
+
+    # Event handler for the 'With BirdNET' dropdown
+    audio_file_dropdown_with_bn.change(
+        fn=update_audio_player_and_bn_info, # Use new function
+        inputs=[species_folder_dropdown, audio_file_dropdown_with_bn], 
+        outputs=[audio_player, center_time_js_output, birdnet_detections_md] # Added birdnet_detections_md
+    ).then(
+        fn=lambda: gr.update(value=None), # Clear the other dropdown
+        inputs=None,
+        outputs=[audio_file_dropdown_no_bn]
     )
     
     gr.Markdown("---")
@@ -281,14 +463,73 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
     gr.Markdown("### Recent Annotations:")
     annotations_table = gr.HTML(value=annotations_df_to_display())
 
+    # Modify save_annotation to pick the active dropdown
+    def save_annotation_revised(selected_species_folder, audio_file_no_bn, audio_file_with_bn, center_time_str):
+        global annotations_df
+        
+        selected_audio_basename = None
+        if audio_file_no_bn:
+            selected_audio_basename = audio_file_no_bn
+        elif audio_file_with_bn:
+            selected_audio_basename = audio_file_with_bn
+        else:
+            return "Please select an audio file from one of the dropdowns.", annotations_df_to_display()
+
+        if not selected_species_folder : # sel_audio_basename is already checked
+            return "Please select a species folder first.", annotations_df_to_display()
+        if not center_time_str:
+            return "Please set the center timestamp using the button.", annotations_df_to_display()
+            
+        try:
+            center_s = float(center_time_str)
+
+            if center_s < 0:
+                return "Timestamp must be non-negative.", annotations_df_to_display()
+
+            filename_relative = os.path.join(selected_species_folder, selected_audio_basename)
+            primary_label = get_primary_label(filename_relative, main_train_df)
+
+            new_annotation = pd.DataFrame([{\
+                "filename": filename_relative,
+                "center_time_s": center_s,
+                "primary_label": primary_label,
+                "annotation_time": datetime.now().isoformat()
+            }])
+            
+            annotations_df = pd.concat([annotations_df, new_annotation], ignore_index=True)
+            
+            output_dir = os.path.dirname(OUTPUT_ANNOTATIONS_FILE)
+            os.makedirs(output_dir, exist_ok=True)
+            
+            annotations_df.to_csv(OUTPUT_ANNOTATIONS_FILE, index=False)
+            
+            # Also, after saving, we might want to clear both audio dropdowns
+            # This requires returning updates for them.
+            # For now, just return status and table. We can enhance clear later.
+            return f"Annotation saved for {filename_relative} at {center_s:.2f}s.", annotations_df_to_display()
+        except ValueError:
+            return "Invalid timestamp format in center time field. Please ensure it's a number.", annotations_df_to_display()
+        except Exception as e:
+            return f"Error saving annotation: {str(e)}", annotations_df_to_display()
+
+
     save_button.click(
-        fn=save_annotation,
-        inputs=[species_folder_dropdown, audio_file_dropdown, center_time_js_output], # Updated inputs
+        fn=save_annotation_revised, # Use new save function
+        inputs=[species_folder_dropdown, audio_file_dropdown_no_bn, audio_file_dropdown_with_bn, center_time_js_output], 
         outputs=[status_message, annotations_table]
     )
-    save_button.click(lambda: "", outputs=center_time_js_output) # Clear center time textbox
+    # Clear only center time textbox after save, keep dropdowns selected
+    save_button.click(
+        fn=lambda: "", 
+        inputs=None, 
+        outputs=[center_time_js_output]
+    )
 
 # --- Launch the UI ---
+# Remove old save_annotation if it's still there globally (it's now save_annotation_revised)
+if 'save_annotation' in globals() and callable(globals()['save_annotation']):
+    del globals()['save_annotation']
+
 if __name__ == "__main__":
     print(f"Audio folders found: {len(species_folders_list)}")
     if not species_folders_list:
