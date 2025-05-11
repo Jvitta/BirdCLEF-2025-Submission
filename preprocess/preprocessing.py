@@ -27,7 +27,19 @@ warnings.filterwarnings("ignore")
 random.seed(config.seed)
 np.random.seed(config.seed)
 
-efficient_at_spectrogram_generator = AugmentMelSTFT(freqm=0, timem=0)
+efficient_at_spectrogram_generator = AugmentMelSTFT(
+            n_mels=config.N_MELS,
+            sr=config.FS,
+            win_length=config.WIN_LENGTH,
+            hopsize=config.HOP_LENGTH,
+            n_fft=config.N_FFT,
+            fmin=config.FMIN, # Ensure FMIN is in config, or pass None for default
+            fmax=config.FMAX,        # Let AugmentMelSTFT calculate base fmax from sr and fmax_aug_range
+            freqm=0,          # Or config.FREQM if you make it configurable
+            timem=0,          # Or config.TIMEM if you make it configurable
+            fmin_aug_range=config.FMIN_AUG_RANGE, # Use config or default
+            fmax_aug_range=config.FMAX_AUG_RANGE # Use config or default (e.g., 1000)
+        )
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""

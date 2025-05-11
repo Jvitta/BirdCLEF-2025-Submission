@@ -42,9 +42,12 @@ class Config:
     TARGET_DURATION = 5.0  
     N_FFT = 1024
     HOP_LENGTH = 128
+    WIN_LENGTH = 800
     N_MELS = 128
     FMIN = 20
-    FMAX = 16000
+    FMAX = None
+    FMIN_AUG_RANGE = 10
+    FMAX_AUG_RANGE = 1000
     TARGET_SHAPE = (128, 500) # Natural output: 128 mels, 500 time_frames for 5s @ 32kHz sr, 320 hop
 
     model_name = 'mn10_as' # Changed to reflect the new EfficientAT model

@@ -18,8 +18,21 @@ def _preprocess_audio_file_worker(audio_path_str, config):
     segment_row_ids = []
 
     try:
-        spectrogram_generator_worker = AugmentMelSTFT(freqm=0, timem=0)
-        spectrogram_generator_worker.eval()
+        # Initialize AugmentMelSTFT here for each worker process call
+        spectrogram_generator_worker = AugmentMelSTFT(
+            n_mels=config.N_MELS,
+            sr=config.FS,
+            win_length=config.WIN_LENGTH,
+            hopsize=config.HOP_LENGTH,
+            n_fft=config.N_FFT,
+            fmin=config.FMIN, # Ensure FMIN is in config, or pass None for default
+            fmax=config.FMAX, # Let AugmentMelSTFT calculate base fmax from sr and fmax_aug_range
+            freqm=0,          # Or config.FREQM if you make it configurable
+            timem=0,          # Or config.TIMEM if you make it configurable
+            fmin_aug_range=config.FMIN_AUG_RANGE, # Use config or default
+            fmax_aug_range=config.FMAX_AUG_RANGE # Use config or default (e.g., 1000)
+        )
+        spectrogram_generator_worker.eval() # Set to eval mode for inference
 
         audio_data, _ = librosa.load(audio_path, sr=config.FS, mono=True)
         target_length_samples = int(config.TARGET_DURATION * config.FS)
