@@ -36,6 +36,7 @@ import wandb
 from config import config
 import utils as utils
 import cv2
+from models.efficient_at.mn.model import get_model as get_efficient_at_model
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -185,12 +186,13 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
-        # Convert to tensor, add channel dimension, repeat AFTER potential logging
-        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
+        # Convert to tensor, add channel dimension (NO LONGER REPEATED)
+        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
 
-        # Normalize the (potentially augmented) tensor
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        spec_tensor = normalize(spec_tensor)
+        # Normalize the (potentially augmented) tensor (REMOVED IMAGENET NORMALIZATION)
+        # The AugmentMelSTFT from EfficientAT already applies normalization: (melspec + 4.5) / 5.0
+        # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # spec_tensor = normalize(spec_tensor)
 
         # Encode labels retrieved from the dataframe row
         target = self.encode_label(primary_label)
@@ -283,50 +285,6 @@ def collate_fn(batch):
         return None
 
     return result
-
-class BirdCLEFModel(nn.Module):
-    """BirdCLEF model using timm backbone."""
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        self.backbone = timm.create_model(
-            config.model_name,
-            pretrained=config.pretrained,
-            in_chans=config.in_channels,
-            drop_rate=0.2, # Consider making these configurable
-            drop_path_rate=0.2 # Consider making these configurable
-        )
-
-        # Use original backbone feature extraction logic
-        if 'efficientnet' in config.model_name:
-            backbone_out = self.backbone.classifier.in_features
-            self.backbone.classifier = nn.Identity()
-        else:
-            backbone_out = self.backbone.get_classifier().in_features
-            self.backbone.reset_classifier(0, '')
-
-        self.pooling = nn.AdaptiveAvgPool2d(1)
-        self.feat_dim = backbone_out
-        self.classifier = nn.Linear(backbone_out, config.num_classes)
-
-        self.mixup_enabled = config.mixup_alpha > 0
-        if self.mixup_enabled:
-            self.mixup_alpha = config.mixup_alpha
-            print(f"Mixup enabled with alpha={self.mixup_alpha}")
-
-    def forward(self, x):
-        features = self.backbone(x)
-
-        if isinstance(features, dict):
-            features = features['features']
-
-        if len(features.shape) == 4:
-            features = self.pooling(features)
-            features = features.view(features.size(0), -1)
-
-        logits = self.classifier(features)
-        return logits
 
 def mixup_data(x, targets, sources, alpha, device):
     """Applies mixup augmentation, ensuring mixing only occurs between samples from the same source.
@@ -548,7 +506,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
 
         # --- Forward pass and Loss Calculation --- #
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-            logits = model(inputs)
+            model_output = model(inputs)
+            logits = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
 
             if apply_mixup or apply_cutmix:
                 loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
@@ -661,7 +620,8 @@ def validate(model, loader, criterion, device):
                 continue
 
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-                outputs = model(inputs)
+                model_output = model(inputs)
+                outputs = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
                 loss = criterion(outputs, targets)
 
             all_outputs_list.append(outputs.float().cpu().numpy())
@@ -885,7 +845,18 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             )
 
             print("\nSetting up model, optimizer, criterion, scheduler...")
-            model = BirdCLEFModel(config).to(config.device)
+            # model = BirdCLEFModel(config).to(config.device) # Old model instantiation
+            # New model instantiation using EfficientAT's get_model
+            model = get_efficient_at_model(
+                num_classes=config.num_classes,          # From your config
+                pretrained_name="mn10_as",               # Specific EfficientAT model
+                width_mult=1.0,                          # Implied by "mn10"
+                head_type="mlp",                         # Common head for these models
+                input_dim_f=config.TARGET_SHAPE[0],      # 128 mels
+                input_dim_t=config.TARGET_SHAPE[1]       # 500 time frames
+                # se_dims, se_agg, se_r will use defaults from get_model which are suitable
+            ).to(config.device)
+            
             optimizer = get_optimizer(model, config)
             criterion = get_criterion(config)
             scheduler = get_scheduler(optimizer, config)

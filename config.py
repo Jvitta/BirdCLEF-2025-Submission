@@ -45,11 +45,11 @@ class Config:
     N_MELS = 136
     FMIN = 20
     FMAX = 16000
-    TARGET_SHAPE = (128, 500)
+    TARGET_SHAPE = (128, 500) # Natural output: 128 mels, 500 time_frames for 5s @ 32kHz sr, 320 hop
 
-    model_name = 'efficientnet_b0'
-    pretrained = True
-    in_channels = 3
+    model_name = 'mn10_as' # Changed to reflect the new EfficientAT model
+    pretrained = True # Pretrained weights will be loaded by the EfficientAT get_model function
+    in_channels = 1 # EfficientAT models expect 1 input channel (the spectrogram itself)
     num_classes = 206
 
     LOAD_PREPROCESSED_DATA = True

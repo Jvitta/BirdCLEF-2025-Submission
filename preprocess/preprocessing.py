@@ -27,18 +27,8 @@ warnings.filterwarnings("ignore")
 random.seed(config.seed)
 np.random.seed(config.seed)
 
-# Initialize the EfficientAT spectrogram generator globally
-# Rely on AugmentMelSTFT's internal defaults for sr, win_length, hopsize, n_mels, n_fft, fmin, fmax.
-# Explicitly disable training-time augmentations (freqm, timem) for NPZ generation.
-efficient_at_spectrogram_generator = AugmentMelSTFT(
-    freqm=0,  # Disable Frequency Masking for NPZ generation
-    timem=0   # Disable Time Masking for NPZ generation
-    # Defaults used from AugmentMelSTFT:
-    # sr=32000, n_mels=128, win_length=800, hopsize=320, n_fft=1024
-    # fmin=0.0
-    # fmax=sr // 2 - fmax_aug_range // 2 = 15000 (with default fmax_aug_range=2000)
-)
-efficient_at_spectrogram_generator.eval() # Set to evaluation mode
+efficient_at_spectrogram_generator = AugmentMelSTFT(freqm=0, timem=0)
+efficient_at_spectrogram_generator.eval() 
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""
@@ -228,11 +218,9 @@ def _generate_spectrogram_from_chunk(audio_chunk_5s, config_obj):
         audio_tensor = torch.from_numpy(audio_chunk_5s.astype(np.float32))
 
         with torch.no_grad():
-            # The AugmentMelSTFT expects input shape (batch, time) or (time)
             # We process one chunk at a time, so unsqueeze to add batch dim for the conv1d preemphasis.
             raw_spec_chunk_tensor = efficient_at_spectrogram_generator(audio_tensor.unsqueeze(0))
 
-        # Remove batch dimension and convert to numpy: (1, n_mels, n_frames) -> (n_mels, n_frames)
         raw_spec_chunk_numpy = raw_spec_chunk_tensor.squeeze(0).cpu().numpy()
 
         if raw_spec_chunk_numpy is None or raw_spec_chunk_numpy.ndim != 2:
