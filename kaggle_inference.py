@@ -4,12 +4,12 @@ import warnings
 import logging
 import time
 import math
-import cv2
+import random
+import cv2 # No longer directly needed here if process_audio_segment is self-contained with it or if cv2 is only for it
 from pathlib import Path
 import multiprocessing
 from functools import partial
 import traceback
-import random # Import random module
 
 import numpy as np
 import pandas as pd
@@ -17,14 +17,18 @@ import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
+# import timm # No longer directly needed if BirdCLEFModel is replaced
 from tqdm.auto import tqdm
-import torchvision.transforms as transforms
+# import torchvision.transforms as transforms # No longer needed due to EfficientAT's internal normalization
 
 # Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
 from config import config # Import central config
-import utils as utils # Import utils
-from utils import _preprocess_audio_file_worker # Import the worker
+import birdclef_utils as utils # Import utils
+from birdclef_utils import _preprocess_audio_file_worker # Import the worker
+
+# EfficientAT model and preprocessing
+from models.efficient_at.mn.model import get_model as get_efficient_at_model
+from models.efficient_at.preprocess import AugmentMelSTFT
 
 # Suppress warnings and limit logging output
 warnings.filterwarnings("ignore")
@@ -36,46 +40,6 @@ class BirdCLEF2025Pipeline:
     Organizes model loading, audio processing, prediction, and submission generation.
     """
 
-    # Nested Model Class (uses config passed to pipeline)
-    class BirdCLEFModel(nn.Module):
-        """Internal model definition, mirrors training structure"""
-        def __init__(self, config, num_classes):
-            super().__init__()
-            self.config = config # Store config if needed internally
-
-            self.backbone = timm.create_model(
-                config.model_name,
-                pretrained=False, # Inference should load trained weights, not pretrained imagenet
-                in_chans=config.in_channels,
-                drop_rate=0.0, # Usually set drop rates to 0 for inference
-                drop_path_rate=0.0
-            )
-            # Adjust final layers based on model type
-            if 'efficientnet' in self.config.model_name:
-                backbone_out = self.backbone.classifier.in_features
-                self.backbone.classifier = nn.Identity()
-            elif 'resnet' in self.config.model_name:
-                backbone_out = self.backbone.fc.in_features
-                self.backbone.fc = nn.Identity()
-            else:
-                backbone_out = self.backbone.get_classifier().in_features
-                self.backbone.reset_classifier(0, '')
-            
-            self.pooling = nn.AdaptiveAvgPool2d(1)
-            self.feat_dim = backbone_out
-            self.classifier = nn.Linear(backbone_out, num_classes)
-
-        def forward(self, x):
-            features = self.backbone(x)
-            if isinstance(features, dict):
-                features = features['features']
-            # If features are 4D, apply global average pooling.
-            if len(features.shape) == 4:
-                features = self.pooling(features)
-                features = features.view(features.size(0), -1)
-            logits = self.classifier(features)
-            return logits
-
     def __init__(self, config): # Accept central config
         """Initialize the inference pipeline with the central configuration."""
         self.config = config
@@ -83,6 +47,20 @@ class BirdCLEF2025Pipeline:
         self.species_ids = []
         self.models = []
         self._load_taxonomy()
+        # Initialize AugmentMelSTFT for spectrogram generation
+        self.spectrogram_generator = AugmentMelSTFT(
+            n_mels=self.config.N_MELS,
+            sr=self.config.FS,
+            win_length=self.config.N_FFT,
+            hopsize=self.config.HOP_LENGTH,
+            n_fft=self.config.N_FFT,
+            freqm=0, # No frequency masking for inference
+            timem=0, # No time masking for inference
+            fmin=self.config.FMIN,
+            fmax=self.config.FMAX
+            # Other parameters like htk, fmin_aug_range, fmax_aug_range use defaults
+        )
+        self.spectrogram_generator.eval()
 
     def _load_taxonomy(self):
         """Load taxonomy data from CSV specified in config."""
@@ -103,49 +81,27 @@ class BirdCLEF2025Pipeline:
             raise
 
     # --- Audio Processing Methods (Kept within Pipeline, using config) --- #
-    # Note: Consider moving these to utils.py if used elsewhere
-
-    def audio_to_melspec(self, audio_data):
-        """Convert audio segment to mel spectrogram using config parameters."""
-        if np.isnan(audio_data).any():
-            mean_signal = np.nanmean(audio_data)
-            audio_data = np.nan_to_num(audio_data, nan=mean_signal)
-
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio_data,
-            sr=self.config.FS,
-            n_fft=self.config.N_FFT,
-            hop_length=self.config.HOP_LENGTH,
-            n_mels=self.config.N_MELS,
-            fmin=self.config.FMIN,
-            fmax=self.config.FMAX,
-            power=2.0
-        )
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-        # Normalize
-        min_val = mel_spec_db.min()
-        max_val = mel_spec_db.max()
-        if max_val > min_val:
-            mel_spec_norm = (mel_spec_db - min_val) / (max_val - min_val)
-        else:
-            mel_spec_norm = np.zeros_like(mel_spec_db)
-        return mel_spec_norm
 
     def process_audio_segment(self, audio_data):
-        """Process a 5-second audio segment for model input."""
-        target_len = int(self.config.TARGET_DURATION * self.config.FS)
-        if len(audio_data) < target_len:
-            audio_data = np.pad(audio_data, (0, target_len - len(audio_data)), mode='constant')
-        elif len(audio_data) > target_len:
-            audio_data = audio_data[:target_len] # Ensure exact length
+        """Process a 5-second audio segment for model input using AugmentMelSTFT."""
+        target_len_samples = int(self.config.TARGET_DURATION * self.config.FS)
+        
+        if not isinstance(audio_data, np.ndarray):
+            audio_data = np.array(audio_data, dtype=np.float32)
 
-        mel_spec = self.audio_to_melspec(audio_data)
+        if len(audio_data) < target_len_samples:
+            audio_data = np.pad(audio_data, (0, target_len_samples - len(audio_data)), mode='constant')
+        elif len(audio_data) > target_len_samples:
+            audio_data = audio_data[:target_len_samples]
 
-        # Resize if necessary to match TARGET_SHAPE
-        if mel_spec.shape != self.config.TARGET_SHAPE:
-            mel_spec = cv2.resize(mel_spec, self.config.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
+        audio_tensor = torch.from_numpy(audio_data.astype(np.float32))
 
-        return mel_spec.astype(np.float32)
+        with torch.no_grad():
+            mel_spec_tensor = self.spectrogram_generator(audio_tensor.unsqueeze(0))
+        
+        mel_spec_numpy = mel_spec_tensor.squeeze(0).cpu().numpy()
+
+        return mel_spec_numpy.astype(np.float32)
 
     def find_model_files(self):
         """
@@ -189,7 +145,20 @@ class BirdCLEF2025Pipeline:
             try:
                 print(f"Loading model: {model_path}")
                 checkpoint = torch.load(model_path, map_location=torch.device(self.config.device))
-                model = self.BirdCLEFModel(self.config, self.num_classes)
+                
+                # Instantiate EfficientAT model using get_efficient_at_model
+                # Assuming config.model_name is like 'mn10_as' or similar for pretrained_name for EfficientAT
+                # And that width_mult, head_type are suitable with defaults or set in config if different
+                model = get_efficient_at_model(
+                    num_classes=config.num_classes,          
+                    pretrained_name="mn10_as",               
+                    width_mult=1.0,                         
+                    head_type="mlp",                         
+                    input_dim_f=config.TARGET_SHAPE[0],      # 128 mels
+                    input_dim_t=config.TARGET_SHAPE[1]       # 500 time frames
+                    # se_dims, se_agg, se_r will use defaults from get_model which are suitable
+                )
+                
                 model.load_state_dict(checkpoint['model_state_dict'])
                 model = model.to(self.config.device)
                 model.eval()
@@ -236,9 +205,6 @@ class BirdCLEF2025Pipeline:
             print(f"Debug mode enabled, using only {self.config.debug_limit_files} files")
             test_files = test_files[:self.config.debug_limit_files]
         print(f"Found {len(test_files)} test soundscapes")
-        if not test_files:
-            print("No test files found. Exiting.")
-            return [], []
 
         # --- Stage 1: Parallel Preprocessing --- 
         print("Starting parallel preprocessing of audio files...")
@@ -302,8 +268,8 @@ class BirdCLEF2025Pipeline:
         print("Starting batched inference...")
         start_inference = time.time()
         all_predictions = []
-        # Define normalization transform once
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # Define normalization transform once -- REMOVE THIS, NOT NEEDED FOR EFFICIENTAT
+        # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         num_total_specs = all_specs_np.shape[0]
 
         for i in tqdm(range(0, num_total_specs, self.config.inference_batch_size), desc="Inference Batches"):
@@ -316,11 +282,16 @@ class BirdCLEF2025Pipeline:
                 # Apply TTA to the numpy batch
                 tta_batch_np = np.array([self.apply_tta(spec, tta_idx) for spec in batch_specs_np])
                 
-                # Convert TTA'd batch to normalized tensor
+                # Convert TTA'd batch to tensor for EfficientAT
+                # Spectrograms from process_audio_segment are (N_MELS, 1000)
                 batch_tensor = torch.tensor(tta_batch_np, dtype=torch.float32)
-                batch_tensor = batch_tensor.unsqueeze(1).repeat(1, 3, 1, 1) 
+                # Add channel dimension: (Batch, Channels, Mels, Time) -> (B, 1, N_MELS, 1000)
+                batch_tensor = batch_tensor.unsqueeze(1) 
                 batch_tensor = batch_tensor.to(self.config.device)
-                batch_tensor = normalize(batch_tensor)
+                
+                # REMOVE: 3-channel repeat and ImageNet normalization
+                # batch_tensor = batch_tensor.repeat(1, 3, 1, 1) 
+                # batch_tensor = normalize(batch_tensor)
                 
                 # --- Ensemble Logic --- 
                 batch_model_preds = []
@@ -434,10 +405,7 @@ class BirdCLEF2025Pipeline:
         
         # 2. Run Inference (Now includes parallel preprocessing)
         row_ids, predictions = self.run_inference()
-        if not row_ids:
-            print("Inference failed or produced no results. Exiting.")
-            return
-            
+    
         # 3. Create Submission
         submission_df = self.create_submission(row_ids, predictions)
         
@@ -463,7 +431,7 @@ if __name__ == "__main__":
         # Might already be set or not applicable
         print("Could not set multiprocessing start method (might be already set or unsupported).")
         pass 
-        
+
     print(f"Initializing pipeline with device: {config.device}")
     pipeline = BirdCLEF2025Pipeline(config) # Pass the imported config
     pipeline.run()

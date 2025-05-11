@@ -62,7 +62,7 @@ class Config:
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
-    epochs = 10
+    epochs = 10 # 10
     train_batch_size = 32
     val_batch_size = 64
     use_amp = False
@@ -78,17 +78,17 @@ class Config:
     selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
-    lr = 1.5e-4
+    lr = 1.5e-4 #0.0005759790964526907
     min_lr = 1e-6
-    weight_decay = 0
+    weight_decay = 0.0 #1.3461944764663799e-05
 
     scheduler = 'CosineAnnealingLR' 
-    T_max = epochs 
+    T_max = 20 # epochs # Set T_max to 20 for a slower decay over 10 epochs
 
     # --- Augmentation Parameters ---
     # Batch-level augmentations (Mixup/CutMix)
-    batch_augment_prob = 1.0     # Probability of applying Mixup OR CutMix to a batch
-    mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
+    batch_augment_prob = 1.0 #1.0     # Probability of applying Mixup OR CutMix to a batch
+    mixup_vs_cutmix_ratio = 1.0 #1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
     mixup_alpha = 0.3901120986458487 
     cutmix_alpha = 1.0           
 
@@ -118,5 +118,7 @@ class Config:
     BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.25 # Threshold for BirdNET-generated pseudo labels
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
+
+    DEBUG_VALIDATE_FIRST_BATCH_ONLY = False # Set to True to test validation freeze
 
 config = Config()

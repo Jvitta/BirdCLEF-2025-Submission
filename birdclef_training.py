@@ -41,6 +41,20 @@ from models.efficient_at.mn.model import get_model as get_efficient_at_model
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
+# Define the SuppressPrint context manager
+class SuppressPrint:
+    def __enter__(self):
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout.close()
+        sys.stdout = self._original_stdout
+        sys.stderr.close()
+        sys.stderr = self._original_stderr
+
 def config_to_dict(cfg):
     return {key: value for key, value in cfg.__dict__.items() if not key.startswith('__') and not callable(value)}
 
@@ -396,7 +410,7 @@ def get_scheduler(optimizer, config):
     if config.scheduler == 'CosineAnnealingLR':
         scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=config.epochs,
+            T_max=config.T_max,
             eta_min=config.min_lr
         )
     elif config.scheduler == 'ReduceLROnPlateau':
@@ -608,6 +622,7 @@ def validate(model, loader, criterion, device):
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
+            print(f"DEBUG: Validation step {step}, processing batch...") # DEBUG PRINT
             if batch is None:
                 print(f"Warning: Skipping None validation batch at step {step}")
                 continue
@@ -615,19 +630,35 @@ def validate(model, loader, criterion, device):
             try:
                 inputs = batch['melspec'].to(device)
                 targets = batch['target'].to(device)
+                # DEBUG PRINT - Log filenames if available, otherwise samplenames
+                if 'filename' in batch:
+                    print(f"DEBUG: Validation step {step}, batch loaded. Filenames (first 5): {batch['filename'][:5]}")
+                elif 'samplename' in batch:
+                    print(f"DEBUG: Validation step {step}, batch loaded. Samplenames (first 5): {batch['samplename'][:5]}")
+                else:
+                    print(f"DEBUG: Validation step {step}, batch loaded. No filename/samplename key in batch.")
 
             except (AttributeError, TypeError) as e:
                 print(f"Error: Skipping validation batch {step} due to unexpected format: {e}")
                 continue
 
+            print(f"DEBUG: Validation step {step}, about to run model forward pass.") # DEBUG PRINT
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
                 model_output = model(inputs)
                 outputs = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
+                print(f"DEBUG: Validation step {step}, model forward pass complete.") # DEBUG PRINT
                 loss = criterion(outputs, targets)
+                print(f"DEBUG: Validation step {step}, loss calculated.") # DEBUG PRINT
 
             all_outputs_list.append(outputs.float().cpu().numpy())
             all_targets_list.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
             losses.append(loss.item())
+
+            # ---- DEBUG: VALIDATE FIRST BATCH ONLY ----
+            if config.DEBUG_VALIDATE_FIRST_BATCH_ONLY and step == 0:
+                print(f"DEBUG: Processed first validation batch (step {step}). Exiting validation loop due to DEBUG_VALIDATE_FIRST_BATCH_ONLY=True.")
+                break # Exit after the first batch
+            # ---- END DEBUG ----
 
             if config.debug and (step + 1) >= config.debug_limit_batches:
                 print(f"DEBUG: Stopping validation early after {config.debug_limit_batches} batches.")
@@ -848,15 +879,16 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             print("\nSetting up model, optimizer, criterion, scheduler...")
             # model = BirdCLEFModel(config).to(config.device) # Old model instantiation
             # New model instantiation using EfficientAT's get_model
-            model = get_efficient_at_model(
-                num_classes=config.num_classes,          # From your config
-                pretrained_name="mn10_as",               # Specific EfficientAT model
-                width_mult=1.0,                          # Implied by "mn10"
-                head_type="mlp",                         # Common head for these models
-                input_dim_f=config.TARGET_SHAPE[0],      # 128 mels
-                input_dim_t=config.TARGET_SHAPE[1]       # 500 time frames
-                # se_dims, se_agg, se_r will use defaults from get_model which are suitable
-            ).to(config.device)
+            with SuppressPrint():
+                model = get_efficient_at_model(
+                    num_classes=config.num_classes,          
+                    pretrained_name="mn10_as",               
+                    width_mult=1.0,                         
+                    head_type="mlp",                         
+                    input_dim_f=config.TARGET_SHAPE[0],      # 128 mels
+                    input_dim_t=config.TARGET_SHAPE[1]       # 500 time frames
+                    # se_dims, se_agg, se_r will use defaults from get_model which are suitable
+                ).to(config.device)
             
             optimizer = get_optimizer(model, config)
             criterion = get_criterion(config)
