@@ -12,6 +12,8 @@ import traceback
 import cv2         
 import librosa      
 from tqdm.auto import tqdm 
+import torch
+from models.efficient_at.preprocess import AugmentMelSTFT
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
@@ -24,6 +26,19 @@ warnings.filterwarnings("ignore")
 
 random.seed(config.seed)
 np.random.seed(config.seed)
+
+# Initialize the EfficientAT spectrogram generator globally
+# Rely on AugmentMelSTFT's internal defaults for sr, win_length, hopsize, n_mels, n_fft, fmin, fmax.
+# Explicitly disable training-time augmentations (freqm, timem) for NPZ generation.
+efficient_at_spectrogram_generator = AugmentMelSTFT(
+    freqm=0,  # Disable Frequency Masking for NPZ generation
+    timem=0   # Disable Time Masking for NPZ generation
+    # Defaults used from AugmentMelSTFT:
+    # sr=32000, n_mels=128, win_length=800, hopsize=320, n_fft=1024
+    # fmin=0.0
+    # fmax=sr // 2 - fmax_aug_range // 2 = 15000 (with default fmax_aug_range=2000)
+)
+efficient_at_spectrogram_generator.eval() # Set to evaluation mode
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""
@@ -203,20 +218,31 @@ def _extract_random_chunk(audio_long, target_samples):
     start_idx_5s = random.randint(0, max_start_idx_5s)
     return audio_long[start_idx_5s : start_idx_5s + target_samples]
 
-def _generate_spectrogram_from_chunk(audio_chunk_5s, config):
-    """Generates a mel spectrogram from an audio chunk, optionally resizes."""
+def _generate_spectrogram_from_chunk(audio_chunk_5s, config_obj):
+    """Generates a mel spectrogram from an audio chunk using EfficientAT's method, then resizes."""
     try:
-        raw_spec_chunk = utils.audio2melspec(audio_chunk_5s, config)
-        if raw_spec_chunk is None:
+        if not isinstance(audio_chunk_5s, np.ndarray) or audio_chunk_5s.ndim != 1:
+            print(f"Warning: audio_chunk_5s is not a 1D numpy array. Shape: {audio_chunk_5s.shape if hasattr(audio_chunk_5s, 'shape') else 'N/A'}")
             return None
         
-        resized_spec = cv2.resize(raw_spec_chunk, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
-        if resized_spec.shape == tuple(config.TARGET_SHAPE):
-            return resized_spec.astype(np.float32)
-        else:
-            print(f"Warning: Resized spec has wrong shape {resized_spec.shape} (expected {config.TARGET_SHAPE})")
+        audio_tensor = torch.from_numpy(audio_chunk_5s.astype(np.float32))
+
+        with torch.no_grad():
+            # The AugmentMelSTFT expects input shape (batch, time) or (time)
+            # We process one chunk at a time, so unsqueeze to add batch dim for the conv1d preemphasis.
+            raw_spec_chunk_tensor = efficient_at_spectrogram_generator(audio_tensor.unsqueeze(0))
+
+        # Remove batch dimension and convert to numpy: (1, n_mels, n_frames) -> (n_mels, n_frames)
+        raw_spec_chunk_numpy = raw_spec_chunk_tensor.squeeze(0).cpu().numpy()
+
+        if raw_spec_chunk_numpy is None or raw_spec_chunk_numpy.ndim != 2:
+            print(f"Warning: Spectrogram generation failed or resulted in non-2D array for a chunk.")
             return None
+
+        return raw_spec_chunk_numpy.astype(np.float32)
+
     except Exception as e:
+        print(f"Error in _generate_spectrogram_from_chunk with EfficientAT: {e}")
         return None
 
 def _process_primary_for_chunking(args):

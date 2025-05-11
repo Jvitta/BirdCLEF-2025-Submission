@@ -11,3 +11,5 @@ annotator_ui/annotated_segments.csv
 data/raw_data/
 outputs
 eda/plots
+
+resources/

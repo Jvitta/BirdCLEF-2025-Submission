@@ -45,7 +45,7 @@ class Config:
     N_MELS = 136
     FMIN = 20
     FMAX = 16000
-    TARGET_SHAPE = (256, 256)
+    TARGET_SHAPE = (128, 500)
 
     model_name = 'efficientnet_b0'
     pretrained = True
