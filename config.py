@@ -17,6 +17,7 @@ class Config:
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
     PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
+    PREPROCESSED_NPZ_PATH_VAL = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms_val.npz')
     MODEL_INPUT_DIR = MODEL_OUTPUT_DIR
 
     # These derived paths use the mount point

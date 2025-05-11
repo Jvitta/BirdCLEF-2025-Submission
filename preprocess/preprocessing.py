@@ -14,6 +14,7 @@ import librosa
 from tqdm.auto import tqdm 
 import torch
 from models.efficient_at.preprocess import AugmentMelSTFT
+import argparse
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
@@ -23,6 +24,11 @@ from config import config
 import utils as utils 
 
 warnings.filterwarnings("ignore")
+
+parser = argparse.ArgumentParser(description="Preprocess audio data for BirdCLEF.")
+parser.add_argument("--mode", type=str, choices=["train", "val"], default="train",
+                    help="Preprocessing mode: 'train' for augmented spectrograms, 'val' for fixed-setting spectrograms.")
+cmd_args = parser.parse_args()
 
 random.seed(config.seed)
 np.random.seed(config.seed)
@@ -40,6 +46,18 @@ efficient_at_spectrogram_generator = AugmentMelSTFT(
             fmin_aug_range=config.FMIN_AUG_RANGE, # Use config or default
             fmax_aug_range=config.FMAX_AUG_RANGE # Use config or default (e.g., 1000)
         )
+
+output_npz_path = ""
+
+if cmd_args.mode == "train":
+    print("--- Running Preprocessing in TRAIN mode (augmented) ---")
+    output_npz_path = config.PREPROCESSED_NPZ_PATH
+else:
+    print("--- Running Preprocessing in VAL mode (fixed settings) ---")
+    efficient_at_spectrogram_generator.eval()
+    output_npz_path = config.PREPROCESSED_NPZ_PATH_VAL
+
+os.makedirs(os.path.dirname(output_npz_path), exist_ok=True)
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""
@@ -546,8 +564,8 @@ def _report_summary(total_tasks, processed_count, error_count, skipped_files, er
         if len(errors_list) > 20: print(f"... and {len(errors_list) - 20} more.")
     print("-" * 26)
 
-def _save_spectrogram_npz(grouped_results, config, project_root):
-    """Determines path and saves the spectrogram dictionary to an NPZ file."""
+def _save_spectrogram_npz(grouped_results, determined_output_path, project_root_unused):
+    """Saves the spectrogram dictionary to the determined NPZ file path."""
     if not grouped_results:
         print("No spectrograms were successfully generated to save.")
         return
@@ -555,28 +573,16 @@ def _save_spectrogram_npz(grouped_results, config, project_root):
     num_saved_files = len(grouped_results)
     total_chunks = sum(arr.shape[0] for arr in grouped_results.values() if arr is not None and hasattr(arr, 'shape'))
 
-    # Determine the output NPZ path based on debug mode
-    if config.debug:
-        debug_output_dir = os.path.join(project_root, "outputs", "preprocessed")
-        output_npz_path = os.path.join(debug_output_dir, "debug_spectrograms2.npz")
-    else:
-        output_npz_path = config.PREPROCESSED_NPZ_PATH
-
-    # Ensure the output directory exists
-    output_dir = os.path.dirname(output_npz_path)
-    os.makedirs(output_dir, exist_ok=True) # exist_ok=True prevents error if dir exists
-
-    print(f"Saving {num_saved_files} primary file entries (total {total_chunks} chunks) to: {output_npz_path}")
+    print(f"Saving {num_saved_files} primary file entries (total {total_chunks} chunks) to: {determined_output_path}")
     start_save = time.time()
     try:
-        np.savez_compressed(output_npz_path, **grouped_results)
+        np.savez_compressed(determined_output_path, **grouped_results)
         end_save = time.time()
         print(f"NPZ saving took {end_save - start_save:.2f} seconds.")
     except Exception as e_save:
         print(f"CRITICAL ERROR saving NPZ file: {e_save}")
         print(traceback.format_exc())
         print("Spectrogram data is likely lost. Check disk space and permissions.")
-        # Depending on desired behavior, might want to raise or exit
         sys.exit(1)
 
 def generate_and_save_spectrograms(df, config):
@@ -620,7 +626,7 @@ def generate_and_save_spectrograms(df, config):
     _report_summary(len(tasks), processed_count, error_count, skipped_files, errors_list)
 
     # 7. Save NPZ file (pass project_root needed for debug path construction)
-    _save_spectrogram_npz(grouped_results, config, project_root)
+    _save_spectrogram_npz(grouped_results, output_npz_path, project_root)
 
     end_time_gen = time.time()
     print(f"--- Spectrogram generation and saving finished in {end_time_gen - start_time_gen:.2f} seconds ---")
