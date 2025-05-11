@@ -81,6 +81,8 @@ ANNOTATION_COLUMNS = ["filename", "center_time_s", "primary_label", "annotation_
 if os.path.exists(OUTPUT_ANNOTATIONS_FILE):
     try:
         annotations_df = pd.read_csv(OUTPUT_ANNOTATIONS_FILE)
+        if 'filename' in annotations_df.columns:
+            annotations_df['filename'] = annotations_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
         # Ensure all defined columns exist
         for col in ANNOTATION_COLUMNS:
             if col not in annotations_df.columns:
@@ -142,21 +144,17 @@ else:
     annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
 
 
-# Ensure filename is string, even if DF was just created
-if 'filename' in annotations_df.columns:
-    annotations_df['filename'] = annotations_df['filename'].astype(str)
-else: # if annotations_df was created totally empty from an exception path without columns
-    annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS) # Re-initialize to be safe with all columns
-    # And repeat dtype logic one last time if reinitialized
+# Ensure filename is string and normalized even if DF was just created or had issues
+if 'filename' not in annotations_df.columns:
+    # Re-initialize if filename column is still missing after all attempts
+    annotations_df = pd.DataFrame(columns=ANNOTATION_COLUMNS)
     for col in ANNOTATION_COLUMNS:
-        if col == "is_low_quality":
-            annotations_df[col] = pd.Series(dtype='bool')
-        elif col in ["center_time_s"]:
-            annotations_df[col] = pd.Series(dtype='float')
-        else:
-            annotations_df[col] = pd.Series(dtype='object')
+        if col == "is_low_quality": annotations_df[col] = pd.Series(dtype='bool')
+        elif col == "center_time_s": annotations_df[col] = pd.Series(dtype='float')
+        else: annotations_df[col] = pd.Series(dtype='object')
     annotations_df['is_low_quality'] = annotations_df['is_low_quality'].astype(bool)
-    annotations_df['filename'] = annotations_df['filename'].astype(str)
+
+annotations_df['filename'] = annotations_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
 
 
 def save_annotation(selected_species_folder, selected_audio_basename, center_time_str):
@@ -172,7 +170,7 @@ def save_annotation(selected_species_folder, selected_audio_basename, center_tim
         if center_s < 0:
             return "Timestamp must be non-negative.", annotations_df_to_display()
 
-        filename_relative = os.path.join(selected_species_folder, selected_audio_basename)
+        filename_relative = (selected_species_folder + '/' + selected_audio_basename).replace(os.sep, '/')
         primary_label = get_primary_label(filename_relative, main_train_df)
 
         new_annotation = pd.DataFrame([{\
@@ -209,20 +207,28 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         "Then click 'Save Annotation'."
     )
 
+    # State components to track audio paths without UI resets
+    no_bn_audio_state = gr.State(value=None)
+    with_bn_audio_state = gr.State(value=None)
+
     with gr.Row():
         with gr.Column(scale=2):
             species_folder_dropdown = gr.Dropdown(choices=species_folders_list, label="Select Species Folder")
             audio_file_dropdown_no_bn = gr.Dropdown(choices=[], label="Select Audio File (No BirdNET Detections)", interactive=True)
             audio_file_dropdown_with_bn = gr.Dropdown(choices=[], label="Select Audio File (Has BirdNET Detections)", interactive=True)
+        
         with gr.Column(scale=1):
             gr.Markdown("### Species Information")
             scientific_name_md = gr.Markdown("**Scientific Name:** N/A")
             common_name_md = gr.Markdown("**Common Name:** N/A")
             class_name_md = gr.Markdown("**Class:** N/A")
             file_annotation_count_md = gr.Markdown("**Annotations for this file:** N/A")
+        
+        with gr.Column(scale=1):
             birdnet_detections_md = gr.Markdown("#### Top BirdNET Detections:\nN/A")
     
-    audio_player = gr.Audio(label="Audio Player", type="filepath", interactive=False, elem_id="audio_player_element")
+    audio_player_no_bn = gr.Audio(label="Audio Player (No BirdNET File)", type="filepath", interactive=False, elem_id="audio_player_no_bn_elem")
+    audio_player_with_bn = gr.Audio(label="Audio Player (BirdNET File)", type="filepath", interactive=False, elem_id="audio_player_with_bn_elem")
     
     center_time_js_output = gr.Textbox(label="Segment Center Time (JS)", interactive=True, elem_id="center_time_js_output_elem")
 
@@ -234,10 +240,11 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         # Initialize updates for two dropdowns
         audio_choices_no_bn_update = gr.update(choices=[], value=None, interactive=True)
         audio_choices_with_bn_update = gr.update(choices=[], value=None, interactive=True)
-        audio_player_update = None
-        center_time_update = ""
-        birdnet_detections_text = "#### Top BirdNET Detections:\nN/A"
-        file_annotations_text = "**Annotations for this file:** N/A"
+        
+        # These will be updated by file selection, not species selection directly
+        # So we send gr.update() to signify no change from this function
+        bn_detections_update = gr.update()
+        file_annotations_update = gr.update()
 
         if selected_species_folder and selected_species_folder in audio_data_structure:
             all_files_in_folder = audio_data_structure[selected_species_folder]
@@ -246,52 +253,55 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             low_quality_files_in_folder_set = set()
 
             if not annotations_df.empty and 'filename' in annotations_df.columns:
-                prefix_to_check = selected_species_folder + os.path.sep
+                # Normalize prefix_to_check to use forward slashes for startswith
+                prefix_to_check = (selected_species_folder + '/').replace(os.sep, '/')
                 relevant_annotations = annotations_df[annotations_df['filename'].str.startswith(prefix_to_check, na=False)]
                 if not relevant_annotations.empty:
-                    # Get files that have ANY 'is_low_quality' == True entry
                     if 'is_low_quality' in relevant_annotations.columns:
+                         # Ensure paths in this set also use forward slashes if derived from annotations_df
                          low_quality_files_in_folder_set = set(relevant_annotations[relevant_annotations['is_low_quality'] == True]['filename'])
                     
-                    # Count all annotations for files not in the low_quality_set for the "max 3" rule
-                    # This count will be used for files that are NOT low quality.
+                    # User's original counting logic for filtering (counts all annotations for relevant files initially)
                     file_annotation_counts_in_folder = relevant_annotations['filename'].value_counts()
             
             files_to_consider_for_dropdowns = []
             for file_basename in all_files_in_folder:
-                relative_path = os.path.join(selected_species_folder, file_basename)
+                # Construct and normalize relative_path to use forward slashes for comparisons
+                relative_path_normalized = (selected_species_folder + '/' + file_basename).replace(os.sep, '/')
 
-                # Filter 0: If marked as low quality (any entry for this file is LQ), skip
-                if relative_path in low_quality_files_in_folder_set:
+                # Filter 0: If marked as low quality
+                if relative_path_normalized in low_quality_files_in_folder_set:
                     continue
 
                 # Filter 1: Check annotation count (for non-low-quality files)
-                if file_annotation_counts_in_folder.get(relative_path, 0) < 3:
-                    full_file_path = os.path.join(config.train_audio_dir, relative_path)
-                    try:
-                        duration = librosa.get_duration(path=full_file_path)
-                        # Filter 2: Check duration
-                        if duration < 5.0:
-                            # Optional: print(f"Skipping {relative_path} due to duration {duration:.2f}s < 5s")
-                            continue 
-                    except Exception as e:
-                        print(f"Warning: Could not get duration for {relative_path}: {e}. Skipping file.")
-                        continue
-                    
-                    files_to_consider_for_dropdowns.append(file_basename)
+                # Files with 3 or more annotations are skipped for the dropdowns
+                if file_annotation_counts_in_folder.get(relative_path_normalized, 0) >= 3:
+                    continue
+                
+                # Construct full_file_path using os.path.join for librosa, as it handles OS-specific paths
+                full_file_path = os.path.join(config.train_audio_dir, selected_species_folder, file_basename)
+                try:
+                    duration = librosa.get_duration(filename=full_file_path) 
+                    if duration < 5.0:
+                        continue 
+                except Exception as e:
+                    print(f"Warning: Could not get duration for {full_file_path}: {e}. Skipping file.")
+                    continue
+                
+                files_to_consider_for_dropdowns.append(file_basename)
             
             choices_no_bn = []
-            choices_with_bn_intermediate = [] # Store (basename, max_confidence) for sorting
+            choices_with_bn_intermediate = [] 
 
             for file_basename in files_to_consider_for_dropdowns:
-                relative_path_os_specific = os.path.join(selected_species_folder, file_basename)
-                lookup_key_for_birdnet = relative_path_os_specific.replace(os.path.sep, '/')
+                # Normalize path for BirdNET lookup key
+                relative_path_lookup_key = (selected_species_folder + '/' + file_basename).replace(os.sep, '/')
                 
                 has_any_birdnet_detection = False
                 max_confidence_for_file = 0.0 # Default for sorting if no valid dets
 
-                if lookup_key_for_birdnet in all_birdnet_detections:
-                    bn_dets_raw = all_birdnet_detections[lookup_key_for_birdnet]
+                if relative_path_lookup_key in all_birdnet_detections:
+                    bn_dets_raw = all_birdnet_detections[relative_path_lookup_key]
                     if bn_dets_raw is not None: 
                         # Process bn_dets_raw to a list of detection dicts to find max confidence
                         actual_detections = []
@@ -334,12 +344,12 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             else:
                 print("Info: taxonomy_df is not loaded or 'primary_label' column is missing.")
         
-        # Return updates for both dropdowns and the new markdown
+        # Return updates for dropdowns, species info, and placeholders for other metadata
         return (
             audio_choices_no_bn_update, audio_choices_with_bn_update, 
-            audio_player_update, center_time_update, 
             sci_name_text, com_name_text, cls_name_text, 
-            birdnet_detections_text, file_annotations_text
+            bn_detections_update, 
+            file_annotations_update 
         )
 
     species_folder_dropdown.change(
@@ -347,89 +357,77 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         inputs=species_folder_dropdown, 
         outputs=[
             audio_file_dropdown_no_bn, audio_file_dropdown_with_bn, 
-            audio_player, center_time_js_output, 
             scientific_name_md, common_name_md, class_name_md,
-            birdnet_detections_md, file_annotation_count_md
+            birdnet_detections_md, file_annotation_count_md # These are correctly placeholders
         ]
     )
 
-    def update_audio_player_and_bn_info(sel_species_folder, sel_audio_basename):
-        audio_player_path = None
-        center_time_val = ""
-        bn_info_text = "#### Top BirdNET Detections:\nN/A"
-        current_file_annotation_count_text = "**Annotations for this file:** N/A"
+    def update_no_bn_player(species_folder, audio_basename, current_bn_audio_path_state):
+        if not species_folder or not audio_basename:
+            # Return updates that don't change other elements if selection is cleared
+            return None, current_bn_audio_path_state, "#### Top BirdNET Detections:\nN/A", "**Annotations for this file:** N/A", None 
 
-        if sel_species_folder and sel_audio_basename:
-            relative_path = os.path.join(sel_species_folder, sel_audio_basename)
-            full_path = os.path.join(config.train_audio_dir, relative_path)
-            audio_player_path = full_path
-            center_time_val = "" # Clear time textbox
+        relative_path_normalized = (species_folder + '/' + audio_basename).replace(os.sep, '/')
+        full_audio_path = os.path.join(config.train_audio_dir, species_folder, audio_basename)
+        
+        annotation_count = 0
+        if not annotations_df.empty and 'filename' in annotations_df.columns:
+            annotation_count = annotations_df[annotations_df['filename'] == relative_path_normalized].shape[0]
+        annotations_text = f"**Annotations for this file:** {annotation_count}"
+        
+        birdnet_text = "#### Top BirdNET Detections:\nN/A (File from 'No BirdNET Detections' list)"
+        
+        # Update no_bn player, its state, and its specific metadata. BN player path comes from state.
+        return full_audio_path, current_bn_audio_path_state, birdnet_text, annotations_text, full_audio_path 
 
-            # Calculate current annotations for this file
-            if not annotations_df.empty and 'filename' in annotations_df.columns:
-                count = annotations_df[annotations_df['filename'] == relative_path].shape[0]
-                current_file_annotation_count_text = f"**Annotations for this file:** {count}"
+    def update_with_bn_player(species_folder, audio_basename, current_no_bn_audio_path_state):
+        if not species_folder or not audio_basename:
+            return current_no_bn_audio_path_state, None, "#### Top BirdNET Detections:\nN/A", "", None
+
+        relative_path_normalized = (species_folder + '/' + audio_basename).replace(os.sep, '/')
+        full_audio_path = os.path.join(config.train_audio_dir, species_folder, audio_basename)
+        
+        annotations_text = "" # No annotation count for BN files
+        birdnet_text = "#### Top BirdNET Detections:\nN/A"
+
+        if relative_path_normalized in all_birdnet_detections:
+            bn_dets_raw = all_birdnet_detections[relative_path_normalized]
+            detections_to_sort = []
+            if isinstance(bn_dets_raw, np.ndarray):
+                detections_to_sort = [item for item in bn_dets_raw if isinstance(item, dict)]
+            elif isinstance(bn_dets_raw, list):
+                detections_to_sort = [d for d in bn_dets_raw if isinstance(d, dict)]
+            
+            if detections_to_sort:
+                sorted_by_confidence = sorted(detections_to_sort, key=lambda x: x.get('confidence', 0), reverse=True)
+                top_5_by_confidence = sorted_by_confidence[:5]
+                final_top_5_sorted = sorted(top_5_by_confidence, key=lambda x: x.get('start_time') if isinstance(x.get('start_time'), (int, float)) else float('inf'))
+                
+                birdnet_text = "#### Top 5 BirdNET Detections (by confidence, then sorted by Start Time):\n"
+                for i, det in enumerate(final_top_5_sorted):
+                    start = det.get('start_time', 'N/A'); end = det.get('end_time', 'N/A'); conf = det.get('confidence', 0)
+                    start_str = f"{start:.1f}s" if isinstance(start, (int, float)) else str(start)
+                    end_str = f"{end:.1f}s" if isinstance(end, (int, float)) else str(end)
+                    conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else str(conf)
+                    birdnet_text += f"{i+1}. Start: {start_str}, End: {end_str}, Conf: {conf_str}\n"
             else:
-                current_file_annotation_count_text = "**Annotations for this file:** 0"
+                birdnet_text = "#### Top BirdNET Detections:\nNo valid detections found."
+        else:
+            birdnet_text = "#### Top BirdNET Detections:\nFile not in BirdNET records."
+        
+        # Update with_bn player, its state, and its specific metadata. No_BN player path comes from state.
+        return current_no_bn_audio_path_state, full_audio_path, birdnet_text, annotations_text, full_audio_path
 
-            # Fetch and format BirdNET detections
-            lookup_key_for_birdnet = relative_path.replace(os.path.sep, '/')
-
-            if lookup_key_for_birdnet in all_birdnet_detections:
-                bn_dets = all_birdnet_detections[lookup_key_for_birdnet]
-
-                if bn_dets is not None and ((isinstance(bn_dets, np.ndarray) and bn_dets.size > 0) or (isinstance(bn_dets, list) and len(bn_dets) > 0)):
-                    detections_to_sort = []
-                    if isinstance(bn_dets, np.ndarray):
-                        # If bn_dets is a numpy array, assume its elements are the dicts
-                        # Convert to list of dicts, filtering for actual dicts just in case
-                        detections_to_sort = [item for item in bn_dets if isinstance(item, dict)]
-                    elif isinstance(bn_dets, list):
-                        # If it's already a list, filter for dicts
-                        detections_to_sort = [d for d in bn_dets if isinstance(d, dict)]
-                    
-                    if detections_to_sort: # Check if we have a non-empty list of dictionaries
-                        valid_dets = sorted(detections_to_sort, key=lambda x: x.get('confidence', 0), reverse=True)
-                        
-                        bn_info_text = "#### Top BirdNET Detections (Top 5):\n"
-                        for i, det in enumerate(valid_dets[:5]):
-                            start = det.get('start_time', 'N/A')
-                            end = det.get('end_time', 'N/A')
-                            conf = det.get('confidence', 0)
-                            # Ensure start/end are numbers before formatting, otherwise use 'N/A'
-                            start_str = f"{start:.1f}s" if isinstance(start, (int, float)) else str(start)
-                            end_str = f"{end:.1f}s" if isinstance(end, (int, float)) else str(end)
-                            conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else str(conf)
-                            bn_info_text += f"{i+1}. Start: {start_str}, End: {end_str}, Conf: {conf_str}\n"
-                    else:
-                        bn_info_text = "#### Top BirdNET Detections:\nNo valid dictionary-formatted detections found."
-                else:
-                    bn_info_text = "#### Top BirdNET Detections:\nNo detections listed for this file (data is None or empty)."
-            else:
-                bn_info_text = "#### Top BirdNET Detections:\nFile not found in BirdNET detection records."
-
-        return audio_player_path, center_time_val, bn_info_text, current_file_annotation_count_text
-
-    # Event handler for the 'No BirdNET' dropdown
     audio_file_dropdown_no_bn.change(
-        fn=update_audio_player_and_bn_info, # Use new function
-        inputs=[species_folder_dropdown, audio_file_dropdown_no_bn], 
-        outputs=[audio_player, center_time_js_output, birdnet_detections_md, file_annotation_count_md] # Added file_annotation_count_md
-    ).then(
-        fn=lambda: gr.update(value=None), # Clear the other dropdown
-        inputs=None,
-        outputs=[audio_file_dropdown_with_bn]
+        fn=update_no_bn_player,
+        inputs=[species_folder_dropdown, audio_file_dropdown_no_bn, with_bn_audio_state],
+        outputs=[audio_player_no_bn, audio_player_with_bn, birdnet_detections_md, file_annotation_count_md, no_bn_audio_state]
     )
-
-    # Event handler for the 'With BirdNET' dropdown
+    
     audio_file_dropdown_with_bn.change(
-        fn=update_audio_player_and_bn_info, # Use new function
-        inputs=[species_folder_dropdown, audio_file_dropdown_with_bn], 
-        outputs=[audio_player, center_time_js_output, birdnet_detections_md, file_annotation_count_md] # Added file_annotation_count_md
-    ).then(
-        fn=lambda: gr.update(value=None), # Clear the other dropdown
-        inputs=None,
-        outputs=[audio_file_dropdown_no_bn]
+        fn=update_with_bn_player,
+        inputs=[species_folder_dropdown, audio_file_dropdown_with_bn, no_bn_audio_state],
+        outputs=[audio_player_no_bn, audio_player_with_bn, birdnet_detections_md, file_annotation_count_md, with_bn_audio_state]
     )
     
     gr.Markdown("---")
@@ -555,7 +553,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         fn=None, 
         inputs=None, outputs=None, 
         # Pass the ID of the audio player's main div and the target textbox's div
-        js=f"( () => {{ const fn = {js_set_time_func}; fn('audio_player_element', 'center_time_js_output_elem'); }} )()"
+        js=f"( () => {{ const fn = {js_set_time_func}; fn('audio_player_no_bn_elem', 'center_time_js_output_elem'); }} )()"
     )
         
     save_button = gr.Button("Save Annotation")
@@ -588,7 +586,7 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             if center_s < 0:
                 return "Timestamp must be non-negative.", annotations_df_to_display()
 
-            filename_relative = os.path.join(selected_species_folder, selected_audio_basename)
+            filename_relative = (selected_species_folder + '/' + selected_audio_basename).replace(os.sep, '/')
             primary_label = get_primary_label(filename_relative, main_train_df)
 
             new_annotation = pd.DataFrame([{\
@@ -638,23 +636,22 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         elif audio_file_with_bn:
             selected_audio_basename = audio_file_with_bn
         else:
-            return "Please select an audio file to mark as low quality.", annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+            return "Please select an audio file to mark as low quality.", annotations_df_to_display()
 
         if not selected_species_folder:
-            return "Please select a species folder first.", annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+            return "Please select a species folder first.", annotations_df_to_display()
 
-        filename_relative = os.path.join(selected_species_folder, selected_audio_basename)
+        filename_relative = (selected_species_folder + '/' + selected_audio_basename).replace(os.sep, '/') # Normalized path
         
         # Check if already marked as low quality to prevent duplicate low quality entries
-        # The dropdown filtering should prevent this, but as a safeguard:
         if not annotations_df[(annotations_df['filename'] == filename_relative) & (annotations_df['is_low_quality'] == True)].empty:
-            return f"File {filename_relative} is already marked as low quality.", annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+            return f"File {filename_relative} is already marked as low quality.", annotations_df_to_display()
 
         new_low_quality_mark = pd.DataFrame([{
             "filename": filename_relative,
             "center_time_s": np.nan,
-            "primary_label": np.nan, # Per request
-            "annotation_time": np.nan, # Per request
+            "primary_label": np.nan, 
+            "annotation_time": np.nan, 
             "is_low_quality": True
         }])
         
@@ -665,22 +662,27 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
         annotations_df.to_csv(OUTPUT_ANNOTATIONS_FILE, index=False)
         
         msg = f"File {filename_relative} marked as low quality."
-        # Clear dropdowns after marking
-        return msg, annotations_df_to_display(), gr.update(value=None), gr.update(value=None)
+        table_update = annotations_df_to_display()
+        
+        # Only return updates for status message and annotations table
+        return msg, table_update
 
     mark_low_quality_button.click(
         fn=handle_mark_low_quality,
         inputs=[species_folder_dropdown, audio_file_dropdown_no_bn, audio_file_dropdown_with_bn],
-        outputs=[status_message, annotations_table, audio_file_dropdown_no_bn, audio_file_dropdown_with_bn] # Clear dropdowns
+        outputs=[status_message, annotations_table] # Only these two outputs
     ).then(
-        # Also refresh species folder to re-filter dropdowns
+        # This .then() call refreshes dropdown CHOICES and general species info.
+        # Critically, it does NOT change the selected dropdown VALUES or the audio players.
+        # birdnet_detections_md and file_annotation_count_md also remain visually unchanged
+        # because update_audio_file_choices_and_species_info returns gr.update() for them.
         fn=update_audio_file_choices_and_species_info,
         inputs=species_folder_dropdown,
         outputs=[
             audio_file_dropdown_no_bn, audio_file_dropdown_with_bn,
-            audio_player, center_time_js_output,
             scientific_name_md, common_name_md, class_name_md,
-            birdnet_detections_md, file_annotation_count_md
+            birdnet_detections_md, file_annotation_count_md 
+            # Players and center_time_js_output are NOT in this list, so they are not affected by the .then() refresh
         ]
     )
 

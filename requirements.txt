@@ -24,6 +24,9 @@ optuna
 h5py==3.7.0 # From EfficientAT
 wandb==0.13.5 # From EfficientAT (and you use W&B)
 
+#annotator
+gradio
+
 # Environment/Execution
 ipython # For IPython.display used in utils (optional if not running in notebook)
 

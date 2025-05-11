@@ -615,6 +615,7 @@ def validate(model, loader, criterion, device):
             try:
                 inputs = batch['melspec'].to(device)
                 targets = batch['target'].to(device)
+
             except (AttributeError, TypeError) as e:
                 print(f"Error: Skipping validation batch {step} due to unexpected format: {e}")
                 continue
@@ -861,8 +862,25 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             criterion = get_criterion(config)
             scheduler = get_scheduler(optimizer, config)
 
-            scaler = torch.amp.GradScaler(device='cuda', enabled=config.use_amp)
-            print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
+            # Direct import test for GradScaler
+            try:
+                from torch.cuda.amp import GradScaler
+                print("Successfully imported GradScaler from torch.cuda.amp")
+                scaler = GradScaler(enabled=config.use_amp)
+            except ImportError as e:
+                print(f"Failed to import GradScaler from torch.cuda.amp: {e}")
+                print("Attempting import from torch.amp ...")
+                try:
+                    from torch.amp import GradScaler
+                    print("Successfully imported GradScaler from torch.amp")
+                    scaler = GradScaler(enabled=config.use_amp)
+                except ImportError as e2:
+                    print(f"Failed to import GradScaler from torch.amp: {e2}")
+                    print("Disabling AMP as GradScaler cannot be imported.")
+                    config.use_amp = False # Ensure AMP is off if scaler can't be created
+                    scaler = torch.amp.GradScaler(enabled=False) # Dummy for now, will be removed
+            
+            print(f"Automatic Mixed Precision (AMP): {'Enabled' if config.use_amp and scaler.is_enabled() else 'Disabled'}")
 
             best_val_auc = 0.0
             best_epoch = 0

@@ -42,7 +42,7 @@ class Config:
     TARGET_DURATION = 5.0  
     N_FFT = 1024
     HOP_LENGTH = 128
-    N_MELS = 136
+    N_MELS = 128
     FMIN = 20
     FMAX = 16000
     TARGET_SHAPE = (128, 500) # Natural output: 128 mels, 500 time_frames for 5s @ 32kHz sr, 320 hop
@@ -78,9 +78,9 @@ class Config:
     selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
-    lr = 0.0005759790964526907
+    lr = 1.5e-4
     min_lr = 1e-6
-    weight_decay = 1.3461944764663799e-05
+    weight_decay = 0
 
     scheduler = 'CosineAnnealingLR' 
     T_max = epochs 
