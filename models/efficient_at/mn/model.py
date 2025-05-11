@@ -363,5 +363,5 @@ def get_model(num_classes: int = 527, pretrained_name: str = None, width_mult: f
                      head_type=head_type, multihead_attention_heads=multihead_attention_heads,
                      input_dims=input_dims, se_conf=se_conf
                      )
-    print(m)
+    # print(m)
     return m

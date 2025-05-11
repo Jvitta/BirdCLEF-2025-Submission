@@ -1,3 +1,11 @@
+import sys
+import os
+
+models_package_parent_dir = '/kaggle/input'
+if models_package_parent_dir not in sys.path:
+    sys.path.insert(0, models_package_parent_dir)
+    print(f"Added {models_package_parent_dir} to sys.path to locate the 'models' package in /kaggle/input/models/")
+
 import os
 import gc
 import warnings
@@ -5,7 +13,7 @@ import logging
 import time
 import math
 import random
-import cv2 # No longer directly needed here if process_audio_segment is self-contained with it or if cv2 is only for it
+import cv2 
 from pathlib import Path
 import multiprocessing
 from functools import partial
@@ -17,20 +25,15 @@ import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# import timm # No longer directly needed if BirdCLEFModel is replaced
 from tqdm.auto import tqdm
-# import torchvision.transforms as transforms # No longer needed due to EfficientAT's internal normalization
 
-# Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
 from config import config # Import central config
 import birdclef_utils as utils # Import utils
 from birdclef_utils import _preprocess_audio_file_worker # Import the worker
 
 # EfficientAT model and preprocessing
 from models.efficient_at.mn.model import get_model as get_efficient_at_model
-from models.efficient_at.preprocess import AugmentMelSTFT
 
-# Suppress warnings and limit logging output
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
@@ -47,20 +50,8 @@ class BirdCLEF2025Pipeline:
         self.species_ids = []
         self.models = []
         self._load_taxonomy()
-        # Initialize AugmentMelSTFT for spectrogram generation
-        self.spectrogram_generator = AugmentMelSTFT(
-            n_mels=self.config.N_MELS,
-            sr=self.config.FS,
-            win_length=self.config.N_FFT,
-            hopsize=self.config.HOP_LENGTH,
-            n_fft=self.config.N_FFT,
-            freqm=0, # No frequency masking for inference
-            timem=0, # No time masking for inference
-            fmin=self.config.FMIN,
-            fmax=self.config.FMAX
-            # Other parameters like htk, fmin_aug_range, fmax_aug_range use defaults
-        )
-        self.spectrogram_generator.eval()
+        # self.spectrogram_generator = AugmentMelSTFT(...) # REMOVE - Worker handles its own instance
+        # self.spectrogram_generator.eval()
 
     def _load_taxonomy(self):
         """Load taxonomy data from CSV specified in config."""
@@ -79,29 +70,6 @@ class BirdCLEF2025Pipeline:
         except Exception as e:
             print(f"Error loading taxonomy: {e}")
             raise
-
-    # --- Audio Processing Methods (Kept within Pipeline, using config) --- #
-
-    def process_audio_segment(self, audio_data):
-        """Process a 5-second audio segment for model input using AugmentMelSTFT."""
-        target_len_samples = int(self.config.TARGET_DURATION * self.config.FS)
-        
-        if not isinstance(audio_data, np.ndarray):
-            audio_data = np.array(audio_data, dtype=np.float32)
-
-        if len(audio_data) < target_len_samples:
-            audio_data = np.pad(audio_data, (0, target_len_samples - len(audio_data)), mode='constant')
-        elif len(audio_data) > target_len_samples:
-            audio_data = audio_data[:target_len_samples]
-
-        audio_tensor = torch.from_numpy(audio_data.astype(np.float32))
-
-        with torch.no_grad():
-            mel_spec_tensor = self.spectrogram_generator(audio_tensor.unsqueeze(0))
-        
-        mel_spec_numpy = mel_spec_tensor.squeeze(0).cpu().numpy()
-
-        return mel_spec_numpy.astype(np.float32)
 
     def find_model_files(self):
         """
@@ -150,13 +118,12 @@ class BirdCLEF2025Pipeline:
                 # Assuming config.model_name is like 'mn10_as' or similar for pretrained_name for EfficientAT
                 # And that width_mult, head_type are suitable with defaults or set in config if different
                 model = get_efficient_at_model(
-                    num_classes=config.num_classes,          
-                    pretrained_name="mn10_as",               
-                    width_mult=1.0,                         
-                    head_type="mlp",                         
-                    input_dim_f=config.TARGET_SHAPE[0],      # 128 mels
-                    input_dim_t=config.TARGET_SHAPE[1]       # 500 time frames
-                    # se_dims, se_agg, se_r will use defaults from get_model which are suitable
+                    num_classes=self.config.num_classes, # Use self.config
+                    pretrained_name=None,               # Pass None to prevent loading base weights from URL
+                    width_mult=1.0,                     # Explicitly set for mn10_as like architecture
+                    head_type="mlp",                    # Explicitly set for mn10_as like architecture
+                    input_dim_f=self.config.TARGET_SHAPE[0],  # Use self.config
+                    input_dim_t=self.config.TARGET_SHAPE[1]   # Use self.config
                 )
                 
                 model.load_state_dict(checkpoint['model_state_dict'])
@@ -297,8 +264,9 @@ class BirdCLEF2025Pipeline:
                 batch_model_preds = []
                 for model in self.models:
                     with torch.no_grad():
-                        outputs = model(batch_tensor)
-                        probs = torch.sigmoid(outputs)
+                        outputs = model(batch_tensor) # model returns a tuple (logits, features)
+                        logits = outputs[0] # Select the logits
+                        probs = torch.sigmoid(logits) # Apply sigmoid to logits
                         batch_model_preds.append(probs.cpu().numpy())
                         
                 # Average predictions across models for this TTA iteration

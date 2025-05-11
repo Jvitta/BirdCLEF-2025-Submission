@@ -32,26 +32,10 @@ def NAME_TO_WIDTH(name):
     return w
 
 
-import csv
-
-# Load label
-with open('metadata/class_labels_indices.csv', 'r') as f:
-    reader = csv.reader(f, delimiter=',')
-    lines = list(reader)
-
-labels = []
-ids = []    # Each label has a unique id such as "/m/068hy"
-for i1 in range(1, len(lines)):
-    id = lines[i1][1]
-    label = lines[i1][2]
-    ids.append(id)
-    labels.append(label)
-
-classes_num = len(labels)
-
-
+from config import config
 import numpy as np
 
+classes_num = config.num_classes
 
 def exp_warmup_linear_down(warmup, rampdown_length, start_rampdown, last_value):
     rampup = exp_rampup(warmup)

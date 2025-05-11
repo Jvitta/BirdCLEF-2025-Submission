@@ -28,7 +28,6 @@ random.seed(config.seed)
 np.random.seed(config.seed)
 
 efficient_at_spectrogram_generator = AugmentMelSTFT(freqm=0, timem=0)
-efficient_at_spectrogram_generator.eval() 
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""
