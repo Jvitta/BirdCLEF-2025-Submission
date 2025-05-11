@@ -6,8 +6,6 @@ __pycache__
 kaggle_training.py
 wandb/
 
-annotator_ui/annotated_segments.csv
-
 data/raw_data/
 outputs
 eda/plots
