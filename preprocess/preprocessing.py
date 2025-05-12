@@ -281,8 +281,11 @@ def _process_primary_for_chunking(args):
         # This ensures that even if cleaned audio is shorter, we might still try to get multiple versions
         base_duration_for_versions = len(audio_for_birdnet_base) 
         
-        # 1 chunk if audio is too short, otherwise PRECOMPUTE_VERSIONS chunks
-        num_versions_to_generate = 1 if base_duration_for_versions < target_samples else config.PRECOMPUTE_VERSIONS
+        # 1 chunk if audio is too short or in val mode, otherwise PRECOMPUTE_VERSIONS chunks
+        if base_duration_for_versions < target_samples or cmd_args.mode == "val":
+            num_versions_to_generate = 1
+        else:
+            num_versions_to_generate = config.PRECOMPUTE_VERSIONS
 
         use_birdnet_strategy = (
             class_name == 'Aves' and

@@ -159,7 +159,7 @@ class BirdCLEFDataset(Dataset):
                 else:
                     # This case indicates an issue with preprocessing or an unexpected NPZ format.
                     # A warning and a fallback resize is a safe approach.
-                    current_samplename = self.labels_df.iloc[idx]['samplename'] # Use self.labels_df
+                    current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
                     print(f"WARNING: Samplename '{current_samplename}' - "
                           f"loaded chunk shape {raw_selected_chunk_2d.shape} "
                           f"does not match TARGET_SHAPE {expected_shape}. Attempting resize.")
@@ -169,7 +169,7 @@ class BirdCLEFDataset(Dataset):
             else:
                 # This implies select_version_for_training returned None, or an issue during loading from NPZ for this sample.
                 # This is an error condition.
-                current_samplename = self.labels_df.iloc[idx]['samplename'] # Use self.labels_df
+                current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
                 print(f"ERROR: Samplename '{current_samplename}' - "
                       f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
                 spec = np.zeros(tuple(self.config.TARGET_SHAPE), dtype=np.float32)
