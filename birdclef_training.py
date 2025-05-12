@@ -3,65 +3,34 @@ import logging
 import random
 import gc
 import time
-import math
 import warnings
-from pathlib import Path
 import sys
-import glob
-import io
-import argparse
-import multiprocessing
-
+import contextlib
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.optim import lr_scheduler
-from torch.utils.data import Dataset, DataLoader
-from losses import FocalLossBCE
-import torchvision.transforms as transforms
-
-from tqdm.auto import tqdm
-
-import timm
+import cv2
 import matplotlib.pyplot as plt
 import optuna
 import wandb
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
 
 from config import config
 import utils as utils
-import cv2
 from models.efficient_at.mn.model import get_model as get_efficient_at_model
+from losses import FocalLossBCE
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-# Define the SuppressPrint context manager
-class SuppressPrint:
-    def __enter__(self):
-        self._original_stdout = sys.stdout
-        self._original_stderr = sys.stderr
-        sys.stdout = open(os.devnull, 'w')
-        sys.stderr = open(os.devnull, 'w')
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stdout.close()
-        sys.stdout = self._original_stdout
-        sys.stderr.close()
-        sys.stderr = self._original_stderr
-
-def config_to_dict(cfg):
-    return {key: value for key, value in cfg.__dict__.items() if not key.startswith('__') and not callable(value)}
-
 def set_seed(seed=42):
-    """
-    Set seed for reproducibility
-    """
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
@@ -70,8 +39,6 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-set_seed(config.seed)
 
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
@@ -84,28 +51,19 @@ class BirdCLEFDataset(Dataset):
         self.mode = mode
         self.all_spectrograms = all_spectrograms
 
-        # Load taxonomy to map labels to indices
-        try:
-            taxonomy_df = pd.read_csv(self.config.taxonomy_path)
-            self.species_ids = taxonomy_df['primary_label'].tolist()
-            if len(self.species_ids) != self.config.num_classes:
-                print(f"Warning: Taxonomy file has {len(self.species_ids)} species, but config.num_classes is {self.config.num_classes}. Using value from taxonomy.")
-                self.num_classes = len(self.species_ids)
-            else:
-                self.num_classes = self.config.num_classes
-            self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
-        except Exception as e:
-            print(f"Error loading taxonomy CSV from {self.config.taxonomy_path}: {e}")
-            raise
+        # Load taxonomy data
+        taxonomy_df = pd.read_csv(self.config.taxonomy_path)
+        self.species_ids = taxonomy_df['primary_label'].tolist()
+
+        assert len(self.species_ids) == self.config.num_classes, \
+            f"Number of species in taxonomy ({len(self.species_ids)}) does not match config.num_classes ({self.config.num_classes})."
+
+        self.num_classes = self.config.num_classes
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
 
         if self.all_spectrograms is not None:
             print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
             print(f"Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
-            # Optional: Add check if all df samplenames are in all_spectrograms keys
-            missing_keys = set(self.df['samplename']) - set(self.all_spectrograms.keys())
-            if missing_keys:
-                 print(f"Warning: {len(missing_keys)} samplenames from the dataframe are missing in the loaded spectrograms dictionary.")
-                 print(f"Examples: {list(missing_keys)[:5]}")
         elif self.config.LOAD_PREPROCESSED_DATA:
             print(f"Dataset mode '{self.mode}': ERROR - Configured to load preprocessed data, but none provided. Dataset will be empty.")
         else:
@@ -121,7 +79,7 @@ class BirdCLEFDataset(Dataset):
         primary_label = row['primary_label']
         secondary_labels = row.get('secondary_labels', [])
         filename_for_error = row.get('filename', samplename) # Use filename if available
-        data_source = row['data_source'] # <--- ADDED
+        data_source = row['data_source'] 
         
         spec = None # This will hold the final (H_5s, W_5s) processed chunk
 
@@ -746,7 +704,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     
     wandb_run = wandb.init(
         project="BirdCLEF-2025", # Or your preferred project name
-        config=config_to_dict(config),
+        config={key: value for key, value in config.__dict__.items() if not key.startswith('__') and not callable(value)},
         name=run_name,
         group=group_name,
         job_type="train",
@@ -800,10 +758,6 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     elif config.USE_PSEUDO_LABELS:
          print("Warning: Could not filter pseudo-labels by confidence. 'data_source' or 'confidence' column missing.")
     # --- End filtering --- 
-
-    if 'samplename' not in working_df.columns:
-        print("CRITICAL ERROR: 'samplename' column missing from DataFrame passed to run_training. Exiting.")
-        sys.exit(1)
 
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
    
@@ -879,7 +833,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             print("\nSetting up model, optimizer, criterion, scheduler...")
             # model = BirdCLEFModel(config).to(config.device) # Old model instantiation
             # New model instantiation using EfficientAT's get_model
-            with SuppressPrint():
+            with contextlib.redirect_stdout(open(os.devnull, 'w')), contextlib.redirect_stderr(open(os.devnull, 'w')):
                 model = get_efficient_at_model(
                     num_classes=config.num_classes,          
                     pretrained_name="mn10_as",               
@@ -1290,6 +1244,8 @@ if __name__ == "__main__":
     print("\n--- Initializing Training Script ---")
     print(f"Using configuration: LOAD_PREPROCESSED_DATA={config.LOAD_PREPROCESSED_DATA}, USE_PSEUDO_LABELS={config.USE_PSEUDO_LABELS}")
 
+    set_seed(config.seed)
+
     all_spectrograms = None 
 
     print("Loading main training metadata...")
@@ -1312,34 +1268,27 @@ if __name__ == "__main__":
 
     # --- Load Preprocessed Spectrograms (if configured) --- #
     if config.LOAD_PREPROCESSED_DATA:
-        all_spectrograms = {} # Initialize as empty dict if loading
+        all_spectrograms = {} 
         
         # Load PRIMARY spectrograms
         primary_npz_path = config.PREPROCESSED_NPZ_PATH
         print(f"Attempting to load primary spectrograms from: {primary_npz_path}")
-        if os.path.exists(primary_npz_path):
-            try:
-                start_load_time = time.time()
-                with np.load(primary_npz_path) as data_archive:
-                    primary_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Primary Specs")}
-                end_load_time = time.time()
-                all_spectrograms.update(primary_specs)
-                print(f"Successfully loaded {len(primary_specs)} primary samples in {end_load_time - start_load_time:.2f} seconds.")
-                del primary_specs; gc.collect()
-            except Exception as e:
-                print(f"ERROR loading primary NPZ file {primary_npz_path}: {e}")
-                # Decide if this is critical - maybe continue without preloaded?
-                print("Cannot continue without primary preloaded data. Exiting.")
-                sys.exit(1)
-        else:
-            print(f"ERROR: Primary NPZ file {primary_npz_path} not found, but LOAD_PREPROCESSED_DATA is True. Exiting.")
+        try:
+            start_load_time = time.time()
+            with np.load(primary_npz_path) as data_archive:
+                primary_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Primary Specs")}
+            end_load_time = time.time()
+            all_spectrograms.update(primary_specs)
+            print(f"Successfully loaded {len(primary_specs)} primary samples in {end_load_time - start_load_time:.2f} seconds.")
+            del primary_specs; gc.collect()
+        except Exception as e:
+            print(f"CRITICAL ERROR loading primary NPZ file {primary_npz_path}: {e}")
             sys.exit(1)
 
         # --- Conditionally Load PSEUDO-LABEL Data & Spectrograms --- #
         if config.USE_PSEUDO_LABELS:
             print("\n--- Loading Pseudo-Label Data (USE_PSEUDO_LABELS=True) ---")
             
-            # Load pseudo metadata
             try:
                 pseudo_labels_df_full = pd.read_csv(config.train_pseudo_csv_path)
                 if not pseudo_labels_df_full.empty:
@@ -1356,68 +1305,63 @@ if __name__ == "__main__":
                     print(f"Loaded and selected columns (including confidence) for {len(pseudo_labels_df)} pseudo labels.")
                     del pseudo_labels_df_full; gc.collect()
 
-                    # Load pseudo spectrograms (check path exists first)
+                    # Load pseudo spectrograms
                     pseudo_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, 'pseudo_spectrograms.npz')
                     print(f"Attempting to load pseudo spectrograms from: {pseudo_npz_path}")
-                    if os.path.exists(pseudo_npz_path):
-                        try:
-                            start_load_time = time.time()
-                            with np.load(pseudo_npz_path) as data_archive:
-                                pseudo_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Pseudo Specs")}
-                            end_load_time = time.time()
-                            all_spectrograms.update(pseudo_specs) # Merge into the main dictionary
-                            print(f"Successfully loaded and merged {len(pseudo_specs)} pseudo samples in {end_load_time - start_load_time:.2f} seconds.")
-                            del pseudo_specs; gc.collect()
-                            
-                            # Concatenate DataFrames only AFTER successfully loading specs
-                            training_df = pd.concat([training_df, pseudo_labels_df], ignore_index=True)
-                            print(f"Combined DataFrame size: {len(training_df)} samples.")
-                            
-                        except Exception as e:
-                             print(f"ERROR loading pseudo NPZ file {pseudo_npz_path}: {e}")
-                             print("Continuing training without pseudo-labels due to NPZ loading error.")
-                    else:
-                        # Critical Error if NPZ is missing but was expected
-                        print(f"CRITICAL ERROR: Pseudo NPZ file {pseudo_npz_path} not found, but USE_PSEUDO_LABELS is True. Exiting.")
-                        sys.exit(1)
+                    
+                    try:
+                        start_load_time = time.time()
+                        with np.load(pseudo_npz_path) as data_archive:
+                            pseudo_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Pseudo Specs")}
+                        end_load_time = time.time()
+                        all_spectrograms.update(pseudo_specs) # Merge into the main dictionary
+                        print(f"Successfully loaded and merged {len(pseudo_specs)} pseudo samples in {end_load_time - start_load_time:.2f} seconds.")
+                        del pseudo_specs; gc.collect()
+                        
+                        training_df = pd.concat([training_df, pseudo_labels_df], ignore_index=True)
+                        print(f"Combined DataFrame size: {len(training_df)} samples.")
+                        
+                    except Exception as e:
+                         print(f"ERROR loading pseudo NPZ file {pseudo_npz_path}: {e}")
+                         print("Continuing training without pseudo-labels due to NPZ loading error.")
                 else:
                     print("Pseudo labels CSV found but is empty. Skipping.")
 
-            except FileNotFoundError:
-                 # Critical Error if CSV is missing but was expected
-                print(f"CRITICAL ERROR: Pseudo labels CSV {config.train_pseudo_csv_path} not found, but USE_PSEUDO_LABELS is True. Exiting.")
-                sys.exit(1)
             except Exception as e:
                 print(f"CRITICAL ERROR loading or processing pseudo labels CSV {config.train_pseudo_csv_path}: {e}")
-                print("Exiting due to pseudo-label loading error.")
                 sys.exit(1)
         else:
             print("\nSkipping pseudo-label data (USE_PSEUDO_LABELS=False).")
 
     # Final check on combined dataframe and spectrograms
     print(f"\nFinal training dataframe size: {len(training_df)} samples.")
-    if all_spectrograms is not None:
-         print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
-         # Optional: Check for missing keys between final df and loaded specs
-         missing_keys = set(training_df['samplename']) - set(all_spectrograms.keys())
-         if missing_keys:
-              print(f"  WARNING: {len(missing_keys)} samplenames in the final dataframe are missing from the loaded spectrograms!")
-
-    # --- Filter training_df to only include samples with loaded spectrograms --- #
-    if all_spectrograms is not None:
-        print("\nFiltering training dataframe based on loaded spectrogram keys...")
+    
+    # --- Filter training_df based on loaded spectrogram keys only if configured to load them --- #
+    if config.LOAD_PREPROCESSED_DATA:
+        # Removed redundant check: if config.LOAD_PREPROCESSED_DATA is True and script reaches here,
+        # all_spectrograms must be a dictionary (initialized as {} and populated, or exited if primary load failed).
+        # if all_spectrograms is None:
+        #     print("CRITICAL ERROR: config.LOAD_PREPROCESSED_DATA is True, but all_spectrograms is None. Exiting.")
+        #     sys.exit(1)
+            
+        print(f"\nConfigured to load preprocessed data. Filtering dataframe...")
+        print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
+        
+        # Filter dataframe to keep only rows with loaded spectrograms
         original_count = len(training_df)
+
         loaded_keys = set(all_spectrograms.keys())
         training_df = training_df[training_df['samplename'].isin(loaded_keys)].reset_index(drop=True)
         filtered_count = len(training_df)
+        
         removed_count = original_count - filtered_count
         if removed_count > 0:
-            print(f"  Removed {removed_count} samples from training_df because their spectrograms were not found in the loaded NPZ file(s).")
+            print(f"  WARNING: Removed {removed_count} samples from training_df because their spectrograms were not found in the loaded NPZ file(s).")
+        
         print(f"  Final training_df size after filtering: {filtered_count} samples.")
     else:
-        print("\nWarning: all_spectrograms is None, cannot filter training_df by loaded keys.")
+        print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
 
-    # --- Run Training --- #
     run_training(training_df, config, all_spectrograms=all_spectrograms)
 
     print("\nTraining script finished!")
