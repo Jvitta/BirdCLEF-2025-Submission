@@ -136,14 +136,11 @@ class BirdCLEFDataset(Dataset):
                 print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
 
             # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
-            # If preprocessing is correct, it should already be config.PREPROCESS_TARGET_SHAPE.
             if raw_selected_chunk_2d is not None:
                 expected_shape = tuple(self.config.PREPROCESS_TARGET_SHAPE)
                 if raw_selected_chunk_2d.shape == expected_shape:
                     spec = raw_selected_chunk_2d
                 else:
-                    # This case indicates an issue with preprocessing or an unexpected NPZ format.
-                    # A warning and a fallback resize is a safe approach.
                     current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
                     print(f"WARNING: Samplename '{current_samplename}' - "
                           f"loaded chunk shape {raw_selected_chunk_2d.shape} "
@@ -153,7 +150,6 @@ class BirdCLEFDataset(Dataset):
                                       interpolation=cv2.INTER_LINEAR)
             else:
                 # This implies select_version_for_training returned None, or an issue during loading from NPZ for this sample.
-                # This is an error condition.
                 current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
                 print(f"ERROR: Samplename '{current_samplename}' - "
                       f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
@@ -169,7 +165,7 @@ class BirdCLEFDataset(Dataset):
                  print(f"Fallback: Using zeros for '{samplename}'. Raw NPZ shape: {original_shape_info}, Processed spec shape before fallback: {current_spec_shape_info}.")
                  spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
         
-        else: # samplename not found in the pre-loaded spectrogram dictionary
+        else:
             print(f"ERROR: Samplename '{samplename}' not found in pre-loaded dictionary! Using zeros.")
             spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
 
@@ -619,11 +615,7 @@ def validate(model, loader, criterion, device):
                 inputs = batch['melspec'].to(device)
                 targets = batch['target'].to(device)
                 # DEBUG PRINT - Log filenames if available, otherwise samplenames
-                if 'filename' in batch:
-                    print(f"DEBUG: Validation step {step}, batch loaded. Filenames (first 5): {batch['filename'][:5]}")
-                elif 'samplename' in batch:
-                    print(f"DEBUG: Validation step {step}, batch loaded. Samplenames (first 5): {batch['samplename'][:5]}")
-                else:
+                if 'filename' not in batch or 'samplename' not in batch:
                     print(f"DEBUG: Validation step {step}, batch loaded. No filename/samplename key in batch.")
 
             except (AttributeError, TypeError) as e:
@@ -636,17 +628,10 @@ def validate(model, loader, criterion, device):
                 outputs = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
                 print(f"DEBUG: Validation step {step}, model forward pass complete.") # DEBUG PRINT
                 loss = criterion(outputs, targets)
-                print(f"DEBUG: Validation step {step}, loss calculated.") # DEBUG PRINT
 
             all_outputs_list.append(outputs.float().cpu().numpy())
             all_targets_list.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
             losses.append(loss.item())
-
-            # ---- DEBUG: VALIDATE FIRST BATCH ONLY ----
-            if config.DEBUG_VALIDATE_FIRST_BATCH_ONLY and step == 0:
-                print(f"DEBUG: Processed first validation batch (step {step}). Exiting validation loop due to DEBUG_VALIDATE_FIRST_BATCH_ONLY=True.")
-                break # Exit after the first batch
-            # ---- END DEBUG ----
 
             if config.debug and (step + 1) >= config.debug_limit_batches:
                 print(f"DEBUG: Stopping validation early after {config.debug_limit_batches} batches.")

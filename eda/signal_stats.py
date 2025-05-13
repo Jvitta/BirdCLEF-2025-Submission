@@ -20,6 +20,7 @@ if project_root not in sys.path:
 
 from config import config
 from models.efficient_at.preprocess import AugmentMelSTFT # Import spectrogram generator
+from birdclef_training import _apply_adain_transformation # Import AdaIN function
 
 warnings.filterwarnings("ignore")
 
@@ -150,6 +151,10 @@ def main():
     # --- 2. Process ALL Train Audio Chunks (from Precomputed) ---
     print("Processing ALL Train Audio Chunks (from Precomputed NPZ)...")
     processed_train_chunks = 0
+    # Store original train stats separately for comparison
+    original_train_stats = [] 
+    transformed_train_stats = []
+
     try:
         # Open the NPZ file but don't load everything into memory
         with np.load(config.PREPROCESSED_NPZ_PATH) as data:
@@ -162,13 +167,29 @@ def main():
                 spec_chunks_array = data[samplename] # Load data for this key only
                 if spec_chunks_array is not None and spec_chunks_array.ndim == 3 and spec_chunks_array.shape[0] > 0:
                     for i in range(spec_chunks_array.shape[0]):
-                        spec_2d = spec_chunks_array[i]
-                        stats = calculate_signal_stats(spec_2d)
-                        stats['source'] = 'train_audio_all_chunks'
-                        stats['id'] = f"{samplename}_prechunk{i}"
-                        all_stats.append(stats)
+                        spec_2d_original = spec_chunks_array[i]
+                        
+                        # Calculate stats for the original spectrogram
+                        original_stats = calculate_signal_stats(spec_2d_original)
+                        original_stats['source'] = 'train_audio_original' # New source name
+                        original_stats['id'] = f"{samplename}_prechunk{i}_orig"
+                        original_train_stats.append(original_stats)
+
+                        # Apply AdaIN transformation (if enabled in config, which it should be for this test)
+                        if config.APPLY_ADAIN:
+                            spec_2d_transformed = _apply_adain_transformation(spec_2d_original.astype(np.float32), config)
+                            # Calculate stats for the transformed spectrogram
+                            transformed_stats = calculate_signal_stats(spec_2d_transformed)
+                            transformed_stats['source'] = 'train_audio_adain' # New source name
+                            transformed_stats['id'] = f"{samplename}_prechunk{i}_adain"
+                            transformed_train_stats.append(transformed_stats)
+                        
                         processed_train_chunks += 1
         print(f"Processed {processed_train_chunks} individual precomputed chunks from train audio.")
+        all_stats.extend(original_train_stats) # Add original train stats
+        if config.APPLY_ADAIN:
+            all_stats.extend(transformed_train_stats) # Add transformed train stats if AdaIN was applied
+
     except FileNotFoundError as fnf_e:
         print(f"ERROR: Precomputed train audio NPZ file not found: {fnf_e}. Skipping.")
     except Exception as e:
