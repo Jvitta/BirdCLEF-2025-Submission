@@ -48,8 +48,9 @@ class Config:
     FMIN = 20
     FMAX = None
     FMIN_AUG_RANGE = 10
-    FMAX_AUG_RANGE = 2000
-    TARGET_SHAPE = (128, 500) # Natural output: 128 mels, 500 time_frames for 5s @ 32kHz sr, 320 hop
+    FMAX_AUG_RANGE = 1000
+    PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
+    TARGET_SHAPE = (128, 1000) # Final shape for training/inference
 
     model_name = 'mn10_as' # Changed to reflect the new EfficientAT model
     pretrained = True # Pretrained weights will be loaded by the EfficientAT get_model function
@@ -82,12 +83,12 @@ class Config:
     selected_folds = [0, 1, 2, 3, 4]
 
     optimizer = 'AdamW'
-    lr = 0.0005759790964526907
+    lr = 0.0004 #0.0005759790964526907
     min_lr = 1e-6
-    weight_decay = 1.3461944764663799e-05
+    weight_decay = 1e-4 #1.3461944764663799e-05
 
     scheduler = 'CosineAnnealingLR' 
-    T_max = 10 # epochs # Set T_max to 20 for a slower decay over 10 epochs
+    T_max = 15 # epochs # Set T_max to 20 for a slower decay over 10 epochs
 
     # --- Augmentation Parameters ---
     # Batch-level augmentations (Mixup/CutMix)

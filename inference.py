@@ -138,8 +138,8 @@ class BirdCLEF2025Pipeline:
         mel_spec = self.audio_to_melspec(audio_data)
 
         # Resize if necessary to match TARGET_SHAPE
-        if mel_spec.shape != self.config.TARGET_SHAPE:
-            mel_spec = cv2.resize(mel_spec, self.config.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
+        if mel_spec.shape != self.config.PREPROCESS_TARGET_SHAPE:
+            mel_spec = cv2.resize(mel_spec, self.config.PREPROCESS_TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
 
         return mel_spec.astype(np.float32)
 

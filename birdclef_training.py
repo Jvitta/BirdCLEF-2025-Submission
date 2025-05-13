@@ -109,9 +109,9 @@ class BirdCLEFDataset(Dataset):
                 print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
 
             # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
-            # If preprocessing is correct, it should already be config.TARGET_SHAPE.
+            # If preprocessing is correct, it should already be config.PREPROCESS_TARGET_SHAPE.
             if raw_selected_chunk_2d is not None:
-                expected_shape = tuple(self.config.TARGET_SHAPE)
+                expected_shape = tuple(self.config.PREPROCESS_TARGET_SHAPE)
                 if raw_selected_chunk_2d.shape == expected_shape:
                     spec = raw_selected_chunk_2d
                 else:
@@ -120,9 +120,9 @@ class BirdCLEFDataset(Dataset):
                     current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
                     print(f"WARNING: Samplename '{current_samplename}' - "
                           f"loaded chunk shape {raw_selected_chunk_2d.shape} "
-                          f"does not match TARGET_SHAPE {expected_shape}. Attempting resize.")
+                          f"does not match PREPROCESS_TARGET_SHAPE {expected_shape}. Attempting resize.")
                     spec = cv2.resize(raw_selected_chunk_2d,
-                                      (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]),
+                                      (self.config.PREPROCESS_TARGET_SHAPE[1], self.config.PREPROCESS_TARGET_SHAPE[0]),
                                       interpolation=cv2.INTER_LINEAR)
             else:
                 # This implies select_version_for_training returned None, or an issue during loading from NPZ for this sample.
@@ -130,26 +130,26 @@ class BirdCLEFDataset(Dataset):
                 current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
                 print(f"ERROR: Samplename '{current_samplename}' - "
                       f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
-                spec = np.zeros(tuple(self.config.TARGET_SHAPE), dtype=np.float32)
+                spec = np.zeros(tuple(self.config.PREPROCESS_TARGET_SHAPE), dtype=np.float32)
 
             # Ensure spec is float32, as augmentations might change it if not careful
             spec = spec.astype(np.float32)
             
             # Fallback if spec is still None or issues occurred during processing
-            if spec is None or spec.shape != self.config.TARGET_SHAPE:
+            if spec is None or spec.shape != self.config.PREPROCESS_TARGET_SHAPE:
                  original_shape_info = spec_data_from_npz.shape if isinstance(spec_data_from_npz, np.ndarray) else type(spec_data_from_npz)
                  current_spec_shape_info = spec.shape if spec is not None else "None"
                  print(f"Fallback: Using zeros for '{samplename}'. Raw NPZ shape: {original_shape_info}, Processed spec shape before fallback: {current_spec_shape_info}.")
-                 spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+                 spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
         
         else: # samplename not found in the pre-loaded spectrogram dictionary
             print(f"ERROR: Samplename '{samplename}' not found in pre-loaded dictionary! Using zeros.")
-            spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+            spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
 
         # --- Final Shape Guarantee --- (important for downstream code)
-        if not isinstance(spec, np.ndarray) or spec.shape != tuple(self.config.TARGET_SHAPE):
+        if not isinstance(spec, np.ndarray) or spec.shape != tuple(self.config.PREPROCESS_TARGET_SHAPE):
              print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
-             spec = np.zeros(self.config.TARGET_SHAPE, dtype=np.float32)
+             spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
 
         # Ensure spec is float32 before augmentations/tensor conversion
         spec = spec.astype(np.float32)
@@ -158,13 +158,11 @@ class BirdCLEFDataset(Dataset):
         if self.mode == "train":
             spec = self.apply_spec_augmentations(spec)
 
-        # Convert to tensor, add channel dimension (NO LONGER REPEATED)
-        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
+        # concatenate the spec with itself to make it 10s long
+        spec = np.concatenate([spec, spec], axis=1)
 
-        # Normalize the (potentially augmented) tensor (REMOVED IMAGENET NORMALIZATION)
-        # The AugmentMelSTFT from EfficientAT already applies normalization: (melspec + 4.5) / 5.0
-        # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        # spec_tensor = normalize(spec_tensor)
+        # Convert to tensor, add channel dimension
+        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
 
         # Encode labels retrieved from the dataframe row
         target = self.encode_label(primary_label)
@@ -498,7 +496,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
         all_targets.append(targets_np)
         losses.append(loss.item())
 
-        # --- Log Spectrograms (New Logic) ---
+        # --- Log Spectrograms ---
         if wandb.run is not None and len(logged_original_samplenames_for_spectrograms) < num_samples_to_log:
             with torch.no_grad(): # Ensure no gradients are calculated for this section
                 for j in range(inputs.size(0)): # Iterate through batch
@@ -839,9 +837,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
                     pretrained_name="mn10_as",               
                     width_mult=1.0,                         
                     head_type="mlp",                         
-                    input_dim_f=config.TARGET_SHAPE[0],      # 128 mels
-                    input_dim_t=config.TARGET_SHAPE[1]       # 500 time frames
-                    # se_dims, se_agg, se_r will use defaults from get_model which are suitable
+                    input_dim_f=config.TARGET_SHAPE[0],     
+                    input_dim_t=config.TARGET_SHAPE[1]      
                 ).to(config.device)
             
             optimizer = get_optimizer(model, config)
@@ -1336,18 +1333,11 @@ if __name__ == "__main__":
     # Final check on combined dataframe and spectrograms
     print(f"\nFinal training dataframe size: {len(training_df)} samples.")
     
-    # --- Filter training_df based on loaded spectrogram keys only if configured to load them --- #
+    # --- Filter training_df based on loaded spectrogram keys if configured to load them --- #
     if config.LOAD_PREPROCESSED_DATA:
-        # Removed redundant check: if config.LOAD_PREPROCESSED_DATA is True and script reaches here,
-        # all_spectrograms must be a dictionary (initialized as {} and populated, or exited if primary load failed).
-        # if all_spectrograms is None:
-        #     print("CRITICAL ERROR: config.LOAD_PREPROCESSED_DATA is True, but all_spectrograms is None. Exiting.")
-        #     sys.exit(1)
-            
         print(f"\nConfigured to load preprocessed data. Filtering dataframe...")
         print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
         
-        # Filter dataframe to keep only rows with loaded spectrograms
         original_count = len(training_df)
 
         loaded_keys = set(all_spectrograms.keys())

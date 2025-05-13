@@ -58,7 +58,9 @@ def _preprocess_audio_file_worker(audio_path_str, config):
                 mel_spec_tensor = spectrogram_generator_worker(segment_audio_tensor.unsqueeze(0))
             mel_spec_numpy = mel_spec_tensor.squeeze(0).cpu().numpy()
             # mel_spec_numpy should now be (config.N_MELS, 500) or TARGET_SHAPE
-
+            # concatenate the spec with itself to make it 10s long
+            mel_spec_numpy = np.concatenate([mel_spec_numpy, mel_spec_numpy], axis=1)
+            
             segment_specs.append(mel_spec_numpy.astype(np.float32))
             
             end_time_sec = (segment_idx + 1) * config.TARGET_DURATION

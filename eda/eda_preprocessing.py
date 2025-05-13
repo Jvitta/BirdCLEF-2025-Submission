@@ -16,7 +16,7 @@ print("--- EDA: Analysis of Preprocessed Spectrogram NPZ File ---")
 
 # --- Configuration ---
 npz_file_path = config.PREPROCESSED_NPZ_PATH
-target_shape = tuple(config.TARGET_SHAPE) # Expected (H, W)
+target_shape = tuple(config.PREPROCESS_TARGET_SHAPE) # Expected (H, W)
 num_samples_to_plot = 10 # How many spectrograms to visually inspect
 num_samples_for_value_stats = 50 # How many chunks to check for value range, shape, dtype
 plot_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots", "preprocessed_spectrograms")

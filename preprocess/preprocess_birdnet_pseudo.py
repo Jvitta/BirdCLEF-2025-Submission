@@ -89,8 +89,8 @@ def _process_pseudo_label_row(args):
         if mel_spec is None:
             return (None, f"Spectrogram generation failed for {segment_key}")
 
-        if mel_spec.shape != tuple(config.TARGET_SHAPE):
-             final_spec_2d = cv2.resize(mel_spec, (config.TARGET_SHAPE[1], config.TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
+        if mel_spec.shape != tuple(config.PREPROCESS_TARGET_SHAPE):
+             final_spec_2d = cv2.resize(mel_spec, (config.PREPROCESS_TARGET_SHAPE[1], config.PREPROCESS_TARGET_SHAPE[0]), interpolation=cv2.INTER_LINEAR)
         else:
              final_spec_2d = mel_spec
         
