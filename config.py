@@ -52,7 +52,7 @@ class Config:
     PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
     TARGET_SHAPE = (128, 1000) # Final shape for training/inference
 
-    model_name = 'mn10_as' # Changed to reflect the new EfficientAT model
+    model_name = 'mn20_as' # Changed to reflect the new EfficientAT model
     pretrained = True # Pretrained weights will be loaded by the EfficientAT get_model function
     in_channels = 1 # EfficientAT models expect 1 input channel (the spectrogram itself)
     num_classes = 206
@@ -125,5 +125,21 @@ class Config:
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
     DEBUG_VALIDATE_FIRST_BATCH_ONLY = False # Set to True to test validation freeze
+
+    # --- AdaIN Statistics (from EDA) ---
+    APPLY_ADAIN = True  # Set to False to disable AdaIN
+    ADAIN_EPSILON = 1e-6 # Epsilon for numerical stability in division
+
+    # Soundscape (Target - ss) stats
+    MU_SS_MEAN = -0.359927    # Mean of 'overall_mean' for soundscape_all_chunks
+    SIGMA_SS_MEAN = 0.215410  # Std of 'overall_mean' for soundscape_all_chunks
+    MU_SS_STD = 0.703811      # Mean of 'overall_std' for soundscape_all_chunks
+    SIGMA_SS_STD = 0.158731   # Std of 'overall_std' for soundscape_all_chunks
+
+    # Train Audio (Source - t) stats
+    MU_T_MEAN = -0.301608     # Mean of 'overall_mean' for train_audio_all_chunks
+    SIGMA_T_MEAN = 0.408074   # Std of 'overall_mean' for train_audio_all_chunks
+    MU_T_STD = 0.549302       # Mean of 'overall_std' for train_audio_all_chunks
+    SIGMA_T_STD = 0.161779    # Std of 'overall_std' for train_audio_all_chunks
 
 config = Config()

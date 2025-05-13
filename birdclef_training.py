@@ -6,6 +6,7 @@ import time
 import warnings
 import sys
 import contextlib
+import argparse
 import numpy as np
 import pandas as pd
 import cv2
@@ -25,10 +26,15 @@ from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, mult
 from config import config
 import utils as utils
 from models.efficient_at.mn.model import get_model as get_efficient_at_model
+from models.efficient_at.dymn.model import get_model as get_dymn_model
 from losses import FocalLossBCE
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+parser = argparse.ArgumentParser(description="BirdCLEF Training Script")
+parser.add_argument("--run_name", type=str, default=None, help="Custom name for the W&B run.")
+cmd_args = parser.parse_args()
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -39,6 +45,27 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def _apply_adain_transformation(spec_np, adain_config):
+    """Applies AdaIN transformation to a numpy spectrogram."""
+    # Calculate original mean and std of the current spectrogram
+    mu_s_train = np.mean(spec_np)
+    sigma_s_train = np.std(spec_np)
+
+    # Calculate the target mean for this specific spectrogram
+    mu_s_train_new = ((mu_s_train - adain_config.MU_T_MEAN) / (adain_config.SIGMA_T_MEAN + adain_config.ADAIN_EPSILON)) * \
+                     adain_config.SIGMA_SS_MEAN + adain_config.MU_SS_MEAN
+
+    # Calculate the target internal standard deviation for this specific spectrogram
+    sigma_s_train_new = ((sigma_s_train - adain_config.MU_T_STD) / (adain_config.SIGMA_T_STD + adain_config.ADAIN_EPSILON)) * \
+                        adain_config.SIGMA_SS_STD + adain_config.MU_SS_STD
+    
+    # Apply the AdaIN transformation
+    transformed_spec = ((spec_np - mu_s_train) / (sigma_s_train + adain_config.ADAIN_EPSILON)) * \
+                       sigma_s_train_new + mu_s_train_new
+    
+    # Ensure spec remains float32 after transformation
+    return transformed_spec.astype(np.float32)
 
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
@@ -151,8 +178,13 @@ class BirdCLEFDataset(Dataset):
              print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
              spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
 
-        # Ensure spec is float32 before augmentations/tensor conversion
+        # Ensure spec is float32 before AdaIN or other augmentations
         spec = spec.astype(np.float32)
+
+        # --- AdaIN Transformation (if enabled and in train mode) ---
+        if self.config.APPLY_ADAIN and self.mode == "train":
+            spec = _apply_adain_transformation(spec, self.config)
+        # --- End AdaIN Transformation ---
 
         # Apply manual SpecAugment (Time/Freq Mask, Contrast) on NumPy array
         if self.mode == "train":
@@ -682,7 +714,7 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, macro_auc, per_class_metrics_list, all_outputs_cat, all_targets_cat
 
-def run_training(df, config, trial=None, all_spectrograms=None):
+def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=None):
     """Runs the training loop. 
     
     Accepts pre-loaded spectrograms via the all_spectrograms argument.
@@ -697,7 +729,12 @@ def run_training(df, config, trial=None, all_spectrograms=None):
     is_hpo_trial = trial is not None
     
     # --- wandb initialization ---
-    run_name = f"trial_{trial.number}" if is_hpo_trial else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+    # Use custom run name if provided, otherwise generate one
+    if custom_run_name:
+        run_name = custom_run_name
+    else:
+        run_name = f"trial_{trial.number}" if is_hpo_trial else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+    
     group_name = "hpo" if is_hpo_trial else "full_training"
     
     wandb_run = wandb.init(
@@ -834,8 +871,8 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             with contextlib.redirect_stdout(open(os.devnull, 'w')), contextlib.redirect_stderr(open(os.devnull, 'w')):
                 model = get_efficient_at_model(
                     num_classes=config.num_classes,          
-                    pretrained_name="mn10_as",               
-                    width_mult=1.0,                         
+                    pretrained_name=config.model_name,               
+                    width_mult=2.0,                         
                     head_type="mlp",                         
                     input_dim_f=config.TARGET_SHAPE[0],     
                     input_dim_t=config.TARGET_SHAPE[1]      
@@ -1352,6 +1389,6 @@ if __name__ == "__main__":
     else:
         print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
 
-    run_training(training_df, config, all_spectrograms=all_spectrograms)
+    run_training(training_df, config, all_spectrograms=all_spectrograms, custom_run_name=cmd_args.run_name)
 
     print("\nTraining script finished!")

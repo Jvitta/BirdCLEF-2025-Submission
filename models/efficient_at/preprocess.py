@@ -16,7 +16,6 @@ class AugmentMelSTFT(nn.Module):
         self.fmin = fmin
         if fmax is None:
             fmax = sr // 2 - fmax_aug_range // 2
-            print(f"Warning: FMAX is None setting to {fmax} ")
         self.fmax = fmax
         self.hopsize = hopsize
         self.register_buffer('window',
