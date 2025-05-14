@@ -200,10 +200,10 @@ def _pad_or_tile_audio(audio_data, target_samples):
     else: 
         return audio_data[:target_samples]
 
-def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples_5s):
+def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples_chunk):
     """
-    Extracts a 5s audio chunk centered around a BirdNET detection.
-    Pads if necessary to ensure target_samples_5s length.
+    Extracts an audio chunk of config.TARGET_DURATION seconds centered around a BirdNET detection.
+    Pads if necessary to ensure target_samples_chunk length.
     Returns None on failure or if resulting chunk is too short before padding.
     """
     try:
@@ -213,7 +213,8 @@ def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_sa
 
         audio_len_samples = len(audio_long)
         
-        chunk_start_sec = center_sec - (config.TARGET_DURATION / 2.0) # config.TARGET_DURATION is 5s
+        # config.TARGET_DURATION drives the length of the chunk to be extracted
+        chunk_start_sec = center_sec - (config.TARGET_DURATION / 2.0) 
         chunk_end_sec = center_sec + (config.TARGET_DURATION / 2.0)
 
         final_start_idx = max(0, int(chunk_start_sec * config.FS))
@@ -224,29 +225,29 @@ def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_sa
         if len(extracted_audio_segment) < min_samples:
             return None 
         
-        return _pad_or_tile_audio(extracted_audio_segment, target_samples_5s)
+        return _pad_or_tile_audio(extracted_audio_segment, target_samples_chunk)
 
     except Exception as e:
         # print(f"Warning: Error during BirdNET 5s chunk extraction: {e}")
         return None
 
 def _extract_random_chunk(audio_long, target_samples):
-    """Extracts a random 5s chunk."""
+    """Extracts a random chunk of audio with 'target_samples' length."""
     if len(audio_long) < target_samples: 
         return _pad_or_tile_audio(audio_long, target_samples)
         
-    max_start_idx_5s = len(audio_long) - target_samples
-    start_idx_5s = random.randint(0, max_start_idx_5s)
-    return audio_long[start_idx_5s : start_idx_5s + target_samples]
+    max_start_idx_chunk = len(audio_long) - target_samples
+    start_idx_chunk = random.randint(0, max_start_idx_chunk)
+    return audio_long[start_idx_chunk : start_idx_chunk + target_samples]
 
-def _generate_spectrogram_from_chunk(audio_chunk_5s, config_obj):
+def _generate_spectrogram_from_chunk(audio_chunk, config_obj):
     """Generates a mel spectrogram from an audio chunk using EfficientAT's method, then resizes."""
     try:
-        if not isinstance(audio_chunk_5s, np.ndarray) or audio_chunk_5s.ndim != 1:
-            print(f"Warning: audio_chunk_5s is not a 1D numpy array. Shape: {audio_chunk_5s.shape if hasattr(audio_chunk_5s, 'shape') else 'N/A'}")
+        if not isinstance(audio_chunk, np.ndarray) or audio_chunk.ndim != 1:
+            print(f"Warning: audio_chunk is not a 1D numpy array. Shape: {audio_chunk.shape if hasattr(audio_chunk, 'shape') else 'N/A'}")
             return None
         
-        audio_tensor = torch.from_numpy(audio_chunk_5s.astype(np.float32))
+        audio_tensor = torch.from_numpy(audio_chunk.astype(np.float32))
 
         with torch.no_grad():
             # We process one chunk at a time, so unsqueeze to add batch dim for the conv1d preemphasis.
@@ -283,11 +284,18 @@ def _process_primary_for_chunking(args):
         # This ensures that even if cleaned audio is shorter, we might still try to get multiple versions
         base_duration_for_versions = len(audio_for_birdnet_base) 
         
-        # 1 chunk if audio is too short or in val mode, otherwise PRECOMPUTE_VERSIONS chunks
-        if base_duration_for_versions < target_samples or cmd_args.mode == "val":
+        # Determine the number of versions to generate
+        if cmd_args.mode == "val":
             num_versions_to_generate = 1
-        else:
-            num_versions_to_generate = config.PRECOMPUTE_VERSIONS
+        else:  # Training mode
+            if base_duration_for_versions < target_samples:
+                num_versions_to_generate = 1  # Generate one chunk (which will be padded/tiled)
+            else:
+                num_full_chunks_fittable = int(base_duration_for_versions // target_samples)
+                
+                # We want at least 1 chunk if it's long enough, but no more than PRECOMPUTE_VERSIONS
+                # and no more than what can actually fit without forcing excessive overlap by this rule.
+                num_versions_to_generate = min(config.PRECOMPUTE_VERSIONS, max(1, num_full_chunks_fittable))
 
         use_birdnet_strategy = (
             class_name == 'Aves' and

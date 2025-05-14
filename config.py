@@ -39,7 +39,7 @@ class Config:
     TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
     FS = 32000 
-    TARGET_DURATION = 5.0  
+    TARGET_DURATION = 10.0  
     N_FFT = 1024
     HOP_LENGTH = 320
     WIN_LENGTH = 800
@@ -48,7 +48,7 @@ class Config:
     FMAX = None # if None, fmax = sr // 2 - fmax_aug_range // 2
     FMIN_AUG_RANGE = 10
     FMAX_AUG_RANGE = 1000
-    PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
+    PREPROCESS_TARGET_SHAPE = (128, 1000) # Expected Preprocessing shape
     TARGET_SHAPE = (128, 1000) # Final shape for training/inference
 
     model_name = 'mn20_as' # Changed to reflect the new EfficientAT model
@@ -63,7 +63,7 @@ class Config:
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
     NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
-    PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
+    PRECOMPUTE_VERSIONS = 3 # Number of different chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
     use_amp = False
@@ -125,7 +125,7 @@ class Config:
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
     # --- AdaIN Statistics ---
-    ADAIN_MODE = 'per_frequency'  # Options: 'none', 'global', 'per_frequency'
+    ADAIN_MODE = 'none'  # Options: 'none', 'global', 'per_frequency'
     ADAIN_PER_FREQUENCY_STATS_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, "adain_per_frequency_stats.npz")
     ADAIN_EPSILON = 1e-6 # Epsilon for numerical stability in division
 

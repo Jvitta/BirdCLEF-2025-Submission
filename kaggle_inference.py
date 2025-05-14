@@ -120,8 +120,8 @@ class BirdCLEF2025Pipeline:
                 model = get_efficient_at_model(
                     num_classes=self.config.num_classes, # Use self.config
                     pretrained_name=None,               # Pass None to prevent loading base weights from URL
-                    width_mult=1.0,                     # Explicitly set for mn10_as like architecture
-                    head_type="mlp",                    # Explicitly set for mn10_as like architecture
+                    width_mult=2.0,                     # Explicitly set for mn20_as like architecture
+                    head_type="mlp",                    # Explicitly set for mn20_as like architecture
                     input_dim_f=self.config.TARGET_SHAPE[0],  # Use self.config
                     input_dim_t=self.config.TARGET_SHAPE[1]   # Use self.config
                 )
@@ -167,10 +167,12 @@ class BirdCLEF2025Pipeline:
         """
         Run inference: Preprocess all files in parallel, then predict in batches.
         """
-        test_files = list(Path(self.config.test_audio_dir).glob('*.ogg'))
-        if self.config.debug:
-            print(f"Debug mode enabled, using only {self.config.debug_limit_files} files")
-            test_files = test_files[:self.config.debug_limit_files]
+        if not self.config.debug:
+            test_files = list(Path(self.config.test_audio_dir).glob('*.ogg'))
+        else:
+            test_files = list(Path(self.config.unlabeled_audio_dir).glob('*.ogg'))
+            print(f"Debug mode enabled, using only {700} files")
+            test_files = test_files[:700]
         print(f"Found {len(test_files)} test soundscapes")
 
         # --- Stage 1: Parallel Preprocessing --- 
@@ -268,6 +270,7 @@ class BirdCLEF2025Pipeline:
                         logits = outputs[0] # Select the logits
                         probs = torch.sigmoid(logits) # Apply sigmoid to logits
                         batch_model_preds.append(probs.cpu().numpy())
+                   
                         
                 # Average predictions across models for this TTA iteration
                 avg_model_preds = np.mean(batch_model_preds, axis=0)
