@@ -46,23 +46,87 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+# --- Global cache for AdaIN per-frequency stats ---
+_adain_per_freq_stats_cache = None
+
+def _load_adain_per_freq_stats(config_obj):
+    global _adain_per_freq_stats_cache
+    if _adain_per_freq_stats_cache is None:
+        try:
+            _adain_per_freq_stats_cache = np.load(config_obj.ADAIN_PER_FREQUENCY_STATS_PATH)
+            expected_keys = ['mu_t_mean_per_freq', 'sigma_t_mean_per_freq', 'mu_t_std_per_freq', 'sigma_t_std_per_freq',
+                               'mu_ss_mean_per_freq', 'sigma_ss_mean_per_freq', 'mu_ss_std_per_freq', 'sigma_ss_std_per_freq']
+            if not all(key in _adain_per_freq_stats_cache for key in expected_keys):
+                print(f"ERROR: AdaIN per-frequency stats file ({config_obj.ADAIN_PER_FREQUENCY_STATS_PATH}) is missing one or more expected keys. Per-frequency AdaIN cannot proceed. Exiting.")
+                sys.exit(1)
+        except Exception as e:
+            print(f"ERROR loading AdaIN per-frequency stats from {config_obj.ADAIN_PER_FREQUENCY_STATS_PATH}: {e}. Per-frequency AdaIN cannot proceed. Exiting.")
+            sys.exit(1)
+    return _adain_per_freq_stats_cache
+
 def _apply_adain_transformation(spec_np, adain_config):
-    """Applies AdaIN transformation to a numpy spectrogram."""
-    # Calculate original mean and std of the current spectrogram
-    mu_s_train = np.mean(spec_np)
-    sigma_s_train = np.std(spec_np)
+    """Applies AdaIN transformation to a numpy spectrogram.
+    Supports 'global' or 'per_frequency' mode based on adain_config.ADAIN_MODE.
+    """
+    if adain_config.ADAIN_MODE == 'global':
+        # Calculate original mean and std of the current spectrogram (overall)
+        mu_s_train = np.mean(spec_np)
+        sigma_s_train = np.std(spec_np)
 
-    # Calculate the target mean for this specific spectrogram
-    mu_s_train_new = ((mu_s_train - adain_config.MU_T_MEAN) / (adain_config.SIGMA_T_MEAN + adain_config.ADAIN_EPSILON)) * \
-                     adain_config.SIGMA_SS_MEAN + adain_config.MU_SS_MEAN
+        # Calculate the target mean for this specific spectrogram (overall)
+        mu_s_train_new = ((mu_s_train - adain_config.MU_T_MEAN) / (adain_config.SIGMA_T_MEAN + adain_config.ADAIN_EPSILON)) * \
+                         adain_config.SIGMA_SS_MEAN + adain_config.MU_SS_MEAN
 
-    # Calculate the target internal standard deviation for this specific spectrogram
-    sigma_s_train_new = ((sigma_s_train - adain_config.MU_T_STD) / (adain_config.SIGMA_T_STD + adain_config.ADAIN_EPSILON)) * \
-                        adain_config.SIGMA_SS_STD + adain_config.MU_SS_STD
-    
-    # Apply the AdaIN transformation
-    transformed_spec = ((spec_np - mu_s_train) / (sigma_s_train + adain_config.ADAIN_EPSILON)) * \
-                       sigma_s_train_new + mu_s_train_new
+        # Calculate the target internal standard deviation for this specific spectrogram (overall)
+        sigma_s_train_new = ((sigma_s_train - adain_config.MU_T_STD) / (adain_config.SIGMA_T_STD + adain_config.ADAIN_EPSILON)) * \
+                            adain_config.SIGMA_SS_STD + adain_config.MU_SS_STD
+        
+        # Apply the AdaIN transformation (overall)
+        transformed_spec = ((spec_np - mu_s_train) / (sigma_s_train + adain_config.ADAIN_EPSILON)) * \
+                           sigma_s_train_new + mu_s_train_new
+        
+    elif adain_config.ADAIN_MODE == 'per_frequency':
+        stats = _load_adain_per_freq_stats(adain_config)
+        if stats is None:
+            print("Skipping per-frequency AdaIN due to stats loading issue.")
+            return spec_np.astype(np.float32) # Return original if stats not loaded
+
+        # Extract per-frequency stats from loaded NPZ
+        mu_t_mean_pf = stats['mu_t_mean_per_freq']
+        sigma_t_mean_pf = stats['sigma_t_mean_per_freq']
+        mu_t_std_pf = stats['mu_t_std_per_freq']
+        sigma_t_std_pf = stats['sigma_t_std_per_freq']
+        mu_ss_mean_pf = stats['mu_ss_mean_per_freq']
+        sigma_ss_mean_pf = stats['sigma_ss_mean_per_freq']
+        mu_ss_std_pf = stats['mu_ss_std_per_freq']
+        sigma_ss_std_pf = stats['sigma_ss_std_per_freq']
+
+        if not (mu_t_mean_pf.shape[0] == spec_np.shape[0] == adain_config.N_MELS):
+            print(f"ERROR: Mismatch in N_MELS for per-frequency AdaIN stats ({mu_t_mean_pf.shape[0]}) and spectrogram ({spec_np.shape[0]}). Expected {adain_config.N_MELS}. Skipping.")
+            return spec_np.astype(np.float32)
+
+        # Calculate original mean and std for each frequency bin of the current spectrogram
+        mu_s_train_pf = np.mean(spec_np, axis=1)  # Shape: (N_MELS,)
+        sigma_s_train_pf = np.std(spec_np, axis=1) # Shape: (N_MELS,)
+
+        # Calculate the target mean for each frequency bin
+        # Ensure broadcasting for per-element operations (N_MELS,)
+        mu_s_train_new_pf = ((mu_s_train_pf - mu_t_mean_pf) / (sigma_t_mean_pf + adain_config.ADAIN_EPSILON)) * \
+                             sigma_ss_mean_pf + mu_ss_mean_pf
+
+        # Calculate the target std for each frequency bin
+        sigma_s_train_new_pf = ((sigma_s_train_pf - mu_t_std_pf) / (sigma_t_std_pf + adain_config.ADAIN_EPSILON)) * \
+                               sigma_ss_std_pf + mu_ss_std_pf
+        
+        # Apply the AdaIN transformation per frequency bin
+        # spec_np is (N_MELS, N_TIMEBINS)
+        # mu_s_train_pf, sigma_s_train_pf are (N_MELS,)
+        # mu_s_train_new_pf, sigma_s_train_new_pf are (N_MELS,)
+        # We need to reshape for broadcasting: (N_MELS, 1)
+        transformed_spec = ((spec_np - mu_s_train_pf[:, np.newaxis]) / (sigma_s_train_pf[:, np.newaxis] + adain_config.ADAIN_EPSILON)) * \
+                           sigma_s_train_new_pf[:, np.newaxis] + mu_s_train_new_pf[:, np.newaxis]
+    else: # 'none' or unknown mode
+        return spec_np.astype(np.float32)
     
     # Ensure spec remains float32 after transformation
     return transformed_spec.astype(np.float32)
@@ -115,8 +179,7 @@ class BirdCLEFDataset(Dataset):
             raw_selected_chunk_2d = None # This will be the 2D chunk selected, potentially >5s wide
 
             if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 3:
-                # Assumes data is always (N, H, W_chunk)
-                # N is number of chunks, H is consistent height, W_chunk is width of EACH chunk.
+                # Assumes data is always (N, H, W) N is number of chunks, H is height, W is width
                 num_available_chunks = spec_data_from_npz.shape[0]
                 
                 if num_available_chunks > 0:
@@ -126,11 +189,7 @@ class BirdCLEFDataset(Dataset):
                     raw_selected_chunk_2d = spec_data_from_npz[selected_idx]
                 else:
                     print(f"WARNING: Data for '{samplename}' is a 3D array but has 0 chunks. Using zeros.")
-
-            elif isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 2:
-                # This case should ideally be phased out if preprocessing always saves as 3D (1, H, W)
-                print(f"WARNING: Data for '{samplename}' is a 2D array. Preprocessing should save as 3D (e.g., (1, H, W)). Attempting to use directly.")
-                raw_selected_chunk_2d = spec_data_from_npz
+                    
             else:
                 ndim_info = spec_data_from_npz.ndim if isinstance(spec_data_from_npz, np.ndarray) else "Not an ndarray"
                 print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
@@ -155,9 +214,6 @@ class BirdCLEFDataset(Dataset):
                       f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
                 spec = np.zeros(tuple(self.config.PREPROCESS_TARGET_SHAPE), dtype=np.float32)
 
-            # Ensure spec is float32, as augmentations might change it if not careful
-            spec = spec.astype(np.float32)
-            
             # Fallback if spec is still None or issues occurred during processing
             if spec is None or spec.shape != self.config.PREPROCESS_TARGET_SHAPE:
                  original_shape_info = spec_data_from_npz.shape if isinstance(spec_data_from_npz, np.ndarray) else type(spec_data_from_npz)
@@ -178,8 +234,12 @@ class BirdCLEFDataset(Dataset):
         spec = spec.astype(np.float32)
 
         # --- AdaIN Transformation (if enabled and in train mode) ---
-        if self.config.APPLY_ADAIN and self.mode == "train":
-            spec = _apply_adain_transformation(spec, self.config)
+        if self.config.ADAIN_MODE != 'none': # Apply if AdaIN is enabled, regardless of mode
+            if self.mode == "train":
+                transform_weight = np.random.uniform(0.0, 0.25)
+                spec = (1-transform_weight)*spec + transform_weight*_apply_adain_transformation(spec, self.config)
+            elif self.mode == "val":
+                spec = 0.875*spec + 0.125*_apply_adain_transformation(spec, self.config)
         # --- End AdaIN Transformation ---
 
         # Apply manual SpecAugment (Time/Freq Mask, Contrast) on NumPy array
@@ -214,7 +274,7 @@ class BirdCLEFDataset(Dataset):
             'target': torch.tensor(target, dtype=torch.float32),
             'filename': filename_for_error,
             'samplename': samplename,
-            'source': data_source # <--- ADDED
+            'source': data_source 
         }
 
     def apply_spec_augmentations(self, spec_np):
@@ -598,15 +658,15 @@ def validate(model, loader, criterion, device):
     """Runs validation with optional mixed precision for inference."""
     model.eval()
     losses = []
-    all_targets_list = [] # Changed name to avoid confusion later
-    all_outputs_list = [] # Changed name
+    all_targets_list = [] 
+    all_outputs_list = [] 
     use_amp = config.use_amp
-    species_ids = loader.dataset.species_ids # Get species IDs for labeling
+    species_ids = loader.dataset.species_ids 
     num_classes = len(species_ids)
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
-            print(f"DEBUG: Validation step {step}, processing batch...") # DEBUG PRINT
+            #print(f"DEBUG: Validation step {step}, processing batch...") # DEBUG PRINT
             if batch is None:
                 print(f"Warning: Skipping None validation batch at step {step}")
                 continue
@@ -614,19 +674,18 @@ def validate(model, loader, criterion, device):
             try:
                 inputs = batch['melspec'].to(device)
                 targets = batch['target'].to(device)
-                # DEBUG PRINT - Log filenames if available, otherwise samplenames
-                if 'filename' not in batch or 'samplename' not in batch:
-                    print(f"DEBUG: Validation step {step}, batch loaded. No filename/samplename key in batch.")
+                #if 'filename' not in batch or 'samplename' not in batch:
+                    #print(f"DEBUG: Validation step {step}, batch loaded. No filename/samplename key in batch.")
 
             except (AttributeError, TypeError) as e:
                 print(f"Error: Skipping validation batch {step} due to unexpected format: {e}")
                 continue
 
-            print(f"DEBUG: Validation step {step}, about to run model forward pass.") # DEBUG PRINT
+            #print(f"DEBUG: Validation step {step}, about to run model forward pass.") # DEBUG PRINT
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
                 model_output = model(inputs)
                 outputs = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
-                print(f"DEBUG: Validation step {step}, model forward pass complete.") # DEBUG PRINT
+                #print(f"DEBUG: Validation step {step}, model forward pass complete.") # DEBUG PRINT
                 loss = criterion(outputs, targets)
 
             all_outputs_list.append(outputs.float().cpu().numpy())
@@ -674,23 +733,20 @@ def validate(model, loader, criterion, device):
             except ValueError:
                 class_auc = 0.0 # Or handle as NaN, but 0.0 is simpler for aggregation
         
-        # Calculate precision, recall, F1 for the positive class (label 1)
-        # average=None and labels=[1] gives metrics specifically for the positive class
         # If class_targets are all 0, precision/recall/f1 for label 1 will be 0 due to zero_division=0
         precision, recall, f1_score, _ = precision_recall_fscore_support(
             class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
         )
 
-        # Extract TP, FP, FN, TN from mcm
         # mcm[i] is [[TN, FP], [FN, TP]] for class i
         tn, fp, fn, tp = mcm[i].ravel()
 
         per_class_metrics_list.append({
             'species_id': species_name,
             'auc': class_auc,
-            'precision': precision, # Directly use the scalar value for pos_label=1
-            'recall': recall,       # Directly use the scalar value for pos_label=1
-            'f1': f1_score,         # Directly use the scalar value for pos_label=1
+            'precision': precision, 
+            'recall': recall,
+            'f1': f1_score,
             'tp': int(tp),
             'fp': int(fp),
             'fn': int(fn),
@@ -838,7 +894,8 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
                 num_workers=config.num_workers,
                 pin_memory=True,
                 collate_fn=collate_fn,
-                drop_last=True
+                drop_last=True,
+                persistent_workers=True if config.num_workers > 0 else False
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -847,7 +904,8 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
                 num_workers=config.num_workers,
                 pin_memory=True,
                 collate_fn=collate_fn,
-                drop_last=False
+                drop_last=False,
+                persistent_workers=True if config.num_workers > 0 else False
             )
 
             print("\nSetting up model, optimizer, criterion, scheduler...")
@@ -893,7 +951,6 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
             best_epoch_val_per_class_metrics = None
             best_epoch_val_all_outputs = None
             best_epoch_val_all_targets = None
-            # current_fold_best_model_path = None # This was already there
 
             # --- Epoch Loop --- #
             for epoch in range(config.epochs):
@@ -980,10 +1037,8 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
                     try:
                         torch.save(checkpoint, save_path)
                         print(f"  Model saved to {save_path}")
-                        current_fold_best_model_path = save_path # Update best model path for this fold
                     except Exception as e:
                         print(f"  Error saving model checkpoint: {e}") # Removed artifact logging from here
-
                 # --- EPOCH LOOP ENDS HERE ---
 
             # --- Code to run AFTER all epochs for the current FOLD are done ---

@@ -25,13 +25,15 @@ import utils as utils
 
 warnings.filterwarnings("ignore")
 
+# --- Seed setting --- #
+random.seed(config.seed)
+np.random.seed(config.seed)
+torch.manual_seed(config.seed)
+
 parser = argparse.ArgumentParser(description="Preprocess audio data for BirdCLEF.")
 parser.add_argument("--mode", type=str, choices=["train", "val"], default="train",
                     help="Preprocessing mode: 'train' for augmented spectrograms, 'val' for fixed-setting spectrograms.")
 cmd_args = parser.parse_args()
-
-random.seed(config.seed)
-np.random.seed(config.seed)
 
 efficient_at_spectrogram_generator = AugmentMelSTFT(
             n_mels=config.N_MELS,

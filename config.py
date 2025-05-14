@@ -4,11 +4,10 @@ import multiprocessing
 
 class Config:
     seed = 43
-    debug = False
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # --- Workbench/Local Paths (using gcsfuse mount) --- #
+    # --- Root Paths --- #
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
     GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/data"
 
@@ -46,7 +45,7 @@ class Config:
     WIN_LENGTH = 800
     N_MELS = 128
     FMIN = 20
-    FMAX = None
+    FMAX = None # if None, fmax = sr // 2 - fmax_aug_range // 2
     FMIN_AUG_RANGE = 10
     FMAX_AUG_RANGE = 1000
     PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
@@ -67,9 +66,6 @@ class Config:
     PRECOMPUTE_VERSIONS = 3 # Number of different 5s chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
 
-    epochs = 10 # 10
-    train_batch_size = 32
-    val_batch_size = 64
     use_amp = False
 
     criterion = 'FocalLossBCE'
@@ -82,18 +78,22 @@ class Config:
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 
+    epochs = 10 # 10
     optimizer = 'AdamW'
-    lr = 0.0004 #0.0005759790964526907
+    lr = 0.0004 
     min_lr = 1e-6
-    weight_decay = 1e-4 #1.3461944764663799e-05
-
+    weight_decay = 0.8e-4 
+    epochs = 10
     scheduler = 'CosineAnnealingLR' 
-    T_max = 15 # epochs # Set T_max to 20 for a slower decay over 10 epochs
+    T_max = 10
+
+    train_batch_size = 32
+    val_batch_size = 64
+    inference_batch_size = 64
 
     # --- Augmentation Parameters ---
-    # Batch-level augmentations (Mixup/CutMix)
-    batch_augment_prob = 1.0 #1.0     # Probability of applying Mixup OR CutMix to a batch
-    mixup_vs_cutmix_ratio = 1.0 #1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
+    batch_augment_prob = 1.0  # Probability of applying Mixup OR CutMix to a batch
+    mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
     mixup_alpha = 0.3901120986458487 
     cutmix_alpha = 1.0           
 
@@ -104,7 +104,6 @@ class Config:
     max_time_mask_width = 30     # Maximum width of time mask
     max_freq_mask_height = 26    # Maximum height of frequency mask
 
-    inference_batch_size = 64
     use_tta = False
     tta_count = 3
     # Threshold for generating pseudo labels
@@ -113,6 +112,7 @@ class Config:
     use_specific_folds_inference = False
     inference_folds = [0, 1]
 
+    debug = False
     debug_limit_batches = 5 
     debug_limit_files = 500
 
@@ -124,22 +124,9 @@ class Config:
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
 
-    DEBUG_VALIDATE_FIRST_BATCH_ONLY = False # Set to True to test validation freeze
-
-    # --- AdaIN Statistics (from EDA) ---
-    APPLY_ADAIN = True  # Set to False to disable AdaIN
+    # --- AdaIN Statistics ---
+    ADAIN_MODE = 'per_frequency'  # Options: 'none', 'global', 'per_frequency'
+    ADAIN_PER_FREQUENCY_STATS_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, "adain_per_frequency_stats.npz")
     ADAIN_EPSILON = 1e-6 # Epsilon for numerical stability in division
-
-    # Soundscape (Target - ss) stats
-    MU_SS_MEAN = -0.359927    # Mean of 'overall_mean' for soundscape_all_chunks
-    SIGMA_SS_MEAN = 0.215410  # Std of 'overall_mean' for soundscape_all_chunks
-    MU_SS_STD = 0.703811      # Mean of 'overall_std' for soundscape_all_chunks
-    SIGMA_SS_STD = 0.158731   # Std of 'overall_std' for soundscape_all_chunks
-
-    # Train Audio (Source - t) stats
-    MU_T_MEAN = -0.301608     # Mean of 'overall_mean' for train_audio_all_chunks
-    SIGMA_T_MEAN = 0.408074   # Std of 'overall_mean' for train_audio_all_chunks
-    MU_T_STD = 0.549302       # Mean of 'overall_std' for train_audio_all_chunks
-    SIGMA_T_STD = 0.161779    # Std of 'overall_std' for train_audio_all_chunks
 
 config = Config()
