@@ -70,6 +70,13 @@ class Config:
 
     use_amp = False
 
+    # --- Dynamic Chunk Precomputation --- #
+    DYNAMIC_CHUNK_COUNTING = True        # Enable/disable dynamic chunk counting based on species rarity
+    MAX_CHUNKS_RARE = 7                  # Max chunks for files from species with very few files (e.g., 1 file)
+    MIN_CHUNKS_COMMON = 1                # Min chunks for files from very common species
+    COMMON_SPECIES_FILE_THRESHOLD = 150  # Species with >= this many files get MIN_CHUNKS_COMMON.
+                                         # Interpolation happens for counts < COMMON_SPECIES_FILE_THRESHOLD down to 1 file.
+
     criterion = 'FocalLossBCE'
     focal_loss_alpha = 0.25
     focal_loss_gamma = 2.0
@@ -143,7 +150,9 @@ class Config:
         'contrast_prob', 'max_time_mask_width', 'max_freq_mask_height',
         'pseudo_label_usage_threshold', 'smoothing_neighbor_weight',
         'BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD', 'birdnet_confidence_threshold',
-        'ADAIN_MODE', 'ADAIN_EPSILON'
+        'ADAIN_MODE', 'ADAIN_EPSILON',
+        'DYNAMIC_CHUNK_COUNTING', 'MAX_CHUNKS_RARE', 'MIN_CHUNKS_COMMON',
+        'COMMON_SPECIES_FILE_THRESHOLD'
     ]
 
     def get_wandb_config(self):

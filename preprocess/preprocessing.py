@@ -95,9 +95,22 @@ def load_and_prepare_metadata(config):
 
     df_working['samplename'] = df_working['filename'].map(lambda x: os.path.splitext(x.replace('/', '-'))[0])
 
+    # --- Calculate per-species file counts --- #
+    species_file_counts = {}
+    if 'primary_label' in df_working.columns and 'filename' in df_working.columns:
+        try:
+            species_file_counts = df_working.groupby('primary_label')['filename'].nunique().to_dict()
+            print(f"Calculated file counts for {len(species_file_counts)} unique species.")
+            # For debugging, print some counts:
+            # print("Sample species counts:", dict(list(species_file_counts.items())[:5]))
+        except Exception as e_counts:
+            print(f"Warning: Could not calculate species file counts: {e_counts}. Dynamic chunking might not work as expected.")
+    else:
+        print("Warning: 'primary_label' or 'filename' not in df_working. Cannot calculate species_file_counts for dynamic chunking.")
+
     end_time = time.time()
     print(f"Metadata preparation finished in {end_time - start_time:.2f} seconds.")
-    return df_working
+    return df_working, species_file_counts
 
 def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_intervals, min_samples):
     """
@@ -267,7 +280,8 @@ def _generate_spectrogram_from_chunk(audio_chunk_5s, config_obj):
 def _process_primary_for_chunking(args):
     """Worker using helper functions to generate spectrograms for one primary audio file."""
     primary_filepath, samplename, config, fabio_intervals, vad_intervals, primary_filename, \
-        class_name, scientific_name, birdnet_dets_for_file, UNCOVERED_AVES_SCIENTIFIC_NAME = args
+        class_name, scientific_name, birdnet_dets_for_file, UNCOVERED_AVES_SCIENTIFIC_NAME, \
+        num_files_for_this_species = args
 
     target_samples = int(config.TARGET_DURATION * config.FS)
     min_samples = int(0.5 * config.FS) # Min samples for a segment to be considered usable before padding
@@ -279,15 +293,65 @@ def _process_primary_for_chunking(args):
         if error_msg:
             return samplename, None, error_msg 
 
-        # Base duration for deciding how many versions to generate is from the primary audio
-        # This ensures that even if cleaned audio is shorter, we might still try to get multiple versions
         base_duration_for_versions = len(audio_for_birdnet_base) 
         
-        # 1 chunk if audio is too short or in val mode, otherwise PRECOMPUTE_VERSIONS chunks
+        # --- Determine number of versions to generate --- #
         if base_duration_for_versions < target_samples or cmd_args.mode == "val":
             num_versions_to_generate = 1
+        elif config.DYNAMIC_CHUNK_COUNTING:
+            N = num_files_for_this_species
+            N_common_thresh = config.COMMON_SPECIES_FILE_THRESHOLD
+            N_min_files_for_max_chunks = 1 # Files at or below this count get MAX_CHUNKS_RARE
+
+            C_max = config.MAX_CHUNKS_RARE
+            C_min = config.MIN_CHUNKS_COMMON
+            # Target chunks for species just below the common threshold (N_common_thresh - 1 files)
+            # This is C_min + 1, ensuring a step down to C_min at N_common_thresh.
+            C_interpolate_end = max(C_min + 1, C_min) # Should be at least C_min, typically C_min + 1 (e.g. 2 if C_min is 1)
+
+            if N >= N_common_thresh:
+                target_chunks = C_min
+            elif N <= N_min_files_for_max_chunks:
+                target_chunks = C_max
+            else:
+                # Linear interpolation for N between (N_min_files_for_max_chunks, N_common_thresh - 1)
+                # Chunks decrease as N increases.
+                x1 = float(N_min_files_for_max_chunks)
+                y1 = float(C_max) # Chunks for x1 files
+                x2 = float(N_common_thresh - 1) # Files just before common threshold
+                y2 = float(C_interpolate_end) # Chunks for x2 files
+
+                if x2 <= x1: # Should not happen if N_common_thresh > N_min_files_for_max_chunks + 1
+                    # Fallback if interpolation range is invalid (e.g., N_common_thresh is too small)
+                    target_chunks = C_max if N <= (x1 + x2) / 2 else C_interpolate_end
+                else:
+                    # Interpolation: y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
+                    calculated_chunks = y1 + (float(N) - x1) * (y2 - y1) / (x2 - x1)
+                    target_chunks = int(round(calculated_chunks))
+            
+            # Ensure chunks are within the global min/max bounds defined in config
+            rarity_based_chunks = max(config.MIN_CHUNKS_COMMON, min(target_chunks, config.MAX_CHUNKS_RARE))
+            
+            # Cap by actual audio length, allowing for more overlapping chunks for rare species
+            strict_length_cap = max(1, int(base_duration_for_versions / target_samples))
+            
+            # Determine a floor for chunks for shorter files, especially if species is rare, 
+            # but don't exceed what rarity itself dictates.
+            overlap_allowance_floor = min(rarity_based_chunks, config.MAX_CHUNKS_RARE // 2) # Use integer division
+            # Ensure this floor is at least 1, and not less than MIN_CHUNKS_COMMON if rarity_based_chunks was already MIN_CHUNKS_COMMON
+            overlap_allowance_floor = max(1, overlap_allowance_floor)
+            if rarity_based_chunks == config.MIN_CHUNKS_COMMON : # If it's a common species per rarity calc
+                 overlap_allowance_floor = min(overlap_allowance_floor, config.MIN_CHUNKS_COMMON) # Don't boost common species beyond MIN_CHUNKS_COMMON via this floor
+
+            effective_length_cap = max(strict_length_cap, overlap_allowance_floor)
+            
+            num_versions_to_generate = min(rarity_based_chunks, effective_length_cap)
+            # Final check to ensure at least 1 chunk is always generated.
+            num_versions_to_generate = max(1, num_versions_to_generate)
         else:
+            # Original logic if dynamic chunking is off
             num_versions_to_generate = config.PRECOMPUTE_VERSIONS
+        # --- End Determine number of versions --- #
 
         use_birdnet_strategy = (
             class_name == 'Aves' and
@@ -476,7 +540,7 @@ def _prepare_dataframe_for_processing(df, taxonomy_df):
 
     return df_processed
 
-def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_birdnet_detections):
+def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_birdnet_detections, species_file_counts):
     """Creates a list of argument tuples for the multiprocessing worker."""
     tasks = []
     skipped_path_count = 0
@@ -497,10 +561,13 @@ def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_bir
 
         if primary_filepath:
             birdnet_dets_for_file = all_birdnet_detections.get(primary_filename, None)
+            # Get the file count for the current species
+            current_species_file_count = species_file_counts.get(row['primary_label'], 0)
+
             tasks.append((
                 primary_filepath, samplename, config, fabio_intervals, vad_intervals, 
                 primary_filename, class_name, scientific_name, birdnet_dets_for_file,
-                UNCOVERED_AVES_SCIENTIFIC_NAME
+                UNCOVERED_AVES_SCIENTIFIC_NAME, current_species_file_count
             ))
         else:
             skipped_path_count += 1
@@ -590,7 +657,7 @@ def _save_spectrogram_npz(grouped_results, determined_output_path, project_root_
         print("Spectrogram data is likely lost. Check disk space and permissions.")
         sys.exit(1)
 
-def generate_and_save_spectrograms(df, config):
+def generate_and_save_spectrograms(df, config, species_file_counts):
     """Generates spectrogram chunks using helper functions and saves to NPZ."""
     start_time_gen = time.time()
     print("\n--- 2. Generating Spectrogram Chunks ---")
@@ -606,15 +673,20 @@ def generate_and_save_spectrograms(df, config):
     # 1. Load auxiliary data
     fabio_intervals, vad_intervals, all_birdnet_detections, taxonomy_df = _load_auxiliary_data(config)
 
-    # 2. Prepare main DataFrame
+    # 2. Prepare main DataFrame (already includes rare if USE_RARE_DATA was true)
+    # df_processed = _prepare_dataframe_for_processing(df, taxonomy_df) # df is already processed from main
+    # if df_processed is None or df_processed.empty: # Check if preparation failed
+    #      print("DataFrame preparation failed or resulted in empty DataFrame. Cannot proceed.")
+    #      return None
+    # Pass df directly as it's df_working from main, which is already prepared.
     df_processed = _prepare_dataframe_for_processing(df, taxonomy_df)
-    if df_processed is None or df_processed.empty: # Check if preparation failed
-         print("DataFrame preparation failed or resulted in empty DataFrame. Cannot proceed.")
-         return None
+    if df_processed is None or df_processed.empty:
+        print("DataFrame preparation failed or resulted in an empty DataFrame. Cannot proceed.")
+        return None
 
     # 3. Create tasks for workers
     tasks, skipped_path_count = _create_processing_tasks(
-        df_processed, config, fabio_intervals, vad_intervals, all_birdnet_detections
+        df_processed, config, fabio_intervals, vad_intervals, all_birdnet_detections, species_file_counts
     )
     if not tasks:
         print("No valid processing tasks created. Cannot proceed.")
@@ -643,11 +715,14 @@ def main(config):
     overall_start = time.time()
     print("Starting BirdCLEF Preprocessing Pipeline...")
     print(f"Configuration: Debug={config.debug}, Seed={config.seed}, UseRare={config.USE_RARE_DATA}, RemoveSpeech={config.REMOVE_SPEECH_INTERVALS}, Versions={config.PRECOMPUTE_VERSIONS}")
-    
-    df_working = load_and_prepare_metadata(config)
+    print(f"Dynamic Chunking Enabled: {config.DYNAMIC_CHUNK_COUNTING}")
+    if config.DYNAMIC_CHUNK_COUNTING:
+        print(f"  Dynamic Chunk Params: MaxRare={config.MAX_CHUNKS_RARE}, MinCommon={config.MIN_CHUNKS_COMMON}, CommonThresh={config.COMMON_SPECIES_FILE_THRESHOLD}")
+
+    df_working, species_file_counts = load_and_prepare_metadata(config)
 
     if df_working is not None and not df_working.empty:
-        generate_and_save_spectrograms(df_working, config) 
+        generate_and_save_spectrograms(df_working, config, species_file_counts) 
     else:
         print("Metadata loading failed or resulted in empty dataframe. Cannot proceed.")
 
