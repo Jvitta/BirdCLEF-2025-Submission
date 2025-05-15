@@ -39,7 +39,7 @@ class Config:
     TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
     FS = 32000 
-    TARGET_DURATION = 10.0  
+    TARGET_DURATION = 5.0  
     N_FFT = 1024
     HOP_LENGTH = 320
     WIN_LENGTH = 800
@@ -48,10 +48,10 @@ class Config:
     FMAX = None # if None, fmax = sr // 2 - fmax_aug_range // 2
     FMIN_AUG_RANGE = 10
     FMAX_AUG_RANGE = 1000
-    PREPROCESS_TARGET_SHAPE = (128, 1000) # Expected Preprocessing shape
+    PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
     TARGET_SHAPE = (128, 1000) # Final shape for training/inference
 
-    model_name = 'mn20_as' # Changed to reflect the new EfficientAT model
+    model_name = 'mn20_as'
     pretrained = True # Pretrained weights will be loaded by the EfficientAT get_model function
     in_channels = 1 # EfficientAT models expect 1 input channel (the spectrogram itself)
     num_classes = 206
@@ -60,6 +60,7 @@ class Config:
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = False
     USE_PSEUDO_LABELS = False
+    USE_WEIGHTED_SAMPLING = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
     
     NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
@@ -82,10 +83,10 @@ class Config:
     optimizer = 'AdamW'
     lr = 0.0004 
     min_lr = 1e-6
-    weight_decay = 0.8e-4 
+    weight_decay = 1e-4 
     epochs = 10
     scheduler = 'CosineAnnealingLR' 
-    T_max = 10
+    T_max = 15
 
     train_batch_size = 32
     val_batch_size = 64

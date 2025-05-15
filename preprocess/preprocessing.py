@@ -280,22 +280,11 @@ def _process_primary_for_chunking(args):
         if error_msg:
             return samplename, None, error_msg 
 
-        # Base duration for deciding how many versions to generate is from the primary audio
-        # This ensures that even if cleaned audio is shorter, we might still try to get multiple versions
-        base_duration_for_versions = len(audio_for_birdnet_base) 
-        
         # Determine the number of versions to generate
         if cmd_args.mode == "val":
             num_versions_to_generate = 1
         else:  # Training mode
-            if base_duration_for_versions < target_samples:
-                num_versions_to_generate = 1  # Generate one chunk (which will be padded/tiled)
-            else:
-                num_full_chunks_fittable = int(base_duration_for_versions // target_samples)
-                
-                # We want at least 1 chunk if it's long enough, but no more than PRECOMPUTE_VERSIONS
-                # and no more than what can actually fit without forcing excessive overlap by this rule.
-                num_versions_to_generate = min(config.PRECOMPUTE_VERSIONS, max(1, num_full_chunks_fittable))
+            num_versions_to_generate = 1 if len(audio_for_birdnet_base) < target_samples else config.PRECOMPUTE_VERSIONS
 
         use_birdnet_strategy = (
             class_name == 'Aves' and

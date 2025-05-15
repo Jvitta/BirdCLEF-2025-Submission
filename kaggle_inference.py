@@ -18,6 +18,7 @@ from pathlib import Path
 import multiprocessing
 from functools import partial
 import traceback
+import matplotlib.pyplot as plt # Added for visualization
 
 import numpy as np
 import pandas as pd
@@ -50,8 +51,6 @@ class BirdCLEF2025Pipeline:
         self.species_ids = []
         self.models = []
         self._load_taxonomy()
-        # self.spectrogram_generator = AugmentMelSTFT(...) # REMOVE - Worker handles its own instance
-        # self.spectrogram_generator.eval()
 
     def _load_taxonomy(self):
         """Load taxonomy data from CSV specified in config."""
@@ -114,9 +113,6 @@ class BirdCLEF2025Pipeline:
                 print(f"Loading model: {model_path}")
                 checkpoint = torch.load(model_path, map_location=torch.device(self.config.device))
                 
-                # Instantiate EfficientAT model using get_efficient_at_model
-                # Assuming config.model_name is like 'mn10_as' or similar for pretrained_name for EfficientAT
-                # And that width_mult, head_type are suitable with defaults or set in config if different
                 model = get_efficient_at_model(
                     num_classes=self.config.num_classes, # Use self.config
                     pretrained_name=None,               # Pass None to prevent loading base weights from URL
@@ -171,8 +167,8 @@ class BirdCLEF2025Pipeline:
             test_files = list(Path(self.config.test_audio_dir).glob('*.ogg'))
         else:
             test_files = list(Path(self.config.unlabeled_audio_dir).glob('*.ogg'))
-            print(f"Debug mode enabled, using only {700} files")
-            test_files = test_files[:700]
+            print(f"Debug mode enabled, using only {self.config.debug_limit_files} files from unlabeled_audio_dir for testing inference pipeline.")
+            test_files = test_files[:self.config.debug_limit_files]
         print(f"Found {len(test_files)} test soundscapes")
 
         # --- Stage 1: Parallel Preprocessing --- 
@@ -210,6 +206,28 @@ class BirdCLEF2025Pipeline:
                 pool.close()
                 pool.join()
         
+        specs_to_visualize = all_specs_list[:12] # Ensure we don't exceed list length
+
+        # --- Visualize Spectrograms ---
+        if specs_to_visualize:
+            visualization_output_dir = "visualized_spectrograms"
+            os.makedirs(visualization_output_dir, exist_ok=True)
+            print(f"Saving {len(specs_to_visualize)} spectrograms to '{visualization_output_dir}'...")
+            for idx, spec_to_vis in enumerate(specs_to_visualize):
+                try:
+                    file_path = os.path.join(visualization_output_dir, f"spec_{idx}.png")
+                    # Ensure spectrogram is 2D (remove channel if it was added, though worker returns 2D)
+                    if spec_to_vis.ndim == 3 and spec_to_vis.shape[0] == 1:
+                        spec_to_vis_2d = spec_to_vis.squeeze(0)
+                    else:
+                        spec_to_vis_2d = spec_to_vis
+                    
+                    plt.imsave(file_path, spec_to_vis_2d, cmap='gray', origin='lower')
+                except Exception as e:
+                    print(f"Could not save spectrogram {idx}: {e}")
+            print(f"Finished saving spectrograms.")
+        # --- End Visualize Spectrograms ---
+
         end_preprocess = time.time()
         print(f"Preprocessing finished in {end_preprocess - start_preprocess:.2f} seconds.")
         print(f"Total spectrogram segments generated: {len(all_specs_list)}")
@@ -258,10 +276,6 @@ class BirdCLEF2025Pipeline:
                 batch_tensor = batch_tensor.unsqueeze(1) 
                 batch_tensor = batch_tensor.to(self.config.device)
                 
-                # REMOVE: 3-channel repeat and ImageNet normalization
-                # batch_tensor = batch_tensor.repeat(1, 3, 1, 1) 
-                # batch_tensor = normalize(batch_tensor)
-                
                 # --- Ensemble Logic --- 
                 batch_model_preds = []
                 for model in self.models:
@@ -270,8 +284,7 @@ class BirdCLEF2025Pipeline:
                         logits = outputs[0] # Select the logits
                         probs = torch.sigmoid(logits) # Apply sigmoid to logits
                         batch_model_preds.append(probs.cpu().numpy())
-                   
-                        
+                         
                 # Average predictions across models for this TTA iteration
                 avg_model_preds = np.mean(batch_model_preds, axis=0)
                 batch_tta_preds.append(avg_model_preds)
@@ -344,7 +357,7 @@ class BirdCLEF2025Pipeline:
             
             if predictions.shape[0] > 1:
                 # Smooth the predictions using neighboring segments
-                neighbor_weight = 0.125
+                neighbor_weight = 0.0
                 center_weight = 1.0 - (2 * neighbor_weight)
                 edge_weight = 1.0 - neighbor_weight
 

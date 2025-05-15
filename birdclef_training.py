@@ -22,6 +22,10 @@ from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
+from sklearn.utils import resample
+from torch.utils.data.sampler import WeightedRandomSampler
+from collections import Counter
+import math
 
 from config import config
 import utils as utils
@@ -880,22 +884,55 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
 
             # Pass the pre-loaded dictionary (or None) to the Dataset
             # NOW, pass both the hardcoded targets AND the shared tracking set (REMOVED THESE)
-            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms) # Removed target_samplenames_to_log, logged_samplenames_shared_list
-            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms) # Removed target_samplenames_to_log, logged_samplenames_shared_list
+            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms) 
+            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms) 
 
             # Get species_ids from the first validation dataset instance created
             if overall_species_ids_for_run is None and hasattr(val_dataset, 'species_ids'):
                 overall_species_ids_for_run = val_dataset.species_ids
 
+            train_sampler = None
+            shuffle_train_loader = True
+
+            if config.USE_WEIGHTED_SAMPLING:
+                print("Using WeightedRandomSampler for training data based on 'samplename'.")
+                # Extract species identifiers from the 'samplename' column of the current fold's training data
+                # Assumes train_df_fold['samplename'] exists and is in format 'species_id-other_info'
+                if 'samplename' not in train_df_fold.columns:
+                    print("ERROR: 'samplename' column not found in train_df_fold. Cannot apply weighted sampling. Defaulting to shuffle=True")
+                    train_sampler = None
+                    shuffle_train_loader = True
+                else:
+                    try:
+                        all_species_ids_for_fold_samples = [sn.split('-')[0] for sn in train_df_fold['samplename']]
+                        
+                        # Calculate frequency of each species_id in this fold
+                        species_id_counts_in_fold = Counter(all_species_ids_for_fold_samples)
+                        
+                        # Calculate weight for each sample in this fold: 1 / sqrt(count of its species_id)
+                        sample_weights_for_fold = [1.0 / math.sqrt(max(1, species_id_counts_in_fold[sid])) for sid in all_species_ids_for_fold_samples]
+                        
+                        weights_tensor = torch.tensor(sample_weights_for_fold, dtype=torch.float)
+                        train_sampler = WeightedRandomSampler(weights_tensor, num_samples=len(weights_tensor), replacement=True)
+                        shuffle_train_loader = False # Sampler handles shuffling
+                        print(f"  WeightedRandomSampler created for fold {fold} with {len(weights_tensor)} weights.")
+                    except Exception as e_sampler:
+                        print(f"ERROR creating WeightedRandomSampler for fold {fold}: {e_sampler}. Defaulting to shuffle=True")
+                        train_sampler = None
+                        shuffle_train_loader = True
+            else:
+                print("Not using WeightedRandomSampler for training data. Standard shuffling will be used.")
+
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=config.train_batch_size,
-                shuffle=True,
+                shuffle=shuffle_train_loader,
                 num_workers=config.num_workers,
                 pin_memory=True,
                 collate_fn=collate_fn,
                 drop_last=True,
-                persistent_workers=True if config.num_workers > 0 else False
+                persistent_workers=True if config.num_workers > 0 else False,
+                sampler=train_sampler
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -1326,6 +1363,7 @@ if __name__ == "__main__":
     try:
         main_train_df_full = pd.read_csv(config.train_csv_path)
         main_train_df_full['filepath'] = main_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
+        # Add samplename: e.g. 1139490/CSA36385.ogg -> 1139490-CSA36385
         main_train_df_full['samplename'] = main_train_df_full.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
         main_train_df_full['data_source'] = 'main'
         
