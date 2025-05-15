@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
 from sklearn.utils import resample
@@ -781,10 +782,13 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
         run_name = f"trial_{trial.number}" if is_hpo_trial else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
     
     group_name = "hpo" if is_hpo_trial else "full_training"
+
+    # Select relevant config parameters for logging
+    relevant_config_params = config.get_wandb_config()
     
     wandb_run = wandb.init(
         project="BirdCLEF-2025", # Or your preferred project name
-        config={key: value for key, value in config.__dict__.items() if not key.startswith('__') and not callable(value)},
+        config=relevant_config_params, # Use the curated dictionary
         name=run_name,
         group=group_name,
         job_type="train",
@@ -794,11 +798,6 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
     if is_hpo_trial:
         wandb.config.update(trial.params, allow_val_change=True)
 
-    # --- Prepare for Spectrogram Logging using Multiprocessing Manager ---
-    # manager = multiprocessing.Manager()
-    # logged_samplenames_shared_list = manager.list()
-    # target_samplenames_to_log_this_run = set(['21038', 'bicwre1', 'turvul', 'ruther1', 'ywcpar', '66578'])
-    
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
@@ -838,6 +837,69 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
     elif config.USE_PSEUDO_LABELS:
          print("Warning: Could not filter pseudo-labels by confidence. 'data_source' or 'confidence' column missing.")
     # --- End filtering --- 
+
+    if config.USE_RARE_DATA:
+        print("\n--- Loading Rare Species Data (USE_RARE_DATA=True) ---")
+        try:
+            rare_train_df_full = pd.read_csv(config.train_rare_csv_path)
+            if not rare_train_df_full.empty:
+                # Ensure 'filename' and 'primary_label' exist, which they should from the generator script
+                if 'filename' not in rare_train_df_full.columns or 'primary_label' not in rare_train_df_full.columns:
+                    print("ERROR: train_rare.csv is missing 'filename' or 'primary_label' column. Skipping rare data.")
+                else:
+                    rare_train_df_full['filepath'] = rare_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_rare_dir, f))
+                    # Consistent samplename generation for rare data
+                    rare_train_df_full['samplename'] = rare_train_df_full.filename.map(
+                        lambda x: str(x.split('/')[0]) + '-' + str(x.split('/')[-1].split('.')[0])
+                    )
+                    rare_train_df_full['data_source'] = 'rare' # Add data source identifier
+                    # Ensure secondary_labels exists, even if empty, for consistent concatenation
+                    if 'secondary_labels' not in rare_train_df_full.columns:
+                         rare_train_df_full['secondary_labels'] = [[] for _ in range(len(rare_train_df_full))]
+
+                    required_cols_rare = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source']
+                    # Select only necessary columns, ensuring all exist
+                    missing_cols_rare = [col for col in required_cols_rare if col not in rare_train_df_full.columns]
+                    if missing_cols_rare:
+                        print(f"ERROR: Rare DataFrame is missing required columns after processing: {missing_cols_rare}. Skipping rare data.")
+                    else:
+                        rare_train_df = rare_train_df_full[required_cols_rare].copy()
+                        print(f"Loaded and selected columns for {len(rare_train_df)} rare training samples.")
+                        del rare_train_df_full; gc.collect()
+                        
+                        # Concatenate with main training data
+                        working_df = pd.concat([working_df, rare_train_df], ignore_index=True)
+                        print(f"Combined DataFrame size (main + rare): {len(working_df)} samples.")
+            else:
+                print("train_rare.csv found but is empty. No rare data added.")
+
+        except Exception as e:
+            print(f"CRITICAL ERROR loading or processing rare labels CSV {config.train_rare_csv_path}: {e}")
+            sys.exit(1)
+    else:
+        print("\nSkipping rare-species data (USE_RARE_DATA=False).")
+
+    # Final check on combined dataframe and spectrograms
+    print(f"\nFinal training dataframe size: {len(working_df)} samples.")
+    
+    # --- Filter training_df based on loaded spectrogram keys if configured to load them --- #
+    if config.LOAD_PREPROCESSED_DATA:
+        print(f"\nConfigured to load preprocessed data. Filtering dataframe...")
+        print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
+        
+        original_count = len(working_df)
+
+        loaded_keys = set(all_spectrograms.keys())
+        working_df = working_df[working_df['samplename'].isin(loaded_keys)].reset_index(drop=True)
+        filtered_count = len(working_df)
+        
+        removed_count = original_count - filtered_count
+        if removed_count > 0:
+            print(f"  WARNING: Removed {removed_count} samples from training_df because their spectrograms were not found in the loaded NPZ file(s).")
+        
+        print(f"  Final training_df size after filtering: {filtered_count} samples.")
+    else:
+        print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
 
     skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
    
@@ -952,7 +1014,7 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
                 model = get_efficient_at_model(
                     num_classes=config.num_classes,          
                     pretrained_name=config.model_name,               
-                    width_mult=2.0,                         
+                    width_mult=config.width_mult,                         
                     head_type="mlp",                         
                     input_dim_f=config.TARGET_SHAPE[0],     
                     input_dim_t=config.TARGET_SHAPE[1]      
@@ -962,29 +1024,13 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
             criterion = get_criterion(config)
             scheduler = get_scheduler(optimizer, config)
 
-            # Direct import test for GradScaler
-            try:
-                from torch.cuda.amp import GradScaler
-                print("Successfully imported GradScaler from torch.cuda.amp")
-                scaler = GradScaler(enabled=config.use_amp)
-            except ImportError as e:
-                print(f"Failed to import GradScaler from torch.cuda.amp: {e}")
-                print("Attempting import from torch.amp ...")
-                try:
-                    from torch.amp import GradScaler
-                    print("Successfully imported GradScaler from torch.amp")
-                    scaler = GradScaler(enabled=config.use_amp)
-                except ImportError as e2:
-                    print(f"Failed to import GradScaler from torch.amp: {e2}")
-                    print("Disabling AMP as GradScaler cannot be imported.")
-                    config.use_amp = False # Ensure AMP is off if scaler can't be created
-                    scaler = torch.amp.GradScaler(enabled=False) # Dummy for now, will be removed
-            
+            scaler = GradScaler(enabled=config.use_amp)
+
             print(f"Automatic Mixed Precision (AMP): {'Enabled' if config.use_amp and scaler.is_enabled() else 'Disabled'}")
 
             best_val_auc = 0.0
             best_epoch = 0
-            # New: Store metrics from the best epoch of the current fold
+
             best_epoch_val_per_class_metrics = None
             best_epoch_val_all_outputs = None
             best_epoch_val_all_targets = None

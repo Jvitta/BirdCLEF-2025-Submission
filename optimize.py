@@ -14,7 +14,7 @@ import functools # Add functools for passing args to objective
 
 from config import config as base_config
 
-from train import run_training, set_seed, calculate_auc # Import calculate_auc
+from birdclef_training import run_training, set_seed, calculate_auc # Import calculate_auc
 
 # load data once for HPO
 print("Loading main training metadata for HPO...")
@@ -25,12 +25,13 @@ try:
         main_train_df_full['samplename'] = main_train_df_full.filename.map(
             lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0]
         )
+        main_train_df_full['data_source'] = 'main' # Add data_source column
     else:
         print("Error: 'filename' column not found in main training CSV. Cannot create 'samplename'. Exiting.")
         sys.exit(1)
     
     # Select only necessary columns to mimic training script setup
-    required_cols_main = ['samplename', 'primary_label', 'secondary_labels'] # Add other cols if needed by run_training
+    required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'data_source'] # Add 'data_source'
     if not all(col in main_train_df_full.columns for col in required_cols_main):
         missing = [col for col in required_cols_main if col not in main_train_df_full.columns]
         print(f"Error: Required columns missing from main training CSV: {missing}. Exiting.")
@@ -54,31 +55,41 @@ def objective(trial, preloaded_data):
     cfg = copy.deepcopy(base_config)
 
     # --- Determine Fold for this Trial ---
-    # Cycle through folds based on trial number
-    fold_to_run = trial.number % cfg.n_fold
-    print(f"INFO: HPO Trial {trial.number} will run on Fold {fold_to_run}")
-    cfg.selected_folds = [fold_to_run] # Configure training to run only this fold
+    # HPO will run on a single, fixed fold for stability (e.g., Fold 2)
+    fixed_hpo_fold = 2
+    # fold_to_run = trial.number % cfg.n_fold # Removed: Using a fixed fold
+    print(f"INFO: HPO Trial {trial.number} will run on fixed Fold {fixed_hpo_fold}")
+    cfg.selected_folds = [fixed_hpo_fold] # Configure training to run only this fold
     # --- End Fold Determination ---
 
     # --- Hyperparameter Suggestions --- #
     # Keep learning rate search tight around the known good value
-    cfg.lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True) # e.g., Tight range around 5e-4
+    cfg.lr = trial.suggest_float("lr", 3e-4, 7e-4, log=True) 
 
     # Keep weight decay search tight around the known good value
-    cfg.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True) # e.g., Tight range around 1e-5
+    cfg.weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-3, log=True) 
 
-    # Focal Loss Hyperparameters
-    cfg.focal_loss_alpha = trial.suggest_float("focal_loss_alpha", 0.05, 0.95) # Standard range, often 0.25 is good
-    cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 0.5, 5.0) # Standard range, 1.0-3.0 often good
-    cfg.focal_loss_bce_weight = trial.suggest_float("focal_loss_bce_weight", 0.0, 2.0) # Full range for BCE vs Focal balance
+    # Focal Loss Hyperparameters (Removed based on user feedback for this HPO run)
+    # cfg.focal_loss_alpha = trial.suggest_float("focal_loss_alpha", 0.05, 0.95) 
+    # cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 0.5, 5.0) 
+    # cfg.focal_loss_bce_weight = trial.suggest_float("focal_loss_bce_weight", 0.0, 2.0)
 
-    # Keep other parameters fixed for this study
-    cfg.mixup_alpha = base_config.mixup_alpha
+    # Max Frequency Mask Height (for 128 mel bins)
+    cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 10, 20)
+
+    # Max Time Mask Width (for 500 time frames in preprocessed spec)
+    cfg.max_time_mask_width = trial.suggest_int("max_time_mask_width", 30, 70)
+
+    # Label Smoothing
+    cfg.label_smoothing_factor = trial.suggest_float("label_smoothing_factor", 0.0, 0.25)
+
+    # Mixup Alpha
+    cfg.mixup_alpha = trial.suggest_float("mixup_alpha", 0.3, 0.5)
+
+    # Keep other augmentation probabilities fixed for this study, as their effect might be captured by mask sizes
     cfg.time_mask_prob = base_config.time_mask_prob
     cfg.freq_mask_prob = base_config.freq_mask_prob
     cfg.contrast_prob = base_config.contrast_prob
-    cfg.max_time_mask_width = base_config.max_time_mask_width
-    cfg.max_freq_mask_height = base_config.max_freq_mask_height
     # --- End Hyperparameter Suggestions ---
 
     # --- Trial Configuration ---
@@ -112,13 +123,13 @@ def objective(trial, preloaded_data):
 
         # Handle None or invalid return values robustly
         if single_fold_best_auc is None or not isinstance(single_fold_best_auc, (int, float)) or pd.isna(single_fold_best_auc) or not abs(single_fold_best_auc) > 0:
-             print(f"Warning: Trial {trial.number} (Fold {fold_to_run}) resulted in invalid AUC ({single_fold_best_auc}). Reporting as 0.0.")
+             print(f"Warning: Trial {trial.number} (Fold {fixed_hpo_fold}) resulted in invalid AUC ({single_fold_best_auc}). Reporting as 0.0.")
              single_fold_best_auc = 0.0
         else:
-             print(f"\n--- Finished Optuna Trial {trial.number} (Fold {fold_to_run}) | Best Val AUC for Fold: {single_fold_best_auc:.4f} ---")
+             print(f"\n--- Finished Optuna Trial {trial.number} (Fold {fixed_hpo_fold}) | Best Val AUC for Fold: {single_fold_best_auc:.4f} ---")
 
     except optuna.TrialPruned:
-        print(f"--- Optuna Trial {trial.number} (Fold {fold_to_run}) was pruned ---")
+        print(f"--- Optuna Trial {trial.number} (Fold {fixed_hpo_fold}) was pruned ---")
         raise # Re-raise the exception to signal pruning to Optuna
 
     except Exception as e:
@@ -139,12 +150,12 @@ def objective(trial, preloaded_data):
 
 if __name__ == "__main__":
     # --- Study Configuration ---
-    study_name = "BirdCLEF_HPO_FocalLoss_LR_WD" # Focused study name
+    study_name = "BirdCLEF_HPO_Augmentations_LR_WD" # Focused study name
     n_trials = 200 # Adjust number of trials as needed for this focused study
 
     # --- Define paths for GCP --- #
     # Database will be stored in the OUTPUT_DIR defined in config.py
-    db_filename = "hpo_focalloss_study_results.db" # Specific DB file
+    db_filename = "hpo_augmentations_study_results.db" # Specific DB file
     db_filepath = os.path.join(base_config.OUTPUT_DIR, db_filename)
     storage_path = f"sqlite:///{db_filepath}" # Use absolute path for Optuna
 
@@ -184,22 +195,27 @@ if __name__ == "__main__":
     # Add base config parameters and tuned parameters as user attributes for reference
     study.set_user_attr("base_config_epochs", base_config.epochs)
     study.set_user_attr("hpo_trial_epochs", hpo_trial_epochs)
-    # study.set_user_attr("hpo_trial_folds", hpo_trial_folds)
+    study.set_user_attr("hpo_fixed_fold", 2) # Indicate that HPO runs on a fixed fold
+    # study.set_user_attr("hpo_trial_folds", hpo_trial_folds) # Removed as we use a fixed fold
     # Updated list of tuned parameters
     tuned_params_list = [
-        "lr", "weight_decay", "focal_loss_alpha", "focal_loss_gamma", "focal_loss_bce_weight"
+        "lr", "weight_decay", "max_freq_mask_height", "max_time_mask_width", "label_smoothing_factor", "mixup_alpha"
     ]
     study.set_user_attr("tuned_parameters", tuned_params_list)
     # Store fixed parameters for reference
     study.set_user_attr("fixed_optimizer", base_config.optimizer)
     study.set_user_attr("fixed_scheduler", base_config.scheduler)
-    study.set_user_attr("fixed_mixup_alpha", base_config.mixup_alpha)
-    study.set_user_attr("fixed_augmentations", {
+    # study.set_user_attr("fixed_mixup_alpha", base_config.mixup_alpha) # mixup_alpha is tuned
+    study.set_user_attr("base_config_mixup_alpha", base_config.mixup_alpha) # Log base value for context
+
+    # Log base augmentation probabilities and contrast, as mask sizes are tuned
+    study.set_user_attr("base_config_augmentations", {
         "time_mask_prob": base_config.time_mask_prob,
         "freq_mask_prob": base_config.freq_mask_prob,
-        "contrast_prob": base_config.contrast_prob,
-        "max_time_mask_width": base_config.max_time_mask_width,
-        "max_freq_mask_height": base_config.max_freq_mask_height
+        "contrast_prob": base_config.contrast_prob
+        # max_time_mask_width and max_freq_mask_height are tuned, so not listed as fixed here
+        # "max_time_mask_width": base_config.max_time_mask_width,
+        # "max_freq_mask_height": base_config.max_freq_mask_height
     })
 
     # --- Pre-load NPZ data once --- #

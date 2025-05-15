@@ -113,33 +113,33 @@ def main():
     os.makedirs(config._PREPROCESSED_OUTPUT_DIR, exist_ok=True)
     adain_stats_save_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, adain_stats_filename)
 
-    # --- 1. Process ALL Soundscape Chunks ---
-    print("Processing ALL Soundscape Chunks (Generating Spectrograms)...")
-    soundscape_files = list(Path(config.unlabeled_audio_dir).glob('*.ogg'))
-    if config.debug and config.debug_limit_files > 0:
-        print(f"DEBUG MODE: Limiting soundscape processing to {config.debug_limit_files} files.")
-        soundscape_files = soundscape_files[:config.debug_limit_files]
+# --- 1. Process ALL Soundscape Chunks ---
+print("Processing ALL Soundscape Chunks (Generating Spectrograms)...")
+soundscape_files = list(Path(config.unlabeled_audio_dir).glob('*.ogg'))
+if config.debug and config.debug_limit_files > 0:
+     print(f"DEBUG MODE: Limiting soundscape processing to {config.debug_limit_files} files.")
+     soundscape_files = soundscape_files[:config.debug_limit_files]
 
-    if not soundscape_files:
+if not soundscape_files:
         print(f"Warning: No soundscape audio files found in {config.unlabeled_audio_dir}. Skipping soundscape processing.")
-    else:
-        print(f"Found {len(soundscape_files)} soundscape files to process.")
-        worker_func = partial(_process_soundscape_file, config_obj=config)
+else:
+    print(f"Found {len(soundscape_files)} soundscape files to process.")
+    worker_func = partial(_process_soundscape_file, config_obj=config)
         soundscape_results_raw = []
-        pool = None
-        try:
-            try: multiprocessing.set_start_method('spawn', force=True)
-            except RuntimeError: pass
-            print(f"Starting soundscape processing pool with {NUM_WORKERS} workers...")
-            pool = multiprocessing.Pool(processes=NUM_WORKERS)
-            results_iterator = pool.imap_unordered(worker_func, [str(p) for p in soundscape_files])
+    pool = None
+    try:
+        try: multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError: pass
+        print(f"Starting soundscape processing pool with {NUM_WORKERS} workers...")
+        pool = multiprocessing.Pool(processes=NUM_WORKERS)
+        results_iterator = pool.imap_unordered(worker_func, [str(p) for p in soundscape_files])
             for result in tqdm(results_iterator, total=len(soundscape_files), desc="Processing Soundscapes"):
                 if isinstance(result, Exception): print(f"Worker Error: {result}")
                 elif result: soundscape_results_raw.extend(result)
-        except Exception as e_pool:
+    except Exception as e_pool:
             print(f"CRITICAL ERROR during multiprocessing: {e_pool}\\n{traceback.format_exc()}")
-        finally:
-            if pool: pool.close(); pool.join()
+    finally:
+        if pool: pool.close(); pool.join()
         
         for stats_item in soundscape_results_raw: stats_item['source'] = 'soundscape_all_chunks'
         all_stats_collection.extend(soundscape_results_raw)
@@ -148,14 +148,14 @@ def main():
     # --- 2. Process ALL Original Train Audio Chunks (from Precomputed) ---
     print("Processing ALL Original Train Audio Chunks (from Precomputed NPZ)...")
     original_train_stats_list = []
-    try:
-        with np.load(config.PREPROCESSED_NPZ_PATH) as data:
+try:
+    with np.load(config.PREPROCESSED_NPZ_PATH) as data:
             samplenames = list(data.keys())
             print(f"Found {len(samplenames)} train_audio spectrogram entries in '{config.PREPROCESSED_NPZ_PATH}'.")
             for samplename in tqdm(samplenames, desc="Original Train Specs"):
                 spec_chunks_array = data[samplename]
-                if spec_chunks_array is not None and spec_chunks_array.ndim == 3 and spec_chunks_array.shape[0] > 0:
-                    for i in range(spec_chunks_array.shape[0]):
+        if spec_chunks_array is not None and spec_chunks_array.ndim == 3 and spec_chunks_array.shape[0] > 0:
+            for i in range(spec_chunks_array.shape[0]):
                         spec_2d_original = spec_chunks_array[i]
                         stats = calculate_signal_stats(spec_2d_original)
                         stats['source'] = 'train_audio_original'
@@ -163,9 +163,9 @@ def main():
                         original_train_stats_list.append(stats)
         all_stats_collection.extend(original_train_stats_list)
         print(f"Collected stats for {len(original_train_stats_list)} original train chunks.")
-    except FileNotFoundError as fnf_e:
+except FileNotFoundError as fnf_e:
         print(f"ERROR: Precomputed train audio NPZ file not found: {fnf_e}. Cannot process original train stats.")
-    except Exception as e:
+except Exception as e:
         print(f"ERROR loading/processing precomputed train audio data for original stats: {e}.")
 
     # --- 3. Create and Save AdaIN Statistics NPZ (from soundscape and original train) ---
@@ -263,7 +263,7 @@ def main():
     # --- 5. Final Aggregation and Plotting (all three sources) ---
     if not all_stats_collection:
         print("No statistics collected at all. Exiting.")
-        sys.exit(0)
+    sys.exit(0)
 
     stats_df = pd.DataFrame(all_stats_collection)
     stats_df.dropna(subset=['overall_mean', 'overall_std'], inplace=True)
@@ -276,37 +276,37 @@ def main():
     stats_df = stats_df[stats_df['mean_per_time_bin'].apply(check_valid_time_array)]
     stats_df = stats_df[stats_df['std_per_time_bin'].apply(check_valid_time_array)]
 
-    if stats_df.empty:
+if stats_df.empty:
         print("Final statistics DataFrame is empty after dropping NaNs. Exiting.")
-        sys.exit(0)
+    sys.exit(0)
 
     print(f"\\nCollected a total of {len(stats_df)} valid spectrogram statistics entries for plotting.")
-    print("Summary Statistics by Source (Overall Metrics):")
-    stat_metrics_to_plot_overall = ["overall_mean", "overall_std"]
-    summary_overall = stats_df.groupby('source')[stat_metrics_to_plot_overall].agg(['mean', 'median', 'std'])
-    print(summary_overall)
+print("Summary Statistics by Source (Overall Metrics):")
+stat_metrics_to_plot_overall = ["overall_mean", "overall_std"]
+summary_overall = stats_df.groupby('source')[stat_metrics_to_plot_overall].agg(['mean', 'median', 'std'])
+print(summary_overall)
 
-    plt.style.use('seaborn-v0_8-whitegrid')
-    
+plt.style.use('seaborn-v0_8-whitegrid')
+
     # Overall Histograms
     print("\\nGenerating overall distribution plots...")
-    for metric in stat_metrics_to_plot_overall:
+for metric in stat_metrics_to_plot_overall:
         plt.figure(figsize=(12, 7))
-        sns.histplot(data=stats_df, x=metric, hue='source', kde=True, bins=50, common_norm=False, stat="density")
-        plt.title(f"Distribution of Spectrogram {metric.replace('_', ' ').title()}")
-        plt.xlabel(metric.replace('_', ' ').title())
-        plt.ylabel("Density")
+    sns.histplot(data=stats_df, x=metric, hue='source', kde=True, bins=50, common_norm=False, stat="density")
+    plt.title(f"Distribution of Spectrogram {metric.replace('_', ' ').title()}")
+    plt.xlabel(metric.replace('_', ' ').title())
+    plt.ylabel("Density")
         plot_filename = f"{metric}_comparison_all_sources.png"
-        plot_path = os.path.join(PLOT_OUTPUT_DIR, plot_filename)
+    plot_path = os.path.join(PLOT_OUTPUT_DIR, plot_filename)
         try: plt.savefig(plot_path); print(f"Saved plot: {plot_path}")
         except Exception as e_save: print(f"Error saving plot {plot_filename}: {e_save}")
-        plt.close()
+    plt.close()
 
-    # Per-frequency line plots
+# Per-frequency line plots
     print("\\nAggregating and plotting per-frequency statistics for all sources...")
     final_per_freq_plot_data = {}
-    for source_name, group_df in stats_df.groupby('source'):
-        if group_df.empty: continue
+for source_name, group_df in stats_df.groupby('source'):
+    if group_df.empty: continue
         
         # Ensure arrays are correctly stacked (they should be valid due to earlier check_valid_array_for_npz)
         stacked_means = np.stack(group_df['mean_per_freq_bin'].tolist())
@@ -340,7 +340,7 @@ def main():
         }
         default_style = {'linestyle': '-', 'marker': 'None', 'color': 'black'} # Fallback
 
-        # Plotting per-frequency mean
+# Plotting per-frequency mean
         plt.figure(figsize=(14, 8)) # Slightly larger figure
         title_mean = "Average Mean Value per Frequency Bin (All Sources)"
         for source_name, data_vals in final_per_freq_plot_data.items():
@@ -355,12 +355,12 @@ def main():
                              alpha=0.15, color=style['color']) # Reduced alpha for fill
         plt.xlabel("Frequency Bin Index"); plt.ylabel("Average Mean Spectrogram Value"); plt.title(title_mean); plt.legend(); plt.grid(True)
         plot_filename_mean = "per_freq_avg_mean_comparison_all_sources.png"
-        plot_path_mean = os.path.join(PLOT_OUTPUT_DIR, plot_filename_mean)
+plot_path_mean = os.path.join(PLOT_OUTPUT_DIR, plot_filename_mean)
         try: plt.savefig(plot_path_mean); print(f"Saved plot: {plot_path_mean}")
         except Exception as e_save: print(f"Error saving plot {plot_filename_mean}: {e_save}")
-        plt.close()
+plt.close()
 
-        # Plotting per-frequency std dev
+# Plotting per-frequency std dev
         plt.figure(figsize=(14, 8)) # Slightly larger figure
         title_std = "Average Standard Deviation per Frequency Bin (All Sources)"
         for source_name, data_vals in final_per_freq_plot_data.items():
@@ -375,7 +375,7 @@ def main():
                              alpha=0.15, color=style['color']) # Reduced alpha for fill
         plt.xlabel("Frequency Bin Index"); plt.ylabel("Average Std Dev of Spectrogram Values"); plt.title(title_std); plt.legend(); plt.grid(True)
         plot_filename_std = "per_freq_avg_std_comparison_all_sources.png"
-        plot_path_std = os.path.join(PLOT_OUTPUT_DIR, plot_filename_std)
+plot_path_std = os.path.join(PLOT_OUTPUT_DIR, plot_filename_std)
         try: plt.savefig(plot_path_std); print(f"Saved plot: {plot_path_std}")
         except Exception as e_save: print(f"Error saving plot {plot_filename_std}: {e_save}")
         plt.close()
@@ -450,10 +450,10 @@ def main():
         plot_path_std_time = os.path.join(PLOT_OUTPUT_DIR, plot_filename_std_time)
         try: plt.savefig(plot_path_std_time); print(f"Saved plot: {plot_path_std_time}")
         except Exception as e_save: print(f"Error saving plot {plot_filename_std_time}: {e_save}")
-        plt.close()
+plt.close()
 
     print(f"\\nSignal statistics comparison plots saved to: {PLOT_OUTPUT_DIR}")
-    print("--- EDA Finished ---")
+print("--- EDA Finished ---")
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()

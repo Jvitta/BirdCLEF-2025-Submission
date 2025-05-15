@@ -51,7 +51,8 @@ class Config:
     PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
     TARGET_SHAPE = (128, 1000) # Final shape for training/inference
 
-    model_name = 'mn20_as'
+    model_name = 'mn20_as' 
+    width_mult = 2.0
     pretrained = True # Pretrained weights will be loaded by the EfficientAT get_model function
     in_channels = 1 # EfficientAT models expect 1 input channel (the spectrogram itself)
     num_classes = 206
@@ -129,5 +130,27 @@ class Config:
     ADAIN_MODE = 'none'  # Options: 'none', 'global', 'per_frequency'
     ADAIN_PER_FREQUENCY_STATS_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, "adain_per_frequency_stats.npz")
     ADAIN_EPSILON = 1e-6 # Epsilon for numerical stability in division
+
+    _wandb_log_params = [
+        'seed', 'TARGET_DURATION', 'N_MELS', 'PREPROCESS_TARGET_SHAPE', 'TARGET_SHAPE',
+        'model_name', 'width_mult', 'REMOVE_SPEECH_INTERVALS', 'USE_RARE_DATA', 'USE_PSEUDO_LABELS',
+        'USE_WEIGHTED_SAMPLING', 'PRECOMPUTE_VERSIONS', 'use_amp', 'criterion',
+        'focal_loss_alpha', 'focal_loss_gamma', 'focal_loss_bce_weight',
+        'label_smoothing_factor', 'n_fold', 'selected_folds', 'epochs', 'optimizer',
+        'lr', 'min_lr', 'weight_decay', 'scheduler', 'T_max', 'train_batch_size',
+        'val_batch_size', 'batch_augment_prob', 'mixup_vs_cutmix_ratio',
+        'mixup_alpha', 'cutmix_alpha', 'time_mask_prob', 'freq_mask_prob',
+        'contrast_prob', 'max_time_mask_width', 'max_freq_mask_height',
+        'pseudo_label_usage_threshold', 'smoothing_neighbor_weight',
+        'BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD', 'birdnet_confidence_threshold',
+        'ADAIN_MODE', 'ADAIN_EPSILON'
+    ]
+
+    def get_wandb_config(self):
+        cfg_dict = {}
+        for attr_name in self._wandb_log_params:
+            if hasattr(self, attr_name):
+                cfg_dict[attr_name] = getattr(self, attr_name)
+        return cfg_dict
 
 config = Config()
