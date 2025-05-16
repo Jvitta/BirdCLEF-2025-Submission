@@ -11,7 +11,7 @@ class Config:
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
     GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/data"
 
-    DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw_data")
+    DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')

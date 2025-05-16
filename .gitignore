@@ -6,7 +6,11 @@ __pycache__
 kaggle_training.py
 wandb/
 
-data/raw_data/
+data/raw/test_soundscapes/
+data/raw/train_audio/
+data/raw/train_audio_rare/
+data/raw/train_soundscapes/
+
 outputs
 eda/plots
 
