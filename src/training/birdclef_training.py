@@ -1214,7 +1214,7 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
 
                 plt.tight_layout()
 
-                plot_dir = os.path.join(config.OUTPUT_DIR, "training_curves")
+                plot_dir = os.path.join(config.OUTPUT_DIR, "plots", "training_curves")
                 os.makedirs(plot_dir, exist_ok=True)
                 plot_save_path = os.path.join(plot_dir, "all_folds_training_plot.png")
 

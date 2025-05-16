@@ -3,43 +3,60 @@ import os
 import multiprocessing
 
 class Config:
-    seed = 43
-    num_workers = max(1, multiprocessing.cpu_count() - 1)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
     # --- Root Paths --- #
     PROJECT_ROOT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission"
-    GCS_MOUNT_POINT = "/home/ext_jvittimberga_gmail_com/BirdCLEF-2025-Submission/data"
+    DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
 
-    DATA_ROOT = os.path.join(GCS_MOUNT_POINT, "raw")
+    RAW_DATA_DIR = os.path.join(DATA_ROOT, "raw")
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
     PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
     PREPROCESSED_NPZ_PATH_VAL = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms_val.npz')
-    MODEL_INPUT_DIR = MODEL_OUTPUT_DIR
 
     # These derived paths use the mount point
-    train_audio_dir = os.path.join(DATA_ROOT, 'train_audio')
-    train_csv_path = os.path.join(DATA_ROOT, 'train.csv')
-    test_audio_dir = os.path.join(DATA_ROOT, 'test_soundscapes')
-    sample_submission_path = os.path.join(DATA_ROOT, 'sample_submission.csv')
-    taxonomy_path = os.path.join(DATA_ROOT, 'taxonomy.csv')
+    train_audio_dir = os.path.join(RAW_DATA_DIR, 'train_audio')
+    train_csv_path = os.path.join(RAW_DATA_DIR, 'train.csv')
+    test_audio_dir = os.path.join(RAW_DATA_DIR, 'test_soundscapes')
+    sample_submission_path = os.path.join(RAW_DATA_DIR, 'sample_submission.csv')
+    taxonomy_path = os.path.join(RAW_DATA_DIR, 'taxonomy.csv')
+
     # Rare species data paths
-    train_audio_rare_dir = os.path.join(DATA_ROOT, 'train_audio_rare')
-    train_rare_csv_path = os.path.join(DATA_ROOT, 'train_rare.csv')
+    train_audio_rare_dir = os.path.join(RAW_DATA_DIR, 'train_audio_rare')
+    train_rare_csv_path = os.path.join(RAW_DATA_DIR, 'train_rare.csv')
+
     # Pseudo-label paths
-    unlabeled_audio_dir = os.path.join(DATA_ROOT, 'train_soundscapes')
-    train_pseudo_csv_path = os.path.join(DATA_ROOT, 'train_pseudo.csv')
+    unlabeled_audio_dir = os.path.join(RAW_DATA_DIR, 'train_soundscapes')
+    train_pseudo_csv_path = os.path.join(RAW_DATA_DIR, 'train_pseudo.csv')
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
-    VOICE_SEPARATION_DIR = os.path.join(GCS_MOUNT_POINT, "BC25 voice separation")
+    VOICE_SEPARATION_DIR = os.path.join(DATA_ROOT, "BC25 voice separation")
     FABIO_CSV_PATH = os.path.join(VOICE_SEPARATION_DIR, "fabio.csv")
     VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data.pkl") # Original VAD data
     TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
     # Path for manual annotations from the UI
     ANNOTATED_SEGMENTS_CSV_PATH = os.path.join(PROJECT_ROOT, "annotator_ui", "annotated_segments.csv")
+    BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
+    ADAIN_PER_FREQUENCY_STATS_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, "adain_per_frequency_stats.npz")
+
+    seed = 43
+    num_workers = max(1, multiprocessing.cpu_count() - 1)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model_name = 'mn20_as' 
+    width_mult = 2.0
+    pretrained = True 
+    in_channels = 1 
+    num_classes = 206
+
+    epochs = 8 # 10
+    optimizer = 'AdamW'
+    lr = 0.0006124336720699518 #0.0004 
+    min_lr = 1e-6
+    weight_decay = 0.0009586824835340106 #1e-4 
+    scheduler = 'CosineAnnealingLR' 
+    T_max = 15
 
     FS = 32000 
     TARGET_DURATION = 5.0  
@@ -54,24 +71,17 @@ class Config:
     PREPROCESS_TARGET_SHAPE = (128, 500) # Expected Preprocessing shape
     TARGET_SHAPE = (128, 1000) # Final shape for training/inference
 
-    model_name = 'mn20_as' 
-    width_mult = 2.0
-    pretrained = True # Pretrained weights will be loaded by the EfficientAT get_model function
-    in_channels = 1 # EfficientAT models expect 1 input channel (the spectrogram itself)
-    num_classes = 206
-
     LOAD_PREPROCESSED_DATA = True
     REMOVE_SPEECH_INTERVALS = True
     USE_RARE_DATA = True
     USE_PSEUDO_LABELS = False
     USE_WEIGHTED_SAMPLING = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
+    use_amp = False
     
     NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
     PRECOMPUTE_VERSIONS = 3 # Number of different chunks per primary file
     MIXING_RATIO_PRIMARY = 0.75 # Weight of primary audio in mix (background = 1.0 - this)
-
-    use_amp = False
 
     # --- Dynamic Chunk Precomputation --- #
     DYNAMIC_CHUNK_COUNTING = True        # Enable/disable dynamic chunk counting based on species rarity
@@ -89,15 +99,6 @@ class Config:
 
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
-
-    epochs = 8 # 10
-    optimizer = 'AdamW'
-    lr = 0.0006124336720699518 #0.0004 
-    min_lr = 1e-6
-    weight_decay = 0.0009586824835340106 #1e-4 
-    epochs = 10
-    scheduler = 'CosineAnnealingLR' 
-    T_max = 15
 
     train_batch_size = 32
     val_batch_size = 64
@@ -134,11 +135,9 @@ class Config:
     # --- BirdNET Preprocessing Config ---
     BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.25 # Threshold for BirdNET-generated pseudo labels
     birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
-    BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
-
+ 
     # --- AdaIN Statistics ---
     ADAIN_MODE = 'none'  # Options: 'none', 'global', 'per_frequency'
-    ADAIN_PER_FREQUENCY_STATS_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, "adain_per_frequency_stats.npz")
     ADAIN_EPSILON = 1e-6 # Epsilon for numerical stability in division
 
     _wandb_log_params = [

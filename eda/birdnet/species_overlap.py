@@ -3,7 +3,7 @@ from config import config
 import os
 import difflib # Import the library
 
-birdnet_species_list_path = os.path.join(config.DATA_ROOT, 'birdnet_metadata.txt')
+birdnet_species_list_path = os.path.join(config.RAW_DATA_DIR, 'birdnet_metadata.txt')
 
 birdnet_df = pd.read_csv(
     birdnet_species_list_path,
