@@ -18,20 +18,33 @@ OUTPUT_ANNOTATIONS_FILE = os.path.join(config.PROJECT_ROOT, "annotator_ui", "ann
 def load_audio_structure():
     """Scans the train_audio directory and organizes files by species folder."""
     audio_structure = {}
-    try:
-        for species_folder_name in sorted(os.listdir(config.train_audio_dir)):
-            species_folder_path = os.path.join(config.train_audio_dir, species_folder_name)
-            if os.path.isdir(species_folder_path):
-                audio_files_in_folder = []
-                for file_basename in sorted(os.listdir(species_folder_path)):
-                    if file_basename.lower().endswith(('.ogg', '.mp3', '.wav', '.flac', '.m4a')):
-                        audio_files_in_folder.append(file_basename)
-                if audio_files_in_folder: # Only add folder if it has audio files
-                    audio_structure[species_folder_name] = audio_files_in_folder
-        return audio_structure
-    except Exception as e:
-        print(f"Error loading audio structure: {e}")
-        return {}
+    
+    audio_dirs_to_scan = [config.train_audio_dir]
+    if os.path.exists(config.train_audio_rare_dir): # Check if rare dir exists
+        audio_dirs_to_scan.append(config.train_audio_rare_dir)
+    else:
+        print(f"Info: Rare audio directory not found at {config.train_audio_rare_dir}. Skipping.")
+
+    for audio_root_dir in audio_dirs_to_scan:
+        print(f"Scanning for audio in: {audio_root_dir}")
+        try:
+            for species_folder_name in sorted(os.listdir(audio_root_dir)):
+                species_folder_path = os.path.join(audio_root_dir, species_folder_name)
+                if os.path.isdir(species_folder_path):
+                    if species_folder_name not in audio_structure:
+                        audio_structure[species_folder_name] = set() # Use a set to avoid duplicates initially
+                    
+                    for file_basename in sorted(os.listdir(species_folder_path)):
+                        if file_basename.lower().endswith(('.ogg', '.mp3', '.wav', '.flac', '.m4a')):
+                            audio_structure[species_folder_name].add(file_basename)
+        except Exception as e:
+            print(f"Error scanning directory {audio_root_dir}: {e}")
+
+    # Convert sets to sorted lists for dropdowns
+    for species_folder_name in audio_structure:
+        audio_structure[species_folder_name] = sorted(list(audio_structure[species_folder_name]))
+        
+    return audio_structure
 
 def get_primary_label(filename_relative_to_train_audio, train_df):
     """Gets primary label from the main training metadata.
@@ -45,11 +58,77 @@ def get_primary_label(filename_relative_to_train_audio, train_df):
 audio_data_structure = load_audio_structure()
 species_folders_list = list(audio_data_structure.keys())
 
+# Calculate per-species file counts (unique basenames across main and rare)
+species_file_counts = { 
+    species: len(files) 
+    for species, files in audio_data_structure.items()
+}
+print(f"Calculated total unique audio files per species across all scanned directories. Example: {dict(list(species_file_counts.items())[:3])}")
+
+# Helper function for dynamic annotation targets
+def calculate_target_annotations_for_species(num_files_for_species, app_config):
+    N = num_files_for_species
+    N_common_thresh = app_config.COMMON_SPECIES_FILE_THRESHOLD
+    N_min_files_for_max_chunks = 1 # Files at or below this count get MAX_CHUNKS_RARE
+
+    C_max = app_config.MAX_CHUNKS_RARE
+    C_min = app_config.MIN_CHUNKS_COMMON
+    # Target chunks for species just below the common threshold (N_common_thresh - 1 files)
+    C_interpolate_end = max(C_min + 1, C_min) 
+
+    if N <= 0: # Should not happen if species is in species_file_counts from audio_data_structure
+        return C_max # Default to max if count is invalid or species not found
+    elif N >= N_common_thresh:
+        target_chunks = C_min
+    elif N <= N_min_files_for_max_chunks:
+        target_chunks = C_max
+    else:
+        x1 = float(N_min_files_for_max_chunks)
+        y1 = float(C_max)
+        x2 = float(N_common_thresh - 1)
+        y2 = float(C_interpolate_end)
+
+        if x2 <= x1: 
+            target_chunks = C_max if N <= (x1 + x2) / 2 else C_interpolate_end
+        else:
+            calculated_chunks = y1 + (float(N) - x1) * (y2 - y1) / (x2 - x1)
+            target_chunks = int(round(calculated_chunks))
+    
+    # Ensure chunks are within the global min/max bounds defined in config
+    final_target = max(app_config.MIN_CHUNKS_COMMON, min(target_chunks, app_config.MAX_CHUNKS_RARE))
+    return final_target
+
 try:
-    main_train_df = pd.read_csv(config.train_csv_path)
+    main_train_df_main = pd.read_csv(config.train_csv_path)
+    main_train_df_main = main_train_df_main[['filename', 'primary_label']].copy()
+    main_train_df_main['filename'] = main_train_df_main['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
+    
+    # Attempt to load and concatenate rare data metadata if path exists
+    main_train_df_rare = None
+    if os.path.exists(config.train_rare_csv_path):
+        try:
+            df_rare_temp = pd.read_csv(config.train_rare_csv_path)
+            # Ensure 'filename' and 'primary_label' exist in rare_df
+            if 'filename' in df_rare_temp.columns and 'primary_label' in df_rare_temp.columns:
+                main_train_df_rare = df_rare_temp[['filename', 'primary_label']].copy()
+                main_train_df_rare['filename'] = main_train_df_rare['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
+                print(f"Loaded rare metadata from {config.train_rare_csv_path}: {len(main_train_df_rare)} rows")
+            else:
+                print(f"Warning: 'filename' or 'primary_label' missing in {config.train_rare_csv_path}. Rare labels not loaded.")
+        except Exception as e_rare:
+            print(f"Warning: Could not load rare train metadata {config.train_rare_csv_path}: {e_rare}")
+    
+    if main_train_df_rare is not None:
+        main_train_df = pd.concat([main_train_df_main, main_train_df_rare], ignore_index=True)
+        # Drop duplicates based on filename, keeping the first occurrence (main_train_df_main entry if overlap)
+        main_train_df.drop_duplicates(subset=['filename'], keep='first', inplace=True)
+        print(f"Combined main and rare metadata. Total unique filenames for labels: {len(main_train_df)}")
+    else:
+        main_train_df = main_train_df_main
+        print("Using main metadata only for labels.")
+
 except Exception as e:
     print(f"Warning: Could not load main train metadata {config.train_csv_path}: {e}")
-    main_train_df = None
 
 # Load taxonomy data
 taxonomy_df = None
@@ -253,17 +332,18 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
             low_quality_files_in_folder_set = set()
 
             if not annotations_df.empty and 'filename' in annotations_df.columns:
-                # Normalize prefix_to_check to use forward slashes for startswith
                 prefix_to_check = (selected_species_folder + '/').replace(os.sep, '/')
                 relevant_annotations = annotations_df[annotations_df['filename'].str.startswith(prefix_to_check, na=False)]
                 if not relevant_annotations.empty:
                     if 'is_low_quality' in relevant_annotations.columns:
-                         # Ensure paths in this set also use forward slashes if derived from annotations_df
                          low_quality_files_in_folder_set = set(relevant_annotations[relevant_annotations['is_low_quality'] == True]['filename'])
-                    
-                    # User's original counting logic for filtering (counts all annotations for relevant files initially)
-                    file_annotation_counts_in_folder = relevant_annotations['filename'].value_counts()
+                    file_annotation_counts_in_folder = relevant_annotations[relevant_annotations['is_low_quality'] == False]['filename'].value_counts()
             
+            # Calculate target annotations for this species
+            num_files_for_this_species = species_file_counts.get(selected_species_folder, 0)
+            target_annotations_for_species = calculate_target_annotations_for_species(num_files_for_this_species, config)
+            print(f"Target annotations for species {selected_species_folder} (with {num_files_for_this_species} files): {target_annotations_for_species}")
+
             files_to_consider_for_dropdowns = []
             for file_basename in all_files_in_folder:
                 # Construct and normalize relative_path to use forward slashes for comparisons
@@ -273,13 +353,22 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
                 if relative_path_normalized in low_quality_files_in_folder_set:
                     continue
 
-                # Filter 1: Check annotation count (for non-low-quality files)
-                # Files with 3 or more annotations are skipped for the dropdowns
-                if file_annotation_counts_in_folder.get(relative_path_normalized, 0) >= 3:
+                # Filter 1: Check annotation count against dynamic target
+                current_annotations_for_file = file_annotation_counts_in_folder.get(relative_path_normalized, 0)
+                if current_annotations_for_file >= target_annotations_for_species:
+                    # print(f"Skipping {relative_path_normalized}: has {current_annotations_for_file} ann., target is {target_annotations_for_species}")
                     continue
                 
                 # Construct full_file_path using os.path.join for librosa, as it handles OS-specific paths
+                # Try main audio dir first, then rare audio dir
                 full_file_path = os.path.join(config.train_audio_dir, selected_species_folder, file_basename)
+                if not os.path.exists(full_file_path) and os.path.exists(config.train_audio_rare_dir):
+                    full_file_path = os.path.join(config.train_audio_rare_dir, selected_species_folder, file_basename)
+
+                if not os.path.exists(full_file_path):
+                    print(f"Warning: File not found in either main or rare dir: {selected_species_folder}/{file_basename}. Skipping.")
+                    continue # Skip if file doesn't exist in either location
+                
                 try:
                     duration = librosa.get_duration(filename=full_file_path) 
                     if duration < 5.0:
@@ -369,11 +458,33 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
 
         relative_path_normalized = (species_folder + '/' + audio_basename).replace(os.sep, '/')
         full_audio_path = os.path.join(config.train_audio_dir, species_folder, audio_basename)
+        if not os.path.exists(full_audio_path) and os.path.exists(config.train_audio_rare_dir):
+            full_audio_path = os.path.join(config.train_audio_rare_dir, species_folder, audio_basename)
+        
+        if not os.path.exists(full_audio_path):
+            return None, current_bn_audio_path_state, "#### Top BirdNET Detections:\nN/A", "**Annotations for this file:** File not found", None
         
         annotation_count = 0
         if not annotations_df.empty and 'filename' in annotations_df.columns:
-            annotation_count = annotations_df[annotations_df['filename'] == relative_path_normalized].shape[0]
-        annotations_text = f"**Annotations for this file:** {annotation_count}"
+            # Count only non-low-quality annotations for this specific file
+            annotation_count = annotations_df[
+                (annotations_df['filename'] == relative_path_normalized) & 
+                (annotations_df['is_low_quality'] == False)
+            ].shape[0]
+        
+        # Get target annotations for the species of this file
+        num_files_for_this_species = species_file_counts.get(species_folder, 0)
+        target_for_species = calculate_target_annotations_for_species(num_files_for_this_species, config)
+        annotations_text = f"**Annotations for this file:** {annotation_count} / {target_for_species} (Species Target)"
+        
+        # Get existing annotation timestamps for this file
+        if annotation_count > 0:
+            existing_times = annotations_df[
+                (annotations_df['filename'] == relative_path_normalized) & 
+                (annotations_df['is_low_quality'] == False)
+            ]['center_time_s'].sort_values().tolist()
+            existing_times_str = ", ".join([f"{t:.1f}s" for t in existing_times])
+            annotations_text += f"\n**Existing timestamps:** [{existing_times_str}]"
         
         birdnet_text = "#### Top BirdNET Detections:\nN/A (File from 'No BirdNET Detections' list)"
         
@@ -386,8 +497,31 @@ with gr.Blocks(title="Bird Call Segment Annotator") as demo:
 
         relative_path_normalized = (species_folder + '/' + audio_basename).replace(os.sep, '/')
         full_audio_path = os.path.join(config.train_audio_dir, species_folder, audio_basename)
+        if not os.path.exists(full_audio_path) and os.path.exists(config.train_audio_rare_dir):
+            full_audio_path = os.path.join(config.train_audio_rare_dir, species_folder, audio_basename)
         
-        annotations_text = "" # No annotation count for BN files
+        if not os.path.exists(full_audio_path):
+            return current_no_bn_audio_path_state, None, "#### Top BirdNET Detections:\nN/A", "**Annotations for this file:** File not found", None
+        
+        # Get target annotations for the species of this file
+        num_files_for_this_species = species_file_counts.get(species_folder, 0)
+        target_for_species = calculate_target_annotations_for_species(num_files_for_this_species, config)
+        # For BirdNET files, we might just show the target, as we don't expect many individual annotations yet
+        annotations_text = f"**Species Annotation Target:** {target_for_species}"
+
+        # For BirdNET files, also show existing annotations if any (though less expected for direct annotation)
+        # This part can be simplified if we don't typically annotate BirdNET-sourced files directly this way often.
+        current_bn_file_annotations = annotations_df[
+            (annotations_df['filename'] == relative_path_normalized) & 
+            (annotations_df['is_low_quality'] == False)
+        ]
+        num_current_bn_file_annotations = current_bn_file_annotations.shape[0]
+        if num_current_bn_file_annotations > 0:
+            annotations_text += f" (File has {num_current_bn_file_annotations} direct annotations)"
+            existing_bn_times = current_bn_file_annotations['center_time_s'].sort_values().tolist()
+            existing_bn_times_str = ", ".join([f"{t:.1f}s" for t in existing_bn_times])
+            annotations_text += f"\n**Existing timestamps:** [{existing_bn_times_str}]"
+
         birdnet_text = "#### Top BirdNET Detections:\nN/A"
 
         if relative_path_normalized in all_birdnet_detections:

@@ -932,17 +932,19 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
             train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
             val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
 
-            # --- Filter Validation Set: Ensure only 'main' data source is used ---
+            # --- Filter Validation Set: Allow 'main' or 'rare' data sources --- 
             original_val_count = len(val_df_fold)
             if 'data_source' in val_df_fold.columns:
-                val_df_fold = val_df_fold[val_df_fold['data_source'] == 'main'].reset_index(drop=True)
-                print(f"Filtered validation set to include only 'main' data source.")
+                allowed_sources = ['main', 'rare']
+                val_df_fold = val_df_fold[val_df_fold['data_source'].isin(allowed_sources)].reset_index(drop=True)
+                print(f"Filtered validation set to include 'main' or 'rare' data sources.")
                 print(f"  Original val count: {original_val_count}, Filtered val count: {len(val_df_fold)}")
             else:
-                print("Warning: 'data_source' column not found in validation fold. Cannot filter.")
-
-            print(f'Training set: {len(train_df_fold)} samples (includes main and potentially pseudo)')
-            print(f'Validation set: {len(val_df_fold)} samples (main data only)')
+                print("Warning: 'data_source' column not found in validation fold. Cannot filter; proceeding with all samples in val_df_fold.")
+            # --- End Validation Set Filtering ---
+            
+            print(f'Training set: {len(train_df_fold)} samples (includes main, rare, and potentially pseudo)')
+            print(f'Validation set: {len(val_df_fold)} samples (main or rare data only)')
 
             # Pass the pre-loaded dictionary (or None) to the Dataset
             # NOW, pass both the hardcoded targets AND the shared tracking set (REMOVED THESE)

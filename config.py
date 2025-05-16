@@ -38,6 +38,9 @@ class Config:
     VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data.pkl") # Original VAD data
     TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
 
+    # Path for manual annotations from the UI
+    ANNOTATED_SEGMENTS_CSV_PATH = os.path.join(PROJECT_ROOT, "annotator_ui", "annotated_segments.csv")
+
     FS = 32000 
     TARGET_DURATION = 5.0  
     N_FFT = 1024
@@ -59,7 +62,7 @@ class Config:
 
     LOAD_PREPROCESSED_DATA = True
     REMOVE_SPEECH_INTERVALS = True
-    USE_RARE_DATA = False
+    USE_RARE_DATA = True
     USE_PSEUDO_LABELS = False
     USE_WEIGHTED_SAMPLING = False
     REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
@@ -74,7 +77,7 @@ class Config:
     DYNAMIC_CHUNK_COUNTING = True        # Enable/disable dynamic chunk counting based on species rarity
     MAX_CHUNKS_RARE = 7                  # Max chunks for files from species with very few files (e.g., 1 file)
     MIN_CHUNKS_COMMON = 1                # Min chunks for files from very common species
-    COMMON_SPECIES_FILE_THRESHOLD = 150  # Species with >= this many files get MIN_CHUNKS_COMMON.
+    COMMON_SPECIES_FILE_THRESHOLD = 200  # Species with >= this many files get MIN_CHUNKS_COMMON.
                                          # Interpolation happens for counts < COMMON_SPECIES_FILE_THRESHOLD down to 1 file.
 
     criterion = 'FocalLossBCE'
@@ -82,16 +85,16 @@ class Config:
     focal_loss_gamma = 2.0
     focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
-    label_smoothing_factor = 0.1
+    label_smoothing_factor = 0.17663005428851927 #0.1
 
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 
     epochs = 10 # 10
     optimizer = 'AdamW'
-    lr = 0.0004 
+    lr = 0.0006124336720699518 #0.0004 
     min_lr = 1e-6
-    weight_decay = 1e-4 
+    weight_decay = 0.0009586824835340106 #1e-4 
     epochs = 10
     scheduler = 'CosineAnnealingLR' 
     T_max = 15
@@ -103,15 +106,15 @@ class Config:
     # --- Augmentation Parameters ---
     batch_augment_prob = 1.0  # Probability of applying Mixup OR CutMix to a batch
     mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
-    mixup_alpha = 0.3901120986458487 
+    mixup_alpha = 0.4194592538670868 #0.3901120986458487 
     cutmix_alpha = 1.0           
 
     # Spectrogram Augmentation (applied manually in Dataset)
     time_mask_prob = 0.446875227279031 # Probability of applying time masking
     freq_mask_prob = 0.263834841662896 # Probability of applying frequency masking
     contrast_prob = 0.445985839941462  # Probability of applying random contrast
-    max_time_mask_width = 30     # Maximum width of time mask
-    max_freq_mask_height = 26    # Maximum height of frequency mask
+    max_time_mask_width = 45 #30     # Maximum width of time mask
+    max_freq_mask_height = 15 #26    # Maximum height of frequency mask
 
     use_tta = False
     tta_count = 3

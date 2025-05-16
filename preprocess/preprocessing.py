@@ -41,12 +41,12 @@ efficient_at_spectrogram_generator = AugmentMelSTFT(
             win_length=config.WIN_LENGTH,
             hopsize=config.HOP_LENGTH,
             n_fft=config.N_FFT,
-            fmin=config.FMIN, # Ensure FMIN is in config, or pass None for default
-            fmax=config.FMAX,        # Let AugmentMelSTFT calculate base fmax from sr and fmax_aug_range
-            freqm=0,          # Or config.FREQM if you make it configurable
-            timem=0,          # Or config.TIMEM if you make it configurable
-            fmin_aug_range=config.FMIN_AUG_RANGE, # Use config or default
-            fmax_aug_range=config.FMAX_AUG_RANGE # Use config or default (e.g., 1000)
+            fmin=config.FMIN,
+            fmax=config.FMAX, 
+            freqm=0,       
+            timem=0,         
+            fmin_aug_range=config.FMIN_AUG_RANGE,
+            fmax_aug_range=config.FMAX_AUG_RANGE
         )
 
 output_npz_path = ""
@@ -69,6 +69,7 @@ def load_and_prepare_metadata(config):
     try:
         df_train_full = pd.read_csv(config.train_csv_path)
         df_train = df_train_full[['filename', 'primary_label']].copy()
+        df_train['filename'] = df_train['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
         print(f"Loaded and filtered main metadata: {df_train.shape[0]} rows")
     except Exception as e:
         print(f"CRITICAL ERROR loading main metadata {config.train_csv_path}: {e}. Exiting.")
@@ -79,11 +80,13 @@ def load_and_prepare_metadata(config):
         try:
             df_rare_full = pd.read_csv(config.train_rare_csv_path) 
             df_rare = df_rare_full[['filename', 'primary_label']].copy()
+            df_rare['filename'] = df_rare['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
             print(f"Loaded and filtered rare metadata: {df_rare.shape[0]} rows")
 
             df_combined = pd.concat([df_train, df_rare], ignore_index=True)
-            df_working = df_combined
-            print(f"Working metadata size (main + rare): {df_working.shape[0]} rows")
+            # Drop duplicates based on filename, keeping the first occurrence (main data preferred)
+            df_working = df_combined.drop_duplicates(subset=['filename'], keep='first').reset_index(drop=True)
+            print(f"Working metadata size (main + rare, unique filenames): {df_working.shape[0]} rows")
         except Exception as e:
             print(f"Error loading or processing rare species metadata: {e}. Proceeding with main data only.")
             df_working = df_train 
@@ -93,6 +96,50 @@ def load_and_prepare_metadata(config):
         df_working = df_train 
         print(f"Working metadata size: {df_working.shape[0]} rows")
 
+    # --- Filter out files where all manual annotations are marked as low quality ---
+    if not df_working.empty: # Proceed only if df_working is not empty
+        try:
+            manual_ann_df = pd.read_csv(config.ANNOTATED_SEGMENTS_CSV_PATH)
+            if 'filename' in manual_ann_df.columns and 'is_low_quality' in manual_ann_df.columns:
+                manual_ann_df['filename'] = manual_ann_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
+                
+                # Robustly convert 'is_low_quality' to boolean
+                if manual_ann_df['is_low_quality'].dtype == 'object' or pd.api.types.is_string_dtype(manual_ann_df['is_low_quality']):
+                    manual_ann_df['is_low_quality'] = manual_ann_df['is_low_quality'].astype(str).str.lower().map({
+                        'true': True, 'yes': True, '1': True, 't': True,
+                        'false': False, 'no': False, '0': False, 'f': False,
+                        'nan': False, '': False, 'none': False, '<na>': False
+                    }).fillna(False) # Fill any unmapped (originally NaN or other strings) as False
+                manual_ann_df['is_low_quality'] = manual_ann_df['is_low_quality'].fillna(False).astype(bool)
+
+                annotated_files_present_in_df_working = manual_ann_df[manual_ann_df['filename'].isin(df_working['filename'])]
+                
+                if not annotated_files_present_in_df_working.empty:
+                    # Group by filename and check if all 'is_low_quality' are True for annotations belonging to files in df_working
+                    file_quality_summary = annotated_files_present_in_df_working.groupby('filename')['is_low_quality'].agg(['all', 'count'])
+                    
+                    # Identify files where count > 0 (i.e., has annotations) and all annotations are low quality
+                    # The .all() column from agg will be True if all are True, or if the group was empty (which we filter by count > 0 implicitly with isin earlier, but explicitly here is safer)
+                    low_quality_files_series = file_quality_summary[file_quality_summary['all'] == True]
+                    filenames_to_exclude = low_quality_files_series.index.tolist()
+
+                    if filenames_to_exclude:
+                        initial_rows = df_working.shape[0]
+                        df_working = df_working[~df_working['filename'].isin(filenames_to_exclude)]
+                        excluded_count = initial_rows - df_working.shape[0]
+                        if excluded_count > 0:
+                            print(f"INFO: Excluded {excluded_count} files from processing because all their manual annotations were marked as low quality.")
+                else:
+                    print(f"Info: No files listed in {config.ANNOTATED_SEGMENTS_CSV_PATH} matched files currently in the working dataframe. No files excluded based on low quality annotations.")
+            else:
+                print(f"Info: 'filename' or 'is_low_quality' column not found in {config.ANNOTATED_SEGMENTS_CSV_PATH}. No files excluded based on low quality annotations.")
+        except FileNotFoundError:
+            print(f"Info: Manual annotations file '{config.ANNOTATED_SEGMENTS_CSV_PATH}' not found. No files excluded based on low quality annotations.")
+        except Exception as e_lq_filter:
+            print(f"Warning: Could not filter files based on low quality annotations: {e_lq_filter}")
+            print(traceback.format_exc()) # Print stack trace for easier debugging
+    # --- End filter ---
+
     df_working['samplename'] = df_working['filename'].map(lambda x: os.path.splitext(x.replace('/', '-'))[0])
 
     # --- Calculate per-species file counts --- #
@@ -101,8 +148,6 @@ def load_and_prepare_metadata(config):
         try:
             species_file_counts = df_working.groupby('primary_label')['filename'].nunique().to_dict()
             print(f"Calculated file counts for {len(species_file_counts)} unique species.")
-            # For debugging, print some counts:
-            # print("Sample species counts:", dict(list(species_file_counts.items())[:5]))
         except Exception as e_counts:
             print(f"Warning: Could not calculate species file counts: {e_counts}. Dynamic chunking might not work as expected.")
     else:
@@ -213,6 +258,20 @@ def _pad_or_tile_audio(audio_data, target_samples):
     else: 
         return audio_data[:target_samples]
 
+def _extract_manual_annotation_chunk(audio_long, center_time_s, config, min_samples, target_samples_5s):
+    """Extracts a 5s audio chunk centered around a manual annotation center time."""
+    try:
+        audio_len_samples = len(audio_long)
+        chunk_start_sec = center_time_s - (config.TARGET_DURATION / 2.0)
+        chunk_end_sec = center_time_s + (config.TARGET_DURATION / 2.0)
+        final_start_idx = max(0, int(chunk_start_sec * config.FS))
+        final_end_idx = min(audio_len_samples, int(chunk_end_sec * config.FS))
+        extracted_audio_segment = audio_long[final_start_idx:final_end_idx]
+        if len(extracted_audio_segment) < min_samples: return None 
+        return _pad_or_tile_audio(extracted_audio_segment, target_samples_5s)
+    except Exception as e:
+        return None
+
 def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples_5s):
     """
     Extracts a 5s audio chunk centered around a BirdNET detection.
@@ -280,24 +339,24 @@ def _generate_spectrogram_from_chunk(audio_chunk_5s, config_obj):
 def _process_primary_for_chunking(args):
     """Worker using helper functions to generate spectrograms for one primary audio file."""
     primary_filepath, samplename, config, fabio_intervals, vad_intervals, primary_filename, \
-        class_name, scientific_name, birdnet_dets_for_file, UNCOVERED_AVES_SCIENTIFIC_NAME, \
-        num_files_for_this_species = args
+        class_name, scientific_name, birdnet_dets_for_file, manual_annotations_for_file, \
+        UNCOVERED_AVES_SCIENTIFIC_NAME, num_files_for_this_species = args
 
     target_samples = int(config.TARGET_DURATION * config.FS)
     min_samples = int(0.5 * config.FS) # Min samples for a segment to be considered usable before padding
 
     try:
-        audio_for_birdnet_base, audio_for_random_base, error_msg = _load_and_clean_audio(
+        audio_for_manual_and_birdnet_base, audio_for_random_base, error_msg = _load_and_clean_audio(
             primary_filepath, primary_filename, config, fabio_intervals, vad_intervals, min_samples
         )
         if error_msg:
             return samplename, None, error_msg 
 
-        base_duration_for_versions = len(audio_for_birdnet_base) 
+        base_duration_for_versions = len(audio_for_manual_and_birdnet_base) 
         
         # --- Determine number of versions to generate --- #
         if base_duration_for_versions < target_samples or cmd_args.mode == "val":
-            num_versions_to_generate = 1
+            num_versions_to_generate_final = 1
         elif config.DYNAMIC_CHUNK_COUNTING:
             N = num_files_for_this_species
             N_common_thresh = config.COMMON_SPECIES_FILE_THRESHOLD
@@ -345,106 +404,122 @@ def _process_primary_for_chunking(args):
 
             effective_length_cap = max(strict_length_cap, overlap_allowance_floor)
             
-            num_versions_to_generate = min(rarity_based_chunks, effective_length_cap)
+            num_versions_to_generate_final = min(rarity_based_chunks, effective_length_cap)
             # Final check to ensure at least 1 chunk is always generated.
-            num_versions_to_generate = max(1, num_versions_to_generate)
+            num_versions_to_generate_final = max(1, num_versions_to_generate_final)
         else:
             # Original logic if dynamic chunking is off
-            num_versions_to_generate = config.PRECOMPUTE_VERSIONS
+            num_versions_to_generate_final = config.PRECOMPUTE_VERSIONS
         # --- End Determine number of versions --- #
 
-        use_birdnet_strategy = (
-            class_name == 'Aves' and
-            scientific_name != UNCOVERED_AVES_SCIENTIFIC_NAME and
-            birdnet_dets_for_file is not None and
-            len([d for d in birdnet_dets_for_file if isinstance(d, dict)]) > 0
-        )
+        # Pre-evaluate conditions for use_birdnet_strategy to be more robust
+        cond1_is_aves = (class_name == 'Aves')
+        
+        cond2_is_not_uncovered = False
+        if isinstance(scientific_name, str) and isinstance(UNCOVERED_AVES_SCIENTIFIC_NAME, str):
+            cond2_is_not_uncovered = (scientific_name != UNCOVERED_AVES_SCIENTIFIC_NAME)
+        
+        cond3_has_birdnet_dets = (birdnet_dets_for_file is not None)
+        
+        cond4_has_valid_birdnet_items = False
+        if cond3_has_birdnet_dets: # Only try to calculate len if birdnet_dets_for_file is not None
+            try:
+                # Ensure it's treated as a Python iterable for this check
+                processed_dets = [d for d in birdnet_dets_for_file if isinstance(d, dict)]
+                cond4_has_valid_birdnet_items = (len(processed_dets) > 0)
+            except TypeError:
+                pass # If not iterable, cond4 remains False, which is fine.
+
+        use_birdnet_strategy = (cond1_is_aves and cond2_is_not_uncovered and cond3_has_birdnet_dets and cond4_has_valid_birdnet_items)
 
         final_specs_list = []
 
-        if not use_birdnet_strategy:
-            # Non-BirdNET / Aves without sufficient detections / UNCOVERED_AVES: 
-            if audio_for_random_base is None or len(audio_for_random_base) == 0:
-                 return samplename, None, "Audio for random chunks is unusable (None or empty)."
-
-            for _ in range(num_versions_to_generate):
-                audio_chunk = _extract_random_chunk(audio_for_random_base, target_samples)
-                
-                if audio_chunk is not None and len(audio_chunk) == target_samples:
-                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
-                    if spec is not None:
-                        final_specs_list.append(spec)
-                    else:
-                        pass
-                else:
-                    pass
-        else:
-            # Strategy 2: BirdNET (Aves with detections)
-            # Use audio_for_birdnet_base for BirdNET detections.
-            # Use audio_for_random_base for random fallbacks.
-            if audio_for_birdnet_base is None or len(audio_for_birdnet_base) == 0:
-                return samplename, None, "Audio for BirdNet chunks is unusable (None or empty)."
-            if audio_for_random_base is None or len(audio_for_random_base) == 0:
-                print(f"Warning: audio_for_random_base is unusable for {samplename} in BirdNet strategy. Random fallbacks might fail or use primary implicitly if _extract_random_chunk has such logic.")
-
-            sorted_detections = []
-            try:
-                sorted_detections = sorted(
-                    [d for d in birdnet_dets_for_file if isinstance(d, dict) and 'confidence' in d],
-                    key=lambda x: x.get('confidence', 0),
-                    reverse=True
-                )
-            except Exception as e_sort:
-                print(f"Warning: Error sorting BirdNET detections for {samplename}: {e_sort}.")
-
-            for i in range(num_versions_to_generate):
-                audio_chunk_from_birdnet = None 
-                if i < len(sorted_detections):
-                    # Extract BirdNET chunk from the original (uncleaned) audio
-                    audio_chunk_from_birdnet = _extract_birdnet_chunk(
-                        audio_for_birdnet_base, sorted_detections[i], config, min_samples, target_samples 
-                    )
-                
-                current_chunk_to_process = audio_chunk_from_birdnet
-
-                # Fallback to random 5s chunk if BirdNET extraction failed or not enough detections
-                if current_chunk_to_process is None:
-                    if audio_for_random_base is not None and len(audio_for_random_base) > 0:
-                        # If audio_for_random_base is shorter than target_samples, _extract_random_chunk handles padding/tiling.
-                        current_chunk_to_process = _extract_random_chunk(audio_for_random_base, target_samples)
-                    else:
-                        # If audio_for_random_base is also bad, try to make a chunk from audio_for_birdnet_base as a last resort for Aves
-                        if len(audio_for_birdnet_base) >= target_samples:
-                             current_chunk_to_process = _extract_random_chunk(audio_for_birdnet_base, target_samples)
-                        else: # If original audio itself is too short, pad/tile it.
-                             current_chunk_to_process = _pad_or_tile_audio(audio_for_birdnet_base, target_samples)
-                        # To avoid making multiple identical padded chunks for short audio, break after the first if random fallback is hit for short audio.
-                        if i > 0 and len(audio_for_birdnet_base) < target_samples:
-                            break 
-                
-                if current_chunk_to_process is not None and len(current_chunk_to_process) == target_samples:
-                    spec = _generate_spectrogram_from_chunk(current_chunk_to_process, config)
-                    if spec is not None:
-                        final_specs_list.append(spec)
+        # Strategy 1: Manual Annotations (highest priority)
+        if manual_annotations_for_file and cmd_args.mode == "train":
+            # Cap number of manual chunks by num_versions_to_generate_final for this species
+            num_manual_to_take = min(len(manual_annotations_for_file), num_versions_to_generate_final)
+            random.shuffle(manual_annotations_for_file) # Shuffle to pick a random subset if more manual than target
             
-            # If relevant_audio (audio_for_birdnet_base) was very short and BirdNET detections failed,
-            # ensure at least one chunk for Aves. This uses the original audio.
-            if not final_specs_list and len(audio_for_birdnet_base) < target_samples:
-                audio_chunk = _pad_or_tile_audio(audio_for_birdnet_base, target_samples)
+            for i in range(num_manual_to_take):
+                center_time_s = manual_annotations_for_file[i]
+                # Use audio_for_manual_and_birdnet_base (original audio) for manual annotations
+                audio_chunk = _extract_manual_annotation_chunk(
+                    audio_for_manual_and_birdnet_base, center_time_s, config, min_samples, target_samples
+                )
                 if audio_chunk is not None and len(audio_chunk) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
-                    if spec is not None:
-                        final_specs_list.append(spec)
+                    if spec is not None: final_specs_list.append(spec)
+            
+            # If manual annotations were found and processed, we are done for this file.
+            if final_specs_list:
+                pass # Proceed to saving these specs
+
+        # Strategy 2: BirdNET (Aves with detections) - only if no manual annotations processed
+        if (use_birdnet_strategy and 
+            cmd_args.mode == "train" and 
+            not final_specs_list): 
+            
+            if audio_for_manual_and_birdnet_base is None or len(audio_for_manual_and_birdnet_base) == 0:
+                return samplename, None, "Audio for BirdNet chunks is unusable (None or empty)."
+            
+            sorted_detections = []
+            try: sorted_detections = sorted([d for d in birdnet_dets_for_file if isinstance(d,dict) and 'confidence' in d], key=lambda x:x.get('confidence',0), reverse=True)
+            except Exception as e_sort: print(f"Warning: Error sorting BirdNET detections for {samplename}: {e_sort}.")
+
+            num_birdnet_chunks_generated = 0
+            for i in range(len(sorted_detections)):
+                if num_birdnet_chunks_generated >= num_versions_to_generate_final: break
+                audio_chunk_from_birdnet = _extract_birdnet_chunk(
+                    audio_for_manual_and_birdnet_base, sorted_detections[i], config, min_samples, target_samples 
+                )
+                if audio_chunk_from_birdnet is not None and len(audio_chunk_from_birdnet) == target_samples:
+                    spec = _generate_spectrogram_from_chunk(audio_chunk_from_birdnet, config)
+                    if spec is not None: final_specs_list.append(spec); num_birdnet_chunks_generated +=1
+            
+            # Fallback to random if not enough BirdNET chunks were generated
+            num_random_fallbacks_needed = num_versions_to_generate_final - num_birdnet_chunks_generated
+            if num_random_fallbacks_needed > 0 and audio_for_random_base is not None and len(audio_for_random_base) > 0:
+                for _ in range(num_random_fallbacks_needed):
+                    audio_chunk = _extract_random_chunk(audio_for_random_base, target_samples)
+                    if audio_chunk is not None and len(audio_chunk) == target_samples:
+                        spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                        if spec is not None: final_specs_list.append(spec)
+        
+        # Strategy 3: Random Chunks (Non-Aves or Aves without enough detections, and no manual annotations processed)
+        # Also handles val mode or short audio initial num_versions_to_generate_final = 1 case.
+        if not final_specs_list: # If no specs from manual or BirdNET yet
+            # Determine how many chunks to make. If val mode or short audio, it will be 1.
+            # Otherwise, it's the dynamically calculated num_versions_to_generate_final.
+            actual_chunks_to_make_random = num_versions_to_generate_final 
+            if cmd_args.mode == "val" or base_duration_for_versions < target_samples : # Ensure val/short always gets 1 try
+                 actual_chunks_to_make_random = 1 
+            
+            audio_source_for_random = audio_for_random_base
+            if audio_source_for_random is None or len(audio_source_for_random) == 0:
+                # Fallback to original audio if cleaned audio is unusable
+                audio_source_for_random = audio_for_manual_and_birdnet_base 
+                if audio_source_for_random is None or len(audio_source_for_random) == 0:
+                    return samplename, None, "All audio sources unusable for random chunks."
+            
+            for _ in range(actual_chunks_to_make_random):
+                audio_chunk = _extract_random_chunk(audio_source_for_random, target_samples)
+                if audio_chunk is not None and len(audio_chunk) == target_samples:
+                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                    if spec is not None: final_specs_list.append(spec)
 
         if not final_specs_list:
-            return samplename, None, "No valid spectrograms generated."
+            # Last resort for train mode if absolutely nothing: Pad/tile original audio once
+            if cmd_args.mode == "train" and base_duration_for_versions >= min_samples:
+                audio_chunk = _pad_or_tile_audio(audio_for_manual_and_birdnet_base, target_samples)
+                if audio_chunk is not None and len(audio_chunk) == target_samples:
+                    spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                    if spec is not None: final_specs_list.append(spec)
+        
+        if not final_specs_list:
+            return samplename, None, "No valid spectrograms generated after all strategies."
 
-        try:
-            final_specs_list = [spec.astype(np.float32) for spec in final_specs_list] # Redundant if helpers ensure it, but safe.
-            final_specs_array = np.stack(final_specs_list, axis=0)
-            return samplename, final_specs_array, None
-        except Exception as e_stack:
-            return samplename, None, f"Error stacking specs for {samplename}: {e_stack}"
+        final_specs_array = np.stack([s.astype(np.float32) for s in final_specs_list], axis=0)
+        return samplename, final_specs_array, None
 
     except Exception as e_main:
         tb_str = traceback.format_exc()
@@ -455,6 +530,7 @@ def _load_auxiliary_data(config):
     fabio_intervals = {}
     vad_intervals = {}
     all_birdnet_detections = {}
+    all_manual_annotations = {} # New: For manual annotations
     taxonomy_df = pd.DataFrame()
 
     # Load VAD/Fabio Intervals (only if REMOVE_SPEECH_INTERVALS is True)
@@ -486,6 +562,24 @@ def _load_auxiliary_data(config):
     except FileNotFoundError: print(f"Warning: BirdNET detections file not found. Proceeding without BirdNET guidance.")
     except Exception as e: print(f"Warning: Error loading BirdNET detections NPZ: {e}. Proceeding without BirdNET guidance.")
 
+    # Load Manual Annotations
+    print(f"\nAttempting to load Manual Annotations from: {config.ANNOTATED_SEGMENTS_CSV_PATH}")
+    try:
+        manual_ann_df = pd.read_csv(config.ANNOTATED_SEGMENTS_CSV_PATH)
+        # Ensure filename is normalized (forward slashes)
+        if 'filename' in manual_ann_df.columns: 
+            manual_ann_df['filename'] = manual_ann_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
+        # Filter out low quality and NaN center_time_s, then group
+        valid_manual_anns = manual_ann_df[
+            (manual_ann_df['is_low_quality'] == False) & 
+            (manual_ann_df['center_time_s'].notna())
+        ]
+        if not valid_manual_anns.empty:
+            all_manual_annotations = valid_manual_anns.groupby('filename')['center_time_s'].apply(list).to_dict()
+        print(f"Successfully loaded and grouped manual annotations for {len(all_manual_annotations)} files.")
+    except FileNotFoundError: print(f"Info: Manual annotations file not found at {config.ANNOTATED_SEGMENTS_CSV_PATH}. Skipping manual annotations.")
+    except Exception as e: print(f"Warning: Error loading manual annotations CSV: {e}. Skipping manual annotations.")
+
     # Load Taxonomy for Class/Scientific Name
     print("\nLoading taxonomy data...")
     try:
@@ -496,7 +590,7 @@ def _load_auxiliary_data(config):
             taxonomy_df = pd.DataFrame() # Reset on error
     except Exception as e: print(f"Error loading taxonomy file: {e}")
     
-    return fabio_intervals, vad_intervals, all_birdnet_detections, taxonomy_df
+    return fabio_intervals, vad_intervals, all_birdnet_detections, all_manual_annotations, taxonomy_df
 
 def _prepare_dataframe_for_processing(df, taxonomy_df):
     """Merges taxonomy data and checks required columns."""
@@ -540,7 +634,7 @@ def _prepare_dataframe_for_processing(df, taxonomy_df):
 
     return df_processed
 
-def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_birdnet_detections, species_file_counts):
+def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_birdnet_detections, all_manual_annotations, species_file_counts):
     """Creates a list of argument tuples for the multiprocessing worker."""
     tasks = []
     skipped_path_count = 0
@@ -549,6 +643,7 @@ def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_bir
     for _, row in df.iterrows():
         primary_filename = row['filename']
         samplename = row['samplename']
+        
         class_name = row['class_name'] 
         scientific_name = row['scientific_name'] 
 
@@ -561,12 +656,13 @@ def _create_processing_tasks(df, config, fabio_intervals, vad_intervals, all_bir
 
         if primary_filepath:
             birdnet_dets_for_file = all_birdnet_detections.get(primary_filename, None)
+            manual_annotations_for_file = all_manual_annotations.get(primary_filename, None)
             # Get the file count for the current species
             current_species_file_count = species_file_counts.get(row['primary_label'], 0)
 
             tasks.append((
                 primary_filepath, samplename, config, fabio_intervals, vad_intervals, 
-                primary_filename, class_name, scientific_name, birdnet_dets_for_file,
+                primary_filename, class_name, scientific_name, birdnet_dets_for_file, manual_annotations_for_file,
                 UNCOVERED_AVES_SCIENTIFIC_NAME, current_species_file_count
             ))
         else:
@@ -671,14 +767,9 @@ def generate_and_save_spectrograms(df, config, species_file_counts):
              return None # Indicate failure or empty result
 
     # 1. Load auxiliary data
-    fabio_intervals, vad_intervals, all_birdnet_detections, taxonomy_df = _load_auxiliary_data(config)
+    fabio_intervals, vad_intervals, all_birdnet_detections, all_manual_annotations, taxonomy_df = _load_auxiliary_data(config)
 
     # 2. Prepare main DataFrame (already includes rare if USE_RARE_DATA was true)
-    # df_processed = _prepare_dataframe_for_processing(df, taxonomy_df) # df is already processed from main
-    # if df_processed is None or df_processed.empty: # Check if preparation failed
-    #      print("DataFrame preparation failed or resulted in empty DataFrame. Cannot proceed.")
-    #      return None
-    # Pass df directly as it's df_working from main, which is already prepared.
     df_processed = _prepare_dataframe_for_processing(df, taxonomy_df)
     if df_processed is None or df_processed.empty:
         print("DataFrame preparation failed or resulted in an empty DataFrame. Cannot proceed.")
@@ -686,7 +777,7 @@ def generate_and_save_spectrograms(df, config, species_file_counts):
 
     # 3. Create tasks for workers
     tasks, skipped_path_count = _create_processing_tasks(
-        df_processed, config, fabio_intervals, vad_intervals, all_birdnet_detections, species_file_counts
+        df_processed, config, fabio_intervals, vad_intervals, all_birdnet_detections, all_manual_annotations, species_file_counts
     )
     if not tasks:
         print("No valid processing tasks created. Cannot proceed.")
@@ -714,7 +805,10 @@ def main(config):
     """Main function to run the preprocessing steps."""
     overall_start = time.time()
     print("Starting BirdCLEF Preprocessing Pipeline...")
-    print(f"Configuration: Debug={config.debug}, Seed={config.seed}, UseRare={config.USE_RARE_DATA}, RemoveSpeech={config.REMOVE_SPEECH_INTERVALS}, Versions={config.PRECOMPUTE_VERSIONS}")
+    
+    static_versions_info = f", StaticVersionsFallback={config.PRECOMPUTE_VERSIONS}" if config.DYNAMIC_CHUNK_COUNTING else f", Versions={config.PRECOMPUTE_VERSIONS}"
+    print(f"Configuration: Debug={config.debug}, Seed={config.seed}, UseRare={config.USE_RARE_DATA}, RemoveSpeech={config.REMOVE_SPEECH_INTERVALS}{static_versions_info}")
+    
     print(f"Dynamic Chunking Enabled: {config.DYNAMIC_CHUNK_COUNTING}")
     if config.DYNAMIC_CHUNK_COUNTING:
         print(f"  Dynamic Chunk Params: MaxRare={config.MAX_CHUNKS_RARE}, MinCommon={config.MIN_CHUNKS_COMMON}, CommonThresh={config.COMMON_SPECIES_FILE_THRESHOLD}")
