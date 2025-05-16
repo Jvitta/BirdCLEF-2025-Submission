@@ -258,23 +258,60 @@ def _pad_or_tile_audio(audio_data, target_samples):
     else: 
         return audio_data[:target_samples]
 
+def _extract_shifted_chunk_strategy(audio_long, center_time_s, config, min_samples, target_samples_5s):
+    """
+    Extracts a chunk of target_samples_5s.
+    If the centered window goes out of bounds, it's shifted to fit.
+    If audio is shorter than target_samples_5s, it's padded/tiled.
+    """
+    audio_len_samples = len(audio_long)
+
+    if audio_len_samples < min_samples:
+        return None # Too short to be usable, even with padding
+
+    # If the entire audio is shorter than the target chunk duration, pad/tile the whole thing.
+    if audio_len_samples < target_samples_5s:
+        return _pad_or_tile_audio(audio_long[:], target_samples_5s) # Use a copy
+
+    # At this point, audio_len_samples >= target_samples_5s
+
+    # Calculate desired start based on the center point
+    chunk_center_samples = int(center_time_s * config.FS)
+    # Calculate start assuming the chunk is centered around chunk_center_samples
+    desired_start_samples = chunk_center_samples - (target_samples_5s // 2)
+    
+    # Determine the actual slice based on boundaries
+    if desired_start_samples < 0:
+        # Shift window to start at the beginning of the file
+        final_start_idx = 0
+        final_end_idx = target_samples_5s
+    elif (desired_start_samples + target_samples_5s) > audio_len_samples:
+        # Shift window to end at the end of the file
+        final_end_idx = audio_len_samples
+        final_start_idx = audio_len_samples - target_samples_5s
+    else:
+        # Window fits perfectly by centering
+        final_start_idx = desired_start_samples
+        final_end_idx = desired_start_samples + target_samples_5s
+    
+    extracted_audio_segment = audio_long[final_start_idx:final_end_idx]
+    
+    # The segment should now be exactly target_samples_5s long because
+    # audio_len_samples >= target_samples_5s and the shifting logic ensures this.
+    # _pad_or_tile_audio here will just return the segment as is if it's the correct length.
+    return _pad_or_tile_audio(extracted_audio_segment, target_samples_5s)
+
 def _extract_manual_annotation_chunk(audio_long, center_time_s, config, min_samples, target_samples_5s):
-    """Extracts a 5s audio chunk centered around a manual annotation center time."""
+    """Extracts a 5s audio chunk centered around a manual annotation center time, using shifting strategy."""
     try:
-        audio_len_samples = len(audio_long)
-        chunk_start_sec = center_time_s - (config.TARGET_DURATION / 2.0)
-        chunk_end_sec = center_time_s + (config.TARGET_DURATION / 2.0)
-        final_start_idx = max(0, int(chunk_start_sec * config.FS))
-        final_end_idx = min(audio_len_samples, int(chunk_end_sec * config.FS))
-        extracted_audio_segment = audio_long[final_start_idx:final_end_idx]
-        if len(extracted_audio_segment) < min_samples: return None 
-        return _pad_or_tile_audio(extracted_audio_segment, target_samples_5s)
+        return _extract_shifted_chunk_strategy(audio_long, center_time_s, config, min_samples, target_samples_5s)
     except Exception as e:
+        print(f"Warning: Error during manual annotation 5s chunk extraction: {e}") # Optional
         return None
 
 def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_samples_5s):
     """
-    Extracts a 5s audio chunk centered around a BirdNET detection.
+    Extracts a 5s audio chunk centered around a BirdNET detection, using shifting strategy.
     Pads if necessary to ensure target_samples_5s length.
     Returns None on failure or if resulting chunk is too short before padding.
     """
@@ -282,24 +319,9 @@ def _extract_birdnet_chunk(audio_long, detection, config, min_samples, target_sa
         birdnet_start_sec = detection.get('start_time', 0)
         birdnet_end_sec = detection.get('end_time', 0)
         center_sec = (birdnet_start_sec + birdnet_end_sec) / 2.0
-
-        audio_len_samples = len(audio_long)
-        
-        chunk_start_sec = center_sec - (config.TARGET_DURATION / 2.0) # config.TARGET_DURATION is 5s
-        chunk_end_sec = center_sec + (config.TARGET_DURATION / 2.0)
-
-        final_start_idx = max(0, int(chunk_start_sec * config.FS))
-        final_end_idx = min(audio_len_samples, int(chunk_end_sec * config.FS))
-        
-        extracted_audio_segment = audio_long[final_start_idx:final_end_idx]
-
-        if len(extracted_audio_segment) < min_samples:
-            return None 
-        
-        return _pad_or_tile_audio(extracted_audio_segment, target_samples_5s)
-
+        return _extract_shifted_chunk_strategy(audio_long, center_sec, config, min_samples, target_samples_5s)
     except Exception as e:
-        # print(f"Warning: Error during BirdNET 5s chunk extraction: {e}")
+        # print(f"Warning: Error during BirdNET 5s chunk extraction: {e}") # Optional
         return None
 
 def _extract_random_chunk(audio_long, target_samples):
@@ -433,13 +455,11 @@ def _process_primary_for_chunking(args):
         use_birdnet_strategy = (cond1_is_aves and cond2_is_not_uncovered and cond3_has_birdnet_dets and cond4_has_valid_birdnet_items)
 
         final_specs_list = []
-
         # Strategy 1: Manual Annotations (highest priority)
         if manual_annotations_for_file and cmd_args.mode == "train":
             # Cap number of manual chunks by num_versions_to_generate_final for this species
             num_manual_to_take = min(len(manual_annotations_for_file), num_versions_to_generate_final)
-            random.shuffle(manual_annotations_for_file) # Shuffle to pick a random subset if more manual than target
-            
+
             for i in range(num_manual_to_take):
                 center_time_s = manual_annotations_for_file[i]
                 # Use audio_for_manual_and_birdnet_base (original audio) for manual annotations
