@@ -15,7 +15,7 @@ project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
 from config import config 
-import utils as utils 
+import src.utils.utils as utils 
 
 warnings.filterwarnings("ignore")
 

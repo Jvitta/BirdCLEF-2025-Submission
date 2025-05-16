@@ -90,7 +90,7 @@ class Config:
     n_fold = 5
     selected_folds = [0, 1, 2, 3, 4]
 
-    epochs = 10 # 10
+    epochs = 8 # 10
     optimizer = 'AdamW'
     lr = 0.0006124336720699518 #0.0004 
     min_lr = 1e-6

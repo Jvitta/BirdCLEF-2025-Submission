@@ -20,7 +20,7 @@ if project_root not in sys.path:
 
 from config import config
 from models.efficient_at.preprocess import AugmentMelSTFT # Import spectrogram generator
-from birdclef_training import _apply_adain_transformation, _load_adain_per_freq_stats
+from src.training.birdclef_training import _apply_adain_transformation, _load_adain_per_freq_stats
 
 warnings.filterwarnings("ignore")
 

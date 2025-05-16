@@ -14,7 +14,7 @@ import functools # Add functools for passing args to objective
 
 from config import config as base_config
 
-from birdclef_training import run_training, set_seed, calculate_auc # Import calculate_auc
+from src.training.birdclef_training import run_training, set_seed, calculate_auc # Import calculate_auc
 
 # load data once for HPO
 print("Loading main training metadata for HPO...")
