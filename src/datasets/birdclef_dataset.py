@@ -6,6 +6,7 @@ import cv2
 import random
 import sys # For sys.exit in ADL helpers
 from math import radians, sin, cos, sqrt, atan2 # Added for Haversine
+import torchvision.transforms as transforms # For ImageNet normalization
 # It seems 'config' is an object passed around, not directly imported here.
 # If 'config' is expected to be available globally, this might need adjustment,
 # but typically it would be passed to the dataset or functions.
@@ -28,88 +29,18 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     distance = R * c
     return distance
 
-# --- Global cache for AdaIN per-frequency stats ---
-# This global variable might be an issue if multiple dataset instances are created
-# and expect different stats. Consider making it an instance variable or handling it differently.
-_adain_per_freq_stats_cache = None
-
-def _load_adain_per_freq_stats(config_obj):
-    global _adain_per_freq_stats_cache
-    if _adain_per_freq_stats_cache is None:
-        try:
-            # Assuming config_obj has ADAIN_PER_FREQUENCY_STATS_PATH
-            _adain_per_freq_stats_cache = np.load(config_obj.ADAIN_PER_FREQUENCY_STATS_PATH)
-            expected_keys = ['mu_t_mean_per_freq', 'sigma_t_mean_per_freq', 'mu_t_std_per_freq', 'sigma_t_std_per_freq',
-                               'mu_ss_mean_per_freq', 'sigma_ss_mean_per_freq', 'mu_ss_std_per_freq', 'sigma_ss_std_per_freq']
-            if not all(key in _adain_per_freq_stats_cache for key in expected_keys):
-                print(f"ERROR: AdaIN per-frequency stats file ({config_obj.ADAIN_PER_FREQUENCY_STATS_PATH}) is missing one or more expected keys. Per-frequency AdaIN cannot proceed. Exiting.")
-                sys.exit(1) # Or raise an error
-        except Exception as e:
-            print(f"ERROR loading AdaIN per-frequency stats from {config_obj.ADAIN_PER_FREQUENCY_STATS_PATH}: {e}. Per-frequency AdaIN cannot proceed. Exiting.")
-            sys.exit(1) # Or raise an error
-    return _adain_per_freq_stats_cache
-
-def _apply_adain_transformation(spec_np, adain_config):
-    """Applies AdaIN transformation to a numpy spectrogram.
-    Supports 'global' or 'per_frequency' mode based on adain_config.ADAIN_MODE.
-    """
-    if adain_config.ADAIN_MODE == 'global':
-        # Assuming adain_config has MU_T_MEAN, SIGMA_T_MEAN, etc.
-        mu_s_train = np.mean(spec_np)
-        sigma_s_train = np.std(spec_np)
-
-        mu_s_train_new = ((mu_s_train - adain_config.MU_T_MEAN) / (adain_config.SIGMA_T_MEAN + adain_config.ADAIN_EPSILON)) * \
-                         adain_config.SIGMA_SS_MEAN + adain_config.MU_SS_MEAN
-        sigma_s_train_new = ((sigma_s_train - adain_config.MU_T_STD) / (adain_config.SIGMA_T_STD + adain_config.ADAIN_EPSILON)) * \
-                            adain_config.SIGMA_SS_STD + adain_config.MU_SS_STD
-        
-        transformed_spec = ((spec_np - mu_s_train) / (sigma_s_train + adain_config.ADAIN_EPSILON)) * \
-                           sigma_s_train_new + mu_s_train_new
-        
-    elif adain_config.ADAIN_MODE == 'per_frequency':
-        stats = _load_adain_per_freq_stats(adain_config)
-        if stats is None:
-            print("Skipping per-frequency AdaIN due to stats loading issue.")
-            return spec_np.astype(np.float32)
-
-        mu_t_mean_pf = stats['mu_t_mean_per_freq']
-        sigma_t_mean_pf = stats['sigma_t_mean_per_freq']
-        mu_t_std_pf = stats['mu_t_std_per_freq']
-        sigma_t_std_pf = stats['sigma_t_std_per_freq']
-        mu_ss_mean_pf = stats['mu_ss_mean_per_freq']
-        sigma_ss_mean_pf = stats['sigma_ss_mean_per_freq']
-        mu_ss_std_pf = stats['mu_ss_std_per_freq']
-        sigma_ss_std_pf = stats['sigma_ss_std_per_freq']
-
-        if not (mu_t_mean_pf.shape[0] == spec_np.shape[0] == adain_config.N_MELS):
-            print(f"ERROR: Mismatch in N_MELS for per-frequency AdaIN stats ({mu_t_mean_pf.shape[0]}) and spectrogram ({spec_np.shape[0]}). Expected {adain_config.N_MELS}. Skipping.")
-            return spec_np.astype(np.float32)
-
-        mu_s_train_pf = np.mean(spec_np, axis=1)
-        sigma_s_train_pf = np.std(spec_np, axis=1)
-
-        mu_s_train_new_pf = ((mu_s_train_pf - mu_t_mean_pf) / (sigma_t_mean_pf + adain_config.ADAIN_EPSILON)) * \
-                             sigma_ss_mean_pf + mu_ss_mean_pf
-        sigma_s_train_new_pf = ((sigma_s_train_pf - mu_t_std_pf) / (sigma_t_std_pf + adain_config.ADAIN_EPSILON)) * \
-                               sigma_ss_std_pf + mu_ss_std_pf
-        
-        transformed_spec = ((spec_np - mu_s_train_pf[:, np.newaxis]) / (sigma_s_train_pf[:, np.newaxis] + adain_config.ADAIN_EPSILON)) * \
-                           sigma_s_train_new_pf[:, np.newaxis] + mu_s_train_new_pf[:, np.newaxis]
-    else: # 'none' or unknown mode
-        return spec_np.astype(np.float32)
-    
-    return transformed_spec.astype(np.float32)
-
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
     Handles loading pre-computed spectrograms from a pre-loaded dictionary
     or generating them on-the-fly.
+    Supports different preprocessing for EfficientNet vs. MobileNet architectures based on config.model_name.
     """
     def __init__(self, df, config, mode="train", all_spectrograms=None):
         self.df = df.copy()
         self.config = config
         self.mode = mode
         self.all_spectrograms = all_spectrograms
+        # self.model_architecture = self.config.MODEL_ARCHITECTURE # Removed
 
         # Load taxonomy data
         taxonomy_df = pd.read_csv(self.config.taxonomy_path)
@@ -134,17 +65,26 @@ class BirdCLEFDataset(Dataset):
                 self.default_weight_value = self.min_dist_weight
             elif isinstance(self.default_weight_missing_coords_config, (float, int)):
                 self.default_weight_value = float(self.default_weight_missing_coords_config)
-            else: # Fallback for unrecognized string or 'mean_of_calculated_weights' (not implemented here)
+            else: # Fallback
                 print(f"Warning: DEFAULT_WEIGHT_FOR_MISSING_COORDS='{self.default_weight_missing_coords_config}' not fully supported or invalid. Defaulting to min_dist_weight.")
                 self.default_weight_value = self.min_dist_weight
 
+        # Setup based on model_name from config
+        if "efficientnet" in self.config.model_name.lower():
+            self.imagenet_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            print(f"Dataset configured for EfficientNet (model_name: {self.config.model_name}). Input shape: {self.config.TARGET_SHAPE}")
+        elif "mn" in self.config.model_name.lower():
+            print(f"Dataset configured for MobileNet (model_name: {self.config.model_name}). Chunk shape: {self.config.PREPROCESS_TARGET_SHAPE}, Final model input shape: {self.config.TARGET_SHAPE}")
+        else:
+            raise ValueError(f"Unsupported model_name for dataset configuration: {self.config.model_name}. Check if 'efficientnet' or 'mn' is in the name.")
+
         if self.all_spectrograms is not None:
-            print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
+            print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary for model: {self.config.model_name}.")
             print(f"Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
         elif self.config.LOAD_PREPROCESSED_DATA:
             print(f"Dataset mode '{self.mode}': ERROR - Configured to load preprocessed data, but none provided. Dataset will be empty.")
         else:
-            print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files.")
+            print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files (ensure preprocessing logic is present if used).")
 
     def __len__(self):
         return len(self.df)
@@ -155,10 +95,10 @@ class BirdCLEFDataset(Dataset):
         
         primary_label = row['primary_label']
         secondary_labels_str = str(row.get('secondary_labels', ''))
-        filename_for_error = row.get('filename', samplename) # Use filename if available
+        filename_for_error = row.get('filename', samplename) 
         data_source = row['data_source'] 
         
-        sample_weight = 1.0 # Default
+        sample_weight = 1.0 
         if (self.mode == 'train' or self.mode == 'valid') and self.enable_distance_weighting:
             current_lat_val = row.get('latitude')
             current_lon_val = row.get('longitude')
@@ -169,104 +109,101 @@ class BirdCLEFDataset(Dataset):
                     if distance <= self.dist_threshold_km:
                         sample_weight = 1.0
                     else:
-                        # Define a falloff range, e.g., 4000km beyond threshold to reach min_weight
                         falloff_range_km = self.config.DISTANCE_WEIGHTING_FALLOFF_RANGE_KM
                         excess_distance = distance - self.dist_threshold_km
-                        # Linear scaling
                         weight_reduction_factor = excess_distance / falloff_range_km
                         sample_weight = 1.0 - (1.0 - self.min_dist_weight) * weight_reduction_factor
-                        sample_weight = max(self.min_dist_weight, min(1.0, sample_weight)) # Clamp weight
-                except (ValueError, TypeError): # If lat/lon conversion to float fails
+                        sample_weight = max(self.min_dist_weight, min(1.0, sample_weight))
+                except (ValueError, TypeError): 
                     sample_weight = self.default_weight_value
-            else: # Latitude or Longitude is NaN
+            else: 
                 sample_weight = self.default_weight_value
         
-        spec = None # This will hold the final (H_5s, W_5s) processed chunk
+        loaded_chunk_np = None # This will hold the initial 2D chunk from NPZ
 
         if samplename in self.all_spectrograms:
             spec_data_from_npz = self.all_spectrograms[samplename]
-            raw_selected_chunk_2d = None # This will be the 2D chunk selected, potentially >5s wide
-
+            
             if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 3:
-                # Assumes data is always (N, H, W) N is number of chunks, H is height, W is width
                 num_available_chunks = spec_data_from_npz.shape[0]
-                
                 if num_available_chunks > 0:
                     selected_idx = 0
                     if self.mode == 'train' and num_available_chunks > 1:
                         selected_idx = random.randint(0, num_available_chunks - 1)
-                    raw_selected_chunk_2d = spec_data_from_npz[selected_idx]
+                    loaded_chunk_np = spec_data_from_npz[selected_idx]
                 else:
-                    print(f"WARNING: Data for '{samplename}' is a 3D array but has 0 chunks. Using zeros.")
-                    
+                    print(f"WARNING: Data for '{samplename}' (3D array) has 0 chunks. Using zeros.")
             else:
-                ndim_info = spec_data_from_npz.ndim if isinstance(spec_data_from_npz, np.ndarray) else "Not an ndarray"
-                print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
+                print(f"WARNING: Data for '{samplename}' has unexpected format. Expected 3D ndarray. Using zeros.")
 
-            # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
-            if raw_selected_chunk_2d is not None:
-                expected_shape = tuple(self.config.PREPROCESS_TARGET_SHAPE)
-                if raw_selected_chunk_2d.shape == expected_shape:
-                    spec = raw_selected_chunk_2d
-                else:
-                    current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
-                    print(f"WARNING: Samplename '{current_samplename}' - "
-                          f"loaded chunk shape {raw_selected_chunk_2d.shape} "
-                          f"does not match PREPROCESS_TARGET_SHAPE {expected_shape}. Attempting resize.")
-                    spec = cv2.resize(raw_selected_chunk_2d,
+            # Ensure the loaded chunk matches PREPROCESS_TARGET_SHAPE (the shape NPZs should have)
+            if loaded_chunk_np is not None:
+                if loaded_chunk_np.shape != self.config.PREPROCESS_TARGET_SHAPE:
+                    print(f"WARNING: Samplename '{samplename}' - loaded chunk shape {loaded_chunk_np.shape} "
+                          f"does not match config.PREPROCESS_TARGET_SHAPE {self.config.PREPROCESS_TARGET_SHAPE}. Attempting resize.")
+                    loaded_chunk_np = cv2.resize(loaded_chunk_np,
                                       (self.config.PREPROCESS_TARGET_SHAPE[1], self.config.PREPROCESS_TARGET_SHAPE[0]),
                                       interpolation=cv2.INTER_LINEAR)
-            else:
-                # This implies select_version_for_training returned None, or an issue during loading from NPZ for this sample.
-                current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
-                print(f"ERROR: Samplename '{current_samplename}' - "
-                      f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
-                spec = np.zeros(tuple(self.config.PREPROCESS_TARGET_SHAPE), dtype=np.float32)
-
-            # Fallback if spec is still None or issues occurred during processing
-            if spec is None or spec.shape != self.config.PREPROCESS_TARGET_SHAPE:
-                 original_shape_info = spec_data_from_npz.shape if isinstance(spec_data_from_npz, np.ndarray) else type(spec_data_from_npz)
-                 current_spec_shape_info = spec.shape if spec is not None else "None"
-                 print(f"Fallback: Using zeros for '{samplename}'. Raw NPZ shape: {original_shape_info}, Processed spec shape before fallback: {current_spec_shape_info}.")
-                 spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
-        
+            else: # Fallback if loaded_chunk_np is still None
+                print(f"ERROR: Samplename '{samplename}' - no valid chunk could be selected. Using zeros for PREPROCESS_TARGET_SHAPE.")
+                loaded_chunk_np = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
         else:
-            print(f"ERROR: Samplename '{samplename}' not found in pre-loaded dictionary! Using zeros.")
-            spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
+            print(f"ERROR: Samplename '{samplename}' not found in pre-loaded dictionary! Using zeros for PREPROCESS_TARGET_SHAPE.")
+            loaded_chunk_np = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
 
-        # --- Final Shape Guarantee --- (important for downstream code)
-        if not isinstance(spec, np.ndarray) or spec.shape != tuple(self.config.PREPROCESS_TARGET_SHAPE):
-             print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
-             spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
+        # Ensure loaded_chunk_np is float32
+        loaded_chunk_np = loaded_chunk_np.astype(np.float32)
 
-        # Ensure spec is float32 before AdaIN or other augmentations
-        spec = spec.astype(np.float32)
-
-        # --- AdaIN Transformation (if enabled and in train mode) ---
-        if self.config.ADAIN_MODE != 'none': # Apply if AdaIN is enabled, regardless of mode
-            if self.mode == "train":
-                transform_weight = np.random.uniform(0.0, 0.25)
-                spec = (1-transform_weight)*spec + transform_weight*_apply_adain_transformation(spec, self.config)
-            elif self.mode == "val":
-                spec = 0.875*spec + 0.125*_apply_adain_transformation(spec, self.config)
-        # --- End AdaIN Transformation ---
-
-        # Apply manual SpecAugment (Time/Freq Mask, Contrast) on NumPy array
+        # Apply manual SpecAugment (Time/Freq Mask, Contrast) on the single-channel NumPy chunk
         if self.mode == "train":
-            spec = self.apply_spec_augmentations(spec)
+            loaded_chunk_np = self.apply_spec_augmentations(loaded_chunk_np)
 
-        # concatenate the spec with itself to make it 10s long
-        spec = np.concatenate([spec, spec], axis=1)
+        # Architecture-specific processing
+        processed_spec_np = None
+        if "efficientnet" in self.config.model_name.lower():
+            # For EfficientNet, PREPROCESS_TARGET_SHAPE is often the same as TARGET_SHAPE
+            if loaded_chunk_np.shape != self.config.TARGET_SHAPE:
+                # This resize happens if PREPROCESS_TARGET_SHAPE (e.g. 5s chunk) is different from final TARGET_SHAPE
+                print(f"INFO: EfficientNet - Resizing augmented chunk from {loaded_chunk_np.shape} to TARGET_SHAPE {self.config.TARGET_SHAPE} for {samplename}.")
+                processed_spec_np = cv2.resize(loaded_chunk_np,
+                                           (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]),
+                                           interpolation=cv2.INTER_LINEAR)
+            else:
+                processed_spec_np = loaded_chunk_np
 
-        # Convert to tensor, add channel dimension
-        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
+            spec_tensor = torch.tensor(processed_spec_np, dtype=torch.float32).unsqueeze(0).repeat(3, 1, 1)
+            spec_tensor = self.imagenet_normalize(spec_tensor)
 
-        # Encode labels retrieved from the dataframe row
+        elif "mn" in self.config.model_name.lower():
+            # MobileNet: loaded_chunk_np is PREPROCESS_TARGET_SHAPE (e.g., 5s chunk)
+            # We concatenate to get TARGET_SHAPE (e.g., 10s)
+            
+            # Check if TARGET_SHAPE width is double PREPROCESS_TARGET_SHAPE width (common case for 5s -> 10s)
+            if self.config.TARGET_SHAPE[1] == 2 * self.config.PREPROCESS_TARGET_SHAPE[1] and \
+               self.config.TARGET_SHAPE[0] == self.config.PREPROCESS_TARGET_SHAPE[0]:
+                processed_spec_np = np.concatenate([loaded_chunk_np, loaded_chunk_np], axis=1)
+            else:
+                # If not simple concatenation, assume direct resize or that PREPROCESS_TARGET_SHAPE is already TARGET_SHAPE
+                processed_spec_np = loaded_chunk_np 
+
+            # Ensure final processed_spec_np matches TARGET_SHAPE for MobileNet
+            if processed_spec_np.shape != self.config.TARGET_SHAPE:
+                print(f"INFO: MobileNet - Resizing processed chunk from {processed_spec_np.shape} to TARGET_SHAPE {self.config.TARGET_SHAPE} for {samplename}.")
+                processed_spec_np = cv2.resize(processed_spec_np, 
+                                           (self.config.TARGET_SHAPE[1], self.config.TARGET_SHAPE[0]), 
+                                           interpolation=cv2.INTER_LINEAR)
+            
+            spec_tensor = torch.tensor(processed_spec_np, dtype=torch.float32).unsqueeze(0) # (1, H, W_final)
+        else:
+            # This should have been caught in __init__, but as a safeguard:
+            raise ValueError(f"Unsupported model_name: {self.config.model_name} during tensor creation.")
+
+        # Encode labels
         target = self.encode_label(primary_label)
         parsed_secondary_labels = []
         if pd.notna(secondary_labels_str) and secondary_labels_str not in ['nan', '', '[]']:
             try: parsed_secondary_labels = eval(secondary_labels_str)
-            except: pass # Keep empty if eval fails
+            except: pass 
         if isinstance(parsed_secondary_labels, list):
             for label in parsed_secondary_labels:
                 if label in self.label_to_idx:

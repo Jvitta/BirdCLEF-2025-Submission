@@ -30,6 +30,14 @@ from config import config
 from src.models.efficient_at.mn.model import get_model as get_efficient_at_model
 from src.training.losses import FocalLossBCE
 from src.datasets.birdclef_dataset import BirdCLEFDataset, _load_adain_per_freq_stats, _apply_adain_transformation
+# Attempt to import the user's EfficientNet model
+# The user needs to ensure this file and class exist.
+# Example: src/models/birdclef_model.py contains class BirdCLEFModel
+try:
+    from src.models.en_model import get_en_model as get_efficientnet_model
+except ImportError:
+    BirdCLEFModel = None # Will be checked before use
+    print("INFO: BirdCLEFModel not found or could not be imported. EfficientNet architecture will not be available unless fixed.")
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -255,19 +263,36 @@ def get_criterion(config):
         raise NotImplementedError(f"Criterion '{config.criterion}' not implemented")
     return criterion
 
-def calculate_auc(targets, outputs):
-    """Calculates macro-averaged ROC AUC."""
+def calculate_auc(targets, outputs, sample_weights=None):
+    """Calculates macro-averaged ROC AUC.
+    Can apply sample weights to the AUC calculation for each class if provided.
+    """
     num_classes = targets.shape[1]
     aucs = []
 
     probs = 1 / (1 + np.exp(-outputs))
 
     for i in range(num_classes):
-        if np.sum(targets[:, i]) > 0:
+        if np.sum(targets[:, i]) > 0: # Check if class has positive samples
             try:
-                class_auc = roc_auc_score(targets[:, i], probs[:, i])
+                # Use sample_weight if provided
+                current_class_weights = None
+                if sample_weights is not None:
+                    # Ensure sample_weights is 1D and matches the number of samples for this class
+                    if sample_weights.ndim == 1 and sample_weights.shape[0] == targets.shape[0]:
+                        current_class_weights = sample_weights
+                    else:
+                        print(f"Warning: calculate_auc received sample_weights with unexpected shape ({sample_weights.shape}). Ignoring for class {i}.")
+                
+                class_auc = roc_auc_score(targets[:, i], probs[:, i], sample_weight=current_class_weights)
                 aucs.append(class_auc)
             except ValueError as e:
+                # This can happen if only one class is present in targets[:, i] after filtering by weights (if weights are zero for one class)
+                # Or if all targets for a class are the same.
+                # print(f"ValueError calculating AUC for class {i}: {e}. Skipping class.")
+                pass # Silently skip or log as needed
+            except Exception as e_calc_auc: # Catch other errors
+                print(f"Error calculating AUC for class {i}: {e_calc_auc}. Skipping class.")
                 pass
 
     return np.mean(aucs) if aucs else 0.0
@@ -451,6 +476,7 @@ def validate(model, loader, criterion, device):
     losses = []
     all_targets_list = [] 
     all_outputs_list = [] 
+    all_sample_weights_list = [] # Initialize list to store sample weights per batch for validation
     use_amp = config.use_amp
     species_ids = loader.dataset.species_ids 
     num_classes = len(species_ids)
@@ -472,6 +498,8 @@ def validate(model, loader, criterion, device):
                 sample_weights_batch_val = None
                 if distance_weighting_enabled_for_val and 'sample_weight' in batch:
                     sample_weights_batch_val = batch['sample_weight'].to(device)
+                    if sample_weights_batch_val is not None: # Ensure it's not None before trying to append
+                        all_sample_weights_list.append(sample_weights_batch_val.cpu().numpy())
                 elif distance_weighting_enabled_for_val:
                     # This might occur if collate_fn or dataset had an issue, or if weighting is on but a specific batch misses weights
                     print(f"Warning: Distance weighting for validation enabled, but 'sample_weight' not found in batch {step}. Using weight 1.0 for this batch.")
@@ -522,7 +550,29 @@ def validate(model, loader, criterion, device):
     all_outputs_cat = np.concatenate(all_outputs_list)
     all_targets_cat = np.concatenate(all_targets_list)
     
-    macro_auc = calculate_auc(all_targets_cat, all_outputs_cat) # Existing macro AUC calculation
+    sample_weights_for_metrics = None
+    if distance_weighting_enabled_for_val and all_sample_weights_list:
+        # Check if any actual weights were collected (i.e., not all batches were missing them)
+        # Filter out None entries if any were appended due to missing weights in some batches (though current logic appends ones)
+        valid_weights_collected = [w for w in all_sample_weights_list if w is not None]
+        if valid_weights_collected:
+            try:
+                sample_weights_for_metrics = np.concatenate(valid_weights_collected)
+                if sample_weights_for_metrics.shape[0] != all_targets_cat.shape[0]:
+                    print(f"WARNING: Concatenated sample_weights_for_metrics shape ({sample_weights_for_metrics.shape[0]}) mismatch with targets ({all_targets_cat.shape[0]}). Disabling for metrics.")
+                    sample_weights_for_metrics = None
+                else:
+                    print(f"INFO: Using {sample_weights_for_metrics.sum():.2f} total weight for {len(sample_weights_for_metrics)} samples in validation metric calculation.")
+            except ValueError as e_concat_weights: # Handle potential error during concatenation (e.g. empty list if all batches missed weights)
+                print(f"WARNING: Error concatenating sample weights for metrics: {e_concat_weights}. Proceeding unweighted.")
+                sample_weights_for_metrics = None
+        else:
+            print("INFO: Distance weighting for validation enabled, but no valid sample weights were collected from batches. Proceeding unweighted for metrics.")
+
+    # macro_auc = calculate_auc(all_targets_cat, all_outputs_cat) # Existing macro AUC calculation
+    # Modified calculate_auc to accept sample_weights
+    macro_auc = calculate_auc(all_targets_cat, all_outputs_cat, 
+                              sample_weights_for_metrics if distance_weighting_enabled_for_val and sample_weights_for_metrics is not None else None)
     avg_loss = np.mean(losses) if losses else 0.0
 
     # --- Per-Class Metrics Calculation ---
@@ -532,6 +582,9 @@ def validate(model, loader, criterion, device):
 
     # Get TP, FP, FN, TN for all classes using multilabel_confusion_matrix
     try:
+        # multilabel_confusion_matrix does not accept sample_weight directly for TP/FP/FN counts in older sklearn.
+        # For weighted TP/FP/FN/TN, one might need to calculate them manually per class or use a library that supports it.
+        # For now, TP/FP/FN/TN will remain unweighted.
         mcm = multilabel_confusion_matrix(all_targets_cat, predictions_binary_cat, labels=list(range(num_classes)))
     except Exception as e_mcm:
         print(f"Error calculating multilabel_confusion_matrix: {e_mcm}. Per-class TP/FP/FN/TN will be zero.")
@@ -546,13 +599,35 @@ def validate(model, loader, criterion, device):
         class_auc = 0.0
         if np.sum(class_targets) > 0 and np.sum(1 - class_targets) > 0: # Ensure both classes are present for AUC
             try:
-                class_auc = roc_auc_score(class_targets, class_probs)
+                # Pass sample weights to roc_auc_score if available and enabled
+                current_sample_weights = None
+                if distance_weighting_enabled_for_val and sample_weights_for_metrics is not None:
+                    # Assuming sample_weights_for_metrics is a 1D array aligned with all_targets_cat
+                     if sample_weights_for_metrics.shape[0] == class_targets.shape[0]:
+                        current_sample_weights = sample_weights_for_metrics
+                     else:
+                        # This case implies an issue with collecting/aligning weights, log and proceed without.
+                        print(f"WARNING: Sample weights for class {species_name} AUC calculation have incorrect shape. Proceeding unweighted.")
+
+                class_auc = roc_auc_score(class_targets, class_probs, sample_weight=current_sample_weights)
             except ValueError:
                 class_auc = 0.0 # Or handle as NaN, but 0.0 is simpler for aggregation
-        
+            except Exception as e_auc: # Catch other potential errors like shape mismatches if not caught by check
+                print(f"Error calculating weighted AUC for class {species_name}: {e_auc}. Proceeding unweighted.")
+                class_auc = roc_auc_score(class_targets, class_probs) # Fallback to unweighted
+
         # If class_targets are all 0, precision/recall/f1 for label 1 will be 0 due to zero_division=0
+        # Pass sample weights to precision_recall_fscore_support if available and enabled
+        current_sample_weights_prfs = None
+        if distance_weighting_enabled_for_val and sample_weights_for_metrics is not None:
+            if sample_weights_for_metrics.shape[0] == class_targets.shape[0]:
+                current_sample_weights_prfs = sample_weights_for_metrics
+            else:
+                print(f"WARNING: Sample weights for class {species_name} PRFS calculation have incorrect shape. Proceeding unweighted.")
+
         precision, recall, f1_score, _ = precision_recall_fscore_support(
-            class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0
+            class_targets, class_preds_binary, average='binary', pos_label=1, zero_division=0,
+            sample_weight=current_sample_weights_prfs
         )
 
         # mcm[i] is [[TN, FP], [FN, TP]] for class i
@@ -590,22 +665,19 @@ def run_training(df, config, trial=None, all_spectrograms=None,
     is_hpo_trial = trial is not None
     
     # --- wandb initialization ---
-    if custom_run_name:
-        run_name = custom_run_name
-    else:
-        run_name = f"trial_{trial.number}" if is_hpo_trial else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
-    
-    wandb_run = wandb.init(
-        project="BirdCLEF-2025", 
-        config=config.get_wandb_config(), 
-        name=run_name,
-        group="hpo" if is_hpo_trial else "full_training",
-        job_type="train",
-        reinit=True 
-    )
-
-    if is_hpo_trial:
-        wandb.config.update(trial.params, allow_val_change=True)
+    wandb_run = None # Initialize to None
+    if not is_hpo_trial: # Only init if not an HPO trial
+        # Determine run_name only for non-HPO runs that will use W&B
+        actual_run_name = custom_run_name if custom_run_name else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+        wandb_run = wandb.init(
+            project="BirdCLEF-2025", 
+            config=config.get_wandb_config(), 
+            name=actual_run_name,
+            group="full_training", # Always "full_training" for non-HPO
+            job_type="train",
+            reinit=True 
+        )
+    # No wandb.config.update for HPO trials as W&B is not initialized for them.
 
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
@@ -952,18 +1024,27 @@ def run_training(df, config, trial=None, all_spectrograms=None,
             )
 
             print("\nSetting up model, optimizer, criterion, scheduler...")
-            # model = BirdCLEFModel(config).to(config.device) # Old model instantiation
-            # New model instantiation using EfficientAT's get_model
-            with contextlib.redirect_stdout(open(os.devnull, 'w')), contextlib.redirect_stderr(open(os.devnull, 'w')):
-                model = get_efficient_at_model(
-                    num_classes=config.num_classes,          
-                    pretrained_name=config.model_name,               
-                    width_mult=config.width_mult,                         
-                    head_type="mlp",                         
-                    input_dim_f=config.TARGET_SHAPE[0],     
-                    input_dim_t=config.TARGET_SHAPE[1],
-                    dropout=config.dropout
-                ).to(config.device)
+            
+            # --- Model Instantiation based on config.model_name ---
+            if "mn" in config.model_name.lower():
+                print(f"Loading EfficientAT MobileNet model: {config.model_name}")
+                with contextlib.redirect_stdout(open(os.devnull, 'w')), contextlib.redirect_stderr(open(os.devnull, 'w')):
+                    model = get_efficient_at_model(
+                        num_classes=config.num_classes,          
+                        pretrained_name=config.model_name, # e.g., 'mn10_as', from config
+                        width_mult=config.width_mult,      # from config
+                        head_type="mlp",                         
+                        input_dim_f=config.TARGET_SHAPE[0], # Use TARGET_SHAPE from config
+                        input_dim_t=config.TARGET_SHAPE[1], # Use TARGET_SHAPE from config
+                        dropout=config.dropout # General dropout from config
+                    ).to(config.device)
+                print(f"  MobileNet '{config.model_name}' instantiated with input shape {config.TARGET_SHAPE}.")
+            elif "efficientnet" in config.model_name.lower():
+                print(f"Loading BirdCLEFModel (EfficientNet): {config.model_name}")
+                model = get_efficientnet_model(config=config).to(config.device) # Pass the whole config
+                print(f"  EfficientNet (BirdCLEFModel wrapper for '{config.model_name}') instantiated. Expects input {config.TARGET_SHAPE} (after dataset prep).")
+            else:
+                raise ValueError(f"Unsupported config.model_name: '{config.model_name}'. Must contain 'mn' or 'efficientnet'.")
             
             optimizer = get_optimizer(model, config)
             criterion = get_criterion(config)
@@ -1035,17 +1116,32 @@ def run_training(df, config, trial=None, all_spectrograms=None,
 
                 # --- HPO Pruning --- #
                 if is_hpo_trial:
-                    current_global_step = hpo_step_offset + epoch # Use offset here
-                    trial.report(val_auc, current_global_step) # Report intermediate val_auc with global step
-                    if trial.should_prune():
-                        print(f"  Pruning trial based on intermediate value at epoch {epoch+1} (global step {current_global_step}).")
-                        # Clean up before pruning to release GPU memory if possible for next trial
-                        del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
-                        if 'train_df_fold' in locals(): del train_df_fold
-                        if 'val_df_fold' in locals(): del val_df_fold
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                        raise optuna.TrialPruned() # Raise exception to stop training
+                    is_first_hpo_fold_in_trial = (hpo_step_offset == 0)
+                    local_epoch_in_fold = epoch # 0-indexed epoch within the current fold
+                    current_global_step = hpo_step_offset + local_epoch_in_fold
+                    
+                    # Number of initial epochs in non-first HPO folds to skip reporting for.
+                    # config.epochs here is the number of epochs set for this HPO fold.
+                    hpo_fold_skip_report_epochs = config.epochs // 2
+                                                     
+                    should_report_this_hpo_step = True
+                    if not is_first_hpo_fold_in_trial and local_epoch_in_fold < hpo_fold_skip_report_epochs:
+                        should_report_this_hpo_step = False
+                        # Optional: print a message for clarity during HPO runs
+                        # print(f"DEBUG HPO: Trial {trial.number}, SKIPPING report for global_step {current_global_step} (local_epoch {local_epoch_in_fold} of a non-first HPO fold).")
+
+                    if should_report_this_hpo_step:
+                        # print(f"DEBUG HPO: Trial {trial.number}, REPORTING val_auc {val_auc:.4f} for global_step {current_global_step}.") # Optional debug
+                        trial.report(val_auc, current_global_step) # Report intermediate val_auc with global step
+                        if trial.should_prune():
+                            print(f"  Pruning HPO trial {trial.number} based on value at global_step {current_global_step} (val_auc: {val_auc:.4f}).")
+                            # Clean up before pruning to release GPU memory if possible for next trial
+                            del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
+                            if 'train_df_fold' in locals(): del train_df_fold
+                            if 'val_df_fold' in locals(): del val_df_fold
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                            raise optuna.TrialPruned() # Raise exception to stop training
 
                 # --- Model Checkpointing --- #
                 if val_auc > best_val_auc:
@@ -1315,7 +1411,7 @@ def run_training(df, config, trial=None, all_spectrograms=None,
                     mean_oof_auc_final = np.mean(oof_scores_from_hist)
 
                 # Update summary if the run is still considered active by the W&B library
-                if wandb.run: # wandb.run is the global accessor for the current active run status
+                if wandb_run: # Use the local wandb_run variable
                     try:
                         wandb.summary['mean_oof_auc'] = mean_oof_auc_final
                         print(f"DEBUG: Updated wandb.summary['mean_oof_auc'] = {mean_oof_auc_final:.4f}")

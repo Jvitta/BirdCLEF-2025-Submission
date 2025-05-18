@@ -11,7 +11,7 @@ class EfficientNetBirdCLEF(nn.Module):
             config.model_name,
             pretrained=config.pretrained,
             in_chans=config.in_channels,
-            drop_rate=0.2, # Consider making these configurable
+            drop_rate=config.drop_rate, # Consider making these configurable
             drop_path_rate=0.2 # Consider making these configurable
         )
 

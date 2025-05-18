@@ -54,7 +54,7 @@ class Config:
         in_channels = 1 
         num_classes = 206
 
-        epochs = 8 # 10
+        epochs = 10 # 10
         optimizer = 'AdamW'
         lr = 0.0006124336720699518 #0.0004 
         min_lr = 1e-6
@@ -85,8 +85,8 @@ class Config:
         REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
         use_amp = False
         EXCLUDE_FILES_WITH_ONLY_LOW_QUALITY_MANUAL_ANNOTATIONS = True
-        ENABLE_DISTANCE_WEIGHTING = True
-        USE_GLOBAL_OVERSAMPLING = True
+        ENABLE_DISTANCE_WEIGHTING = False
+        USE_GLOBAL_OVERSAMPLING = False
 
         NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
         PRECOMPUTE_VERSIONS = 3 # Number of different chunks per primary file

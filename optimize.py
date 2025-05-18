@@ -26,19 +26,28 @@ try:
             lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0]
         )
         main_train_df_full['data_source'] = 'main' # Add data_source column
+        # Ensure filepath is created, similar to train_mn.py
+        main_train_df_full['filepath'] = main_train_df_full['filename'].apply(
+            lambda f: os.path.join(base_config.train_audio_dir, f)
+        )
     else:
-        print("Error: 'filename' column not found in main training CSV. Cannot create 'samplename'. Exiting.")
+        print("Error: 'filename' column not found in main training CSV. Cannot create 'samplename' or 'filepath'. Exiting.")
         sys.exit(1)
     
-    # Select only necessary columns to mimic training script setup
-    required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'data_source'] # Add 'data_source'
-    if not all(col in main_train_df_full.columns for col in required_cols_main):
-        missing = [col for col in required_cols_main if col not in main_train_df_full.columns]
-        print(f"Error: Required columns missing from main training CSV: {missing}. Exiting.")
+    # Select necessary columns, now including those needed for grouping
+    required_cols_main = [
+        'samplename', 'primary_label', 'secondary_labels', 'data_source', 
+        'latitude', 'longitude', 'author', 'filepath', 'filename' # Added grouping and file path cols
+    ]
+    
+    # Check if all required columns are present
+    missing_cols = [col for col in required_cols_main if col not in main_train_df_full.columns]
+    if missing_cols:
+        print(f"Error: Required columns missing from main training CSV: {missing_cols}. Exiting.")
         sys.exit(1)
     
     main_train_df = main_train_df_full[required_cols_main].copy()
-    print(f"Successfully loaded and prepared {len(main_train_df)} samples for HPO.")
+    print(f"Successfully loaded and prepared {len(main_train_df)} samples for HPO, including grouping columns.")
     del main_train_df_full # Free up memory
 
 except FileNotFoundError:
@@ -48,7 +57,7 @@ except Exception as e:
     print(f"Error loading main training CSV: {e}. Exiting.")
     sys.exit(1)
 
-def objective(trial, preloaded_data):
+def objective(trial, preloaded_data, preloaded_val_data):
     """Runs one training trial with hyperparameters suggested by Optuna."""
     global main_train_df
 
@@ -56,27 +65,37 @@ def objective(trial, preloaded_data):
 
     # --- Hyperparameter Suggestions --- #
     # Keep learning rate search tight around the known good value
-    cfg.lr = trial.suggest_float("lr", 3e-4, 7e-4, log=True) 
+    cfg.lr = trial.suggest_float("lr", 2e-4, 7e-4, log=True) 
 
     # Keep weight decay search tight around the known good value
-    cfg.weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-3, log=True) 
+    cfg.weight_decay = trial.suggest_float("weight_decay", 5e-5, 1e-3, log=True) 
+
+    # Dropout
+    cfg.dropout = trial.suggest_float("dropout", 0.1, 0.4)
 
     # Max Frequency Mask Height (for 128 mel bins)
-    cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 10, 20)
+    cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 8, 24)
 
     # Max Time Mask Width (for 500 time frames in preprocessed spec)
-    cfg.max_time_mask_width = trial.suggest_int("max_time_mask_width", 30, 70)
+    cfg.max_time_mask_width = trial.suggest_int("max_time_mask_width", 20, 80)
+
+    # Augmentation Probabilities
+    cfg.time_mask_prob = trial.suggest_float("time_mask_prob", 0.2, 0.7)
+    cfg.freq_mask_prob = trial.suggest_float("freq_mask_prob", 0.1, 0.5)
 
     # Label Smoothing
     cfg.label_smoothing_factor = trial.suggest_float("label_smoothing_factor", 0.0, 0.25)
 
     # Mixup Alpha
-    cfg.mixup_alpha = trial.suggest_float("mixup_alpha", 0.3, 0.5)
+    cfg.mixup_alpha = trial.suggest_float("mixup_alpha", 0.2, 0.6)
+    
+    # Focal Loss Gamma
+    cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 1.5, 3.0)
 
     # Keep other augmentation probabilities fixed for this study, as their effect might be captured by mask sizes
-    cfg.time_mask_prob = base_config.time_mask_prob
-    cfg.freq_mask_prob = base_config.freq_mask_prob
-    cfg.contrast_prob = base_config.contrast_prob
+    # cfg.time_mask_prob = base_config.time_mask_prob # Now tuned
+    # cfg.freq_mask_prob = base_config.freq_mask_prob # Now tuned
+    # cfg.contrast_prob = base_config.contrast_prob # Now tuned
     # --- End Hyperparameter Suggestions ---
 
     # --- Trial Configuration ---
@@ -120,6 +139,7 @@ def objective(trial, preloaded_data):
                 cfg_fold, 
                 trial=trial, 
                 all_spectrograms=preloaded_data, 
+                val_spectrogram_data=preloaded_val_data,
                 custom_run_name=f"hpo_trial_{trial.number}_fold{fold_num}",
                 hpo_step_offset=current_hpo_step_offset
             )
@@ -158,12 +178,12 @@ def objective(trial, preloaded_data):
 
 if __name__ == "__main__":
     # --- Study Configuration ---
-    study_name = "BirdCLEF_HPO_Augmentations_LR_WD" # Focused study name
+    study_name = "BirdCLEF_HPO_New_Validation_Set2" # Focused study name
     n_trials = 200 # Adjust number of trials as needed for this focused study
 
     # --- Define paths for GCP --- #
     # Database will be stored in the OUTPUT_DIR defined in config.py
-    db_filename = "hpo_augmentations_study_results.db" # Specific DB file
+    db_filename = "hpo_new_validation_set_study_results2.db" # Specific DB file
     db_filepath = os.path.join(base_config.OUTPUT_DIR, db_filename)
     storage_path = f"sqlite:///{db_filepath}" # Use absolute path for Optuna
 
@@ -193,7 +213,7 @@ if __name__ == "__main__":
     hpo_trial_epochs_per_fold = base_config.epochs # Assuming this is epochs PER FOLD in HPO
     # Allow each fold a few epochs to start learning before pruning becomes aggressive.
     # For a 2-fold HPO trial, this means pruning effectively starts a few epochs into the second fold.
-    warmup_steps_for_pruner = hpo_trial_epochs_per_fold + 3 # e.g., if 10 epochs/fold, warmup is 13 steps.
+    warmup_steps_for_pruner = hpo_trial_epochs_per_fold // 2 # e.g., if 10 epochs/fold, warmup is 5 steps.
 
     study = optuna.create_study(
         direction="maximize",
@@ -212,7 +232,10 @@ if __name__ == "__main__":
     # study.set_user_attr("hpo_trial_folds", hpo_trial_folds) # Removed as we use a fixed fold
     # Updated list of tuned parameters
     tuned_params_list = [
-        "lr", "weight_decay", "max_freq_mask_height", "max_time_mask_width", "label_smoothing_factor", "mixup_alpha"
+        "lr", "weight_decay", "dropout", 
+        "max_freq_mask_height", "max_time_mask_width", 
+        "time_mask_prob", "freq_mask_prob",
+        "label_smoothing_factor", "mixup_alpha", "focal_loss_gamma"
     ]
     study.set_user_attr("tuned_parameters", tuned_params_list)
     # Store fixed parameters for reference
@@ -222,10 +245,12 @@ if __name__ == "__main__":
     study.set_user_attr("base_config_mixup_alpha", base_config.mixup_alpha) # Log base value for context
 
     # Log base augmentation probabilities and contrast, as mask sizes are tuned
-    study.set_user_attr("base_config_augmentations", {
-        "time_mask_prob": base_config.time_mask_prob,
-        "freq_mask_prob": base_config.freq_mask_prob,
-        "contrast_prob": base_config.contrast_prob
+    study.set_user_attr("base_config_augmentations_fixed_values", {
+        # These are now tuned, so we log their original base_config values for reference
+        "base_time_mask_prob": base_config.time_mask_prob,
+        "base_freq_mask_prob": base_config.freq_mask_prob,
+        "base_dropout": base_config.dropout,
+        "base_focal_loss_gamma": base_config.focal_loss_gamma
         # max_time_mask_width and max_freq_mask_height are tuned, so not listed as fixed here
         # "max_time_mask_width": base_config.max_time_mask_width,
         # "max_freq_mask_height": base_config.max_freq_mask_height
@@ -256,9 +281,33 @@ if __name__ == "__main__":
         print("\nConfigured to generate spectrograms on-the-fly (no pre-loading for HPO).")
     # --- End Pre-loading --- #
 
+    # --- Pre-load DEDICATED VALIDATION Spectrograms (if available) ---
+    global_val_spectrograms = None
+    if hasattr(base_config, 'PREPROCESSED_NPZ_PATH_VAL') and base_config.PREPROCESSED_NPZ_PATH_VAL:
+        val_npz_path = base_config.PREPROCESSED_NPZ_PATH_VAL
+        print(f"Attempting to pre-load DEDICATED VALIDATION NPZ file into RAM for HPO: {val_npz_path}")
+        if os.path.exists(val_npz_path):
+            try:
+                print("Loading DEDICATED VALIDATION NPZ... (This might take a moment)")
+                start_load_time_val = time.time()
+                with np.load(val_npz_path) as data_archive_val:
+                    global_val_spectrograms = {key: data_archive_val[key] for key in tqdm(data_archive_val.keys(), desc="Loading VAL NPZ into RAM")}
+                end_load_time_val = time.time()
+                print(f"Successfully pre-loaded {len(global_val_spectrograms)} DEDICATED VALIDATION samples into RAM in {end_load_time_val - start_load_time_val:.2f} seconds.")
+            except Exception as e:
+                print(f"Error loading DEDICATED VALIDATION NPZ file ({val_npz_path}) into RAM: {e}")
+                global_val_spectrograms = None # Ensure it's None on error
+        else:
+            print(f"Info: DEDICATED VALIDATION NPZ file not found at {val_npz_path}. HPO will proceed without it.")
+    else:
+        print("\nInfo: config.PREPROCESSED_NPZ_PATH_VAL not defined. HPO will proceed without dedicated validation specs.")
+    # --- End DEDICATED VALIDATION Pre-loading ---
+
     try:
         # Use functools.partial to pass fixed arguments (like loaded data) to the objective
-        objective_with_data = functools.partial(objective, preloaded_data=global_all_spectrograms)
+        objective_with_data = functools.partial(objective, 
+                                                preloaded_data=global_all_spectrograms,
+                                                preloaded_val_data=global_val_spectrograms) # Pass val data
         study.optimize(objective_with_data, n_trials=n_trials, timeout=None)
     except KeyboardInterrupt:
         print("\nOptimization stopped manually. Saving current results.")
