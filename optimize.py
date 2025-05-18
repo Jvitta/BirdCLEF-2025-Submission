@@ -14,7 +14,7 @@ import functools # Add functools for passing args to objective
 
 from config import config as base_config
 
-from src.training.birdclef_training import run_training, set_seed, calculate_auc # Import calculate_auc
+from src.training.train_mn import run_training, set_seed, calculate_auc # Import calculate_auc
 
 # load data once for HPO
 print("Loading main training metadata for HPO...")
@@ -54,25 +54,12 @@ def objective(trial, preloaded_data):
 
     cfg = copy.deepcopy(base_config)
 
-    # --- Determine Fold for this Trial ---
-    # HPO will run on a single, fixed fold for stability (e.g., Fold 2)
-    fixed_hpo_fold = 2
-    # fold_to_run = trial.number % cfg.n_fold # Removed: Using a fixed fold
-    print(f"INFO: HPO Trial {trial.number} will run on fixed Fold {fixed_hpo_fold}")
-    cfg.selected_folds = [fixed_hpo_fold] # Configure training to run only this fold
-    # --- End Fold Determination ---
-
     # --- Hyperparameter Suggestions --- #
     # Keep learning rate search tight around the known good value
     cfg.lr = trial.suggest_float("lr", 3e-4, 7e-4, log=True) 
 
     # Keep weight decay search tight around the known good value
     cfg.weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-3, log=True) 
-
-    # Focal Loss Hyperparameters (Removed based on user feedback for this HPO run)
-    # cfg.focal_loss_alpha = trial.suggest_float("focal_loss_alpha", 0.05, 0.95) 
-    # cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 0.5, 5.0) 
-    # cfg.focal_loss_bce_weight = trial.suggest_float("focal_loss_bce_weight", 0.0, 2.0)
 
     # Max Frequency Mask Height (for 128 mel bins)
     cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 10, 20)
@@ -93,43 +80,64 @@ def objective(trial, preloaded_data):
     # --- End Hyperparameter Suggestions ---
 
     # --- Trial Configuration ---
-    cfg.epochs = base_config.epochs # Use the base config epochs for HPO trials
-    print(f"INFO: Running HPO trial with {cfg.epochs} epochs.")
+    # Use base_config.epochs as max epochs PER FOLD for HPO trials
+    hpo_epochs_per_fold = base_config.epochs 
+    cfg.epochs = hpo_epochs_per_fold # Set this for run_training
+    print(f"INFO: Running HPO trial with max {cfg.epochs} epochs per fold.")
 
-    # cfg.n_fold = 5 # Use full 5 folds for HPO evaluation
-    print(f"INFO: Running HPO trial with fold {cfg.selected_folds}")
-    # --- End Trial Configuration ---
-
-
-    trial_model_dir = os.path.join(base_config.MODEL_OUTPUT_DIR, f"hpo_trial_{trial.number}")
-    cfg.MODEL_OUTPUT_DIR = trial_model_dir
-    os.makedirs(cfg.MODEL_OUTPUT_DIR, exist_ok=True)
+    trial_model_dir_base = os.path.join(base_config.MODEL_OUTPUT_DIR, f"hpo_trial_{trial.number}")
+    os.makedirs(trial_model_dir_base, exist_ok=True) # Create a base directory for the trial
 
     cfg.debug = False
     cfg.debug_limit_batches = float('inf')
 
+    trial_seed = base_config.seed + trial.number # Use a consistent seed derivation for the trial
+    # Seed will be set per fold inside run_training if needed, or use trial_seed globally if preferred for HPO
+    # For now, run_training sets its own seed based on config.seed which will be trial_seed here.
+    cfg.seed = trial_seed 
 
-    trial_seed = base_config.seed + trial.number
-    set_seed(trial_seed)
-    cfg.seed = trial_seed
-
-    print(f"\n--- Starting Optuna Trial {trial.number} (Seed: {cfg.seed}) ---")
+    print(f"\n--- Starting Optuna Trial {trial.number} (Overall Seed: {cfg.seed}) ---")
     print(f"Parameters: {trial.params}")
 
-    try:
-        # Pass the trial object for potential pruning callback within run_training
-        # The training function should now handle pruning internally
-        single_fold_best_auc = run_training(main_train_df, cfg, trial=trial, all_spectrograms=preloaded_data)
+    fold_aucs = []
+    folds_to_run_hpo = [0, 1] # Run on Fold 0 and Fold 1
 
-        # Handle None or invalid return values robustly
-        if single_fold_best_auc is None or not isinstance(single_fold_best_auc, (int, float)) or pd.isna(single_fold_best_auc) or not abs(single_fold_best_auc) > 0:
-             print(f"Warning: Trial {trial.number} (Fold {fixed_hpo_fold}) resulted in invalid AUC ({single_fold_best_auc}). Reporting as 0.0.")
-             single_fold_best_auc = 0.0
-        else:
-             print(f"\n--- Finished Optuna Trial {trial.number} (Fold {fixed_hpo_fold}) | Best Val AUC for Fold: {single_fold_best_auc:.4f} ---")
+    try:
+        for i, fold_num in enumerate(folds_to_run_hpo):
+            print(f"\n--- Trial {trial.number}, Processing Fold {fold_num} ---")
+            cfg_fold = copy.deepcopy(cfg) # Use a fresh copy of cfg for each fold to avoid state leakage
+            cfg_fold.selected_folds = [fold_num]
+            
+            # Set model output directory for this specific fold to keep checkpoints separate if needed
+            cfg_fold.MODEL_OUTPUT_DIR = os.path.join(trial_model_dir_base, f"fold_{fold_num}")
+            os.makedirs(cfg_fold.MODEL_OUTPUT_DIR, exist_ok=True)
+
+            current_hpo_step_offset = i * hpo_epochs_per_fold
+
+            # Pass the trial object for potential pruning callback within run_training
+            fold_best_auc = run_training(
+                main_train_df, 
+                cfg_fold, 
+                trial=trial, 
+                all_spectrograms=preloaded_data, 
+                custom_run_name=f"hpo_trial_{trial.number}_fold{fold_num}",
+                hpo_step_offset=current_hpo_step_offset
+            )
+
+            if fold_best_auc is None or not isinstance(fold_best_auc, (int, float)) or pd.isna(fold_best_auc) or not abs(fold_best_auc) > 0:
+                 print(f"Warning: Trial {trial.number}, Fold {fold_num} resulted in invalid AUC ({fold_best_auc}). Appending 0.0.")
+                 fold_aucs.append(0.0)
+            else:
+                 print(f"--- Trial {trial.number}, Fold {fold_num} | Best Val AUC for Fold: {fold_best_auc:.4f} ---")
+                 fold_aucs.append(fold_best_auc)
+        
+        # If any fold was pruned, optuna.TrialPruned would have been raised and caught below.
+        # If we reach here, both folds completed (or returned a value that wasn't a prune exception).
+        final_objective_value = np.mean(fold_aucs) if fold_aucs else 0.0
+        print(f"\n--- Finished Optuna Trial {trial.number} | Average Val AUC (Folds {folds_to_run_hpo}): {final_objective_value:.4f} ---")
 
     except optuna.TrialPruned:
-        print(f"--- Optuna Trial {trial.number} (Fold {fixed_hpo_fold}) was pruned ---")
+        print(f"--- Optuna Trial {trial.number} was pruned during one of its folds ---")
         raise # Re-raise the exception to signal pruning to Optuna
 
     except Exception as e:
@@ -137,16 +145,16 @@ def objective(trial, preloaded_data):
         import traceback
         traceback.print_exc()
         print(f"--- End of traceback for trial {trial.number} ---")
-        single_fold_best_auc = 0.0 # Report 0.0 AUC for failed trials
+        final_objective_value = 0.0 # Report 0.0 AUC for failed trials
 
-    # Clean up trial-specific model directory (Uncommented to save space)
+    # Clean up trial-specific model directory base (contains subdirs for fold_0, fold_1)
     try:
-        shutil.rmtree(trial_model_dir)
-        print(f"Removed trial directory: {trial_model_dir}")
+        shutil.rmtree(trial_model_dir_base)
+        print(f"Removed trial base directory: {trial_model_dir_base}")
     except OSError as e:
-        print(f"Warning: Could not remove trial directory {trial_model_dir}: {e}")
+        print(f"Warning: Could not remove trial base directory {trial_model_dir_base}: {e}")
 
-    return single_fold_best_auc
+    return final_objective_value
 
 if __name__ == "__main__":
     # --- Study Configuration ---
@@ -181,13 +189,18 @@ if __name__ == "__main__":
     print(f"HPO Trial Epochs: {hpo_trial_epochs}")
     # print(f"HPO Trial Folds: {hpo_trial_folds}")
 
-    # Create study using the storage path in the *working* directory
+    # Adjust n_warmup_steps for MedianPruner based on epochs per HPO fold
+    hpo_trial_epochs_per_fold = base_config.epochs # Assuming this is epochs PER FOLD in HPO
+    # Allow each fold a few epochs to start learning before pruning becomes aggressive.
+    # For a 2-fold HPO trial, this means pruning effectively starts a few epochs into the second fold.
+    warmup_steps_for_pruner = hpo_trial_epochs_per_fold + 3 # e.g., if 10 epochs/fold, warmup is 13 steps.
+
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
         sampler=optuna.samplers.TPESampler(seed=base_config.seed),
         # Configure MedianPruner: Prune if value is worse than median after n_warmup_steps epochs
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5, interval_steps=1),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=warmup_steps_for_pruner, interval_steps=1),
         storage=storage_path_to_use, # Use the defined path
         load_if_exists=True # Load if the db file exists and study_name matches
     )

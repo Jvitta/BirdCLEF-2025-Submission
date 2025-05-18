@@ -29,6 +29,8 @@ from config import config
 import src.utils.utils as utils
 import cv2
 
+from src.models.en_model import EfficientNetBirdCLEF
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
@@ -275,50 +277,6 @@ def collate_fn(batch):
         return None
 
     return result
-
-class BirdCLEFModel(nn.Module):
-    """BirdCLEF model using timm backbone."""
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        self.backbone = timm.create_model(
-            config.model_name,
-            pretrained=config.pretrained,
-            in_chans=config.in_channels,
-            drop_rate=0.2, # Consider making these configurable
-            drop_path_rate=0.2 # Consider making these configurable
-        )
-
-        # Use original backbone feature extraction logic
-        if 'efficientnet' in config.model_name:
-            backbone_out = self.backbone.classifier.in_features
-            self.backbone.classifier = nn.Identity()
-        else:
-            backbone_out = self.backbone.get_classifier().in_features
-            self.backbone.reset_classifier(0, '')
-
-        self.pooling = nn.AdaptiveAvgPool2d(1)
-        self.feat_dim = backbone_out
-        self.classifier = nn.Linear(backbone_out, config.num_classes)
-
-        self.mixup_enabled = config.mixup_alpha > 0
-        if self.mixup_enabled:
-            self.mixup_alpha = config.mixup_alpha
-            print(f"Mixup enabled with alpha={self.mixup_alpha}")
-
-    def forward(self, x):
-        features = self.backbone(x)
-
-        if isinstance(features, dict):
-            features = features['features']
-
-        if len(features.shape) == 4:
-            features = self.pooling(features)
-            features = features.view(features.size(0), -1)
-
-        logits = self.classifier(features)
-        return logits
 
 def mixup_data(x, targets, sources, alpha, device):
     """Applies mixup augmentation, ensuring mixing only occurs between samples from the same source.
@@ -877,7 +835,7 @@ def run_training(df, config, trial=None, all_spectrograms=None):
             )
 
             print("\nSetting up model, optimizer, criterion, scheduler...")
-            model = BirdCLEFModel(config).to(config.device)
+            model = EfficientNetBirdCLEF(config).to(config.device)
             optimizer = get_optimizer(model, config)
             criterion = get_criterion(config)
             scheduler = get_scheduler(optimizer, config)

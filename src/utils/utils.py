@@ -134,3 +134,25 @@ def _preprocess_audio_file_worker(audio_path_str, config):
     except Exception as e:
         print(f"\nError preprocessing worker {audio_path.name}: {e}\n{traceback.format_exc()}")
         return [], []
+    
+def audio2melspec(audio_data, cfg):
+    """Convert audio data to mel spectrogram"""
+    if np.isnan(audio_data).any():
+        mean_signal = np.nanmean(audio_data)
+        audio_data = np.nan_to_num(audio_data, nan=mean_signal)
+
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio_data,
+        sr=cfg.FS,
+        n_fft=cfg.N_FFT,
+        hop_length=cfg.HOP_LENGTH,
+        n_mels=cfg.N_MELS,
+        fmin=cfg.FMIN,
+        fmax=cfg.FMAX,
+        power=2.0
+    )
+
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+    mel_spec_norm = (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min() + 1e-8)
+    
+    return mel_spec_norm

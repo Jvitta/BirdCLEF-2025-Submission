@@ -13,7 +13,7 @@ import cv2
 import librosa      
 from tqdm.auto import tqdm 
 import torch
-from models.efficient_at.preprocess import AugmentMelSTFT
+from src.models.efficient_at.preprocess import AugmentMelSTFT
 import argparse
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -97,47 +97,51 @@ def load_and_prepare_metadata(config):
         print(f"Working metadata size: {df_working.shape[0]} rows")
 
     # --- Filter out files where all manual annotations are marked as low quality ---
-    if not df_working.empty: # Proceed only if df_working is not empty
-        try:
-            manual_ann_df = pd.read_csv(config.ANNOTATED_SEGMENTS_CSV_PATH)
-            if 'filename' in manual_ann_df.columns and 'is_low_quality' in manual_ann_df.columns:
-                manual_ann_df['filename'] = manual_ann_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
-                
-                # Robustly convert 'is_low_quality' to boolean
-                if manual_ann_df['is_low_quality'].dtype == 'object' or pd.api.types.is_string_dtype(manual_ann_df['is_low_quality']):
-                    manual_ann_df['is_low_quality'] = manual_ann_df['is_low_quality'].astype(str).str.lower().map({
-                        'true': True, 'yes': True, '1': True, 't': True,
-                        'false': False, 'no': False, '0': False, 'f': False,
-                        'nan': False, '': False, 'none': False, '<na>': False
-                    }).fillna(False) # Fill any unmapped (originally NaN or other strings) as False
-                manual_ann_df['is_low_quality'] = manual_ann_df['is_low_quality'].fillna(False).astype(bool)
-
-                annotated_files_present_in_df_working = manual_ann_df[manual_ann_df['filename'].isin(df_working['filename'])]
-                
-                if not annotated_files_present_in_df_working.empty:
-                    # Group by filename and check if all 'is_low_quality' are True for annotations belonging to files in df_working
-                    file_quality_summary = annotated_files_present_in_df_working.groupby('filename')['is_low_quality'].agg(['all', 'count'])
+    if config.EXCLUDE_FILES_WITH_ONLY_LOW_QUALITY_MANUAL_ANNOTATIONS:
+        print("EXCLUDE_FILES_WITH_ONLY_LOW_QUALITY_MANUAL_ANNOTATIONS is True. Applying filter.")
+        if not df_working.empty: # Proceed only if df_working is not empty
+            try:
+                manual_ann_df = pd.read_csv(config.ANNOTATED_SEGMENTS_CSV_PATH)
+                if 'filename' in manual_ann_df.columns and 'is_low_quality' in manual_ann_df.columns:
+                    manual_ann_df['filename'] = manual_ann_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
                     
-                    # Identify files where count > 0 (i.e., has annotations) and all annotations are low quality
-                    # The .all() column from agg will be True if all are True, or if the group was empty (which we filter by count > 0 implicitly with isin earlier, but explicitly here is safer)
-                    low_quality_files_series = file_quality_summary[file_quality_summary['all'] == True]
-                    filenames_to_exclude = low_quality_files_series.index.tolist()
+                    # Robustly convert 'is_low_quality' to boolean
+                    if manual_ann_df['is_low_quality'].dtype == 'object' or pd.api.types.is_string_dtype(manual_ann_df['is_low_quality']):
+                        manual_ann_df['is_low_quality'] = manual_ann_df['is_low_quality'].astype(str).str.lower().map({
+                            'true': True, 'yes': True, '1': True, 't': True,
+                            'false': False, 'no': False, '0': False, 'f': False,
+                            'nan': False, '': False, 'none': False, '<na>': False
+                        }).fillna(False) # Fill any unmapped (originally NaN or other strings) as False
+                    manual_ann_df['is_low_quality'] = manual_ann_df['is_low_quality'].fillna(False).astype(bool)
 
-                    if filenames_to_exclude:
-                        initial_rows = df_working.shape[0]
-                        df_working = df_working[~df_working['filename'].isin(filenames_to_exclude)]
-                        excluded_count = initial_rows - df_working.shape[0]
-                        if excluded_count > 0:
-                            print(f"INFO: Excluded {excluded_count} files from processing because all their manual annotations were marked as low quality.")
+                    annotated_files_present_in_df_working = manual_ann_df[manual_ann_df['filename'].isin(df_working['filename'])]
+                    
+                    if not annotated_files_present_in_df_working.empty:
+                        # Group by filename and check if all 'is_low_quality' are True for annotations belonging to files in df_working
+                        file_quality_summary = annotated_files_present_in_df_working.groupby('filename')['is_low_quality'].agg(['all', 'count'])
+                        
+                        # Identify files where count > 0 (i.e., has annotations) and all annotations are low quality
+                        # The .all() column from agg will be True if all are True, or if the group was empty (which we filter by count > 0 implicitly with isin earlier, but explicitly here is safer)
+                        low_quality_files_series = file_quality_summary[file_quality_summary['all'] == True]
+                        filenames_to_exclude = low_quality_files_series.index.tolist()
+
+                        if filenames_to_exclude:
+                            initial_rows = df_working.shape[0]
+                            df_working = df_working[~df_working['filename'].isin(filenames_to_exclude)]
+                            excluded_count = initial_rows - df_working.shape[0]
+                            if excluded_count > 0:
+                                print(f"INFO: Excluded {excluded_count} files from processing because all their manual annotations were marked as low quality.")
+                    else:
+                        print(f"Info: No files listed in {config.ANNOTATED_SEGMENTS_CSV_PATH} matched files currently in the working dataframe. No files excluded based on low quality annotations.")
                 else:
-                    print(f"Info: No files listed in {config.ANNOTATED_SEGMENTS_CSV_PATH} matched files currently in the working dataframe. No files excluded based on low quality annotations.")
-            else:
-                print(f"Info: 'filename' or 'is_low_quality' column not found in {config.ANNOTATED_SEGMENTS_CSV_PATH}. No files excluded based on low quality annotations.")
-        except FileNotFoundError:
-            print(f"Info: Manual annotations file '{config.ANNOTATED_SEGMENTS_CSV_PATH}' not found. No files excluded based on low quality annotations.")
-        except Exception as e_lq_filter:
-            print(f"Warning: Could not filter files based on low quality annotations: {e_lq_filter}")
-            print(traceback.format_exc()) # Print stack trace for easier debugging
+                    print(f"Info: 'filename' or 'is_low_quality' column not found in {config.ANNOTATED_SEGMENTS_CSV_PATH}. No files excluded based on low quality annotations.")
+            except FileNotFoundError:
+                print(f"Info: Manual annotations file '{config.ANNOTATED_SEGMENTS_CSV_PATH}' not found. No files excluded based on low quality annotations.")
+            except Exception as e_lq_filter:
+                print(f"Warning: Could not filter files based on low quality annotations: {e_lq_filter}")
+                print(traceback.format_exc()) # Print stack trace for easier debugging
+    else:
+        print("EXCLUDE_FILES_WITH_ONLY_LOW_QUALITY_MANUAL_ANNOTATIONS is False. Skipping filter.")
     # --- End filter ---
 
     df_working['samplename'] = df_working['filename'].map(lambda x: os.path.splitext(x.replace('/', '-'))[0])
@@ -334,28 +338,50 @@ def _extract_random_chunk(audio_long, target_samples):
     return audio_long[start_idx_5s : start_idx_5s + target_samples]
 
 def _generate_spectrogram_from_chunk(audio_chunk_5s, config_obj):
-    """Generates a mel spectrogram from an audio chunk using EfficientAT's method, then resizes."""
+    """Generates a mel spectrogram from an audio chunk using model-specific methods, then resizes to PREPROCESS_TARGET_SHAPE if needed."""
     try:
         if not isinstance(audio_chunk_5s, np.ndarray) or audio_chunk_5s.ndim != 1:
             print(f"Warning: audio_chunk_5s is not a 1D numpy array. Shape: {audio_chunk_5s.shape if hasattr(audio_chunk_5s, 'shape') else 'N/A'}")
             return None
         
-        audio_tensor = torch.from_numpy(audio_chunk_5s.astype(np.float32))
+        raw_spec_chunk_numpy = None
 
-        with torch.no_grad():
-            # We process one chunk at a time, so unsqueeze to add batch dim for the conv1d preemphasis.
-            raw_spec_chunk_tensor = efficient_at_spectrogram_generator(audio_tensor.unsqueeze(0))
-
-        raw_spec_chunk_numpy = raw_spec_chunk_tensor.squeeze(0).cpu().numpy()
+        if 'mn' in config_obj.model_name:
+            audio_tensor = torch.from_numpy(audio_chunk_5s.astype(np.float32))
+            with torch.no_grad():
+                # efficient_at_spectrogram_generator is initialized globally and configured by global config
+                raw_spec_chunk_tensor = efficient_at_spectrogram_generator(audio_tensor.unsqueeze(0))
+            raw_spec_chunk_numpy = raw_spec_chunk_tensor.squeeze(0).cpu().numpy()
+        
+        elif 'efficientnet' in config_obj.model_name:
+            # utils.audio2melspec uses parameters from the passed config_obj
+            raw_spec_chunk_numpy = utils.audio2melspec(audio_chunk_5s, config_obj)
+        else:
+            print(f"Warning: Unknown model_name '{config_obj.model_name}' in config. Cannot generate spectrogram.")
+            return None
 
         if raw_spec_chunk_numpy is None or raw_spec_chunk_numpy.ndim != 2:
             print(f"Warning: Spectrogram generation failed or resulted in non-2D array for a chunk.")
             return None
 
+        # --- Resize if necessary to config_obj.PREPROCESS_TARGET_SHAPE ---
+        current_shape = (raw_spec_chunk_numpy.shape[0], raw_spec_chunk_numpy.shape[1])
+        desired_shape = config_obj.PREPROCESS_TARGET_SHAPE
+
+        if current_shape != desired_shape:
+            # print(f"Info: Resizing spectrogram from {current_shape} to {desired_shape} for model {config_obj.model_name}") # Optional for debugging
+            # cv2.resize expects dsize as (width, height)
+            raw_spec_chunk_numpy = cv2.resize(
+                raw_spec_chunk_numpy, 
+                (desired_shape[1], desired_shape[0]), 
+                interpolation=cv2.INTER_LINEAR
+            )
+        
         return raw_spec_chunk_numpy.astype(np.float32)
 
     except Exception as e:
-        print(f"Error in _generate_spectrogram_from_chunk with EfficientAT: {e}")
+        print(f"Error in _generate_spectrogram_from_chunk: {e}")
+        print(traceback.format_exc())
         return None
 
 def _process_primary_for_chunking(args):
@@ -456,13 +482,14 @@ def _process_primary_for_chunking(args):
 
         final_specs_list = []
         # Strategy 1: Manual Annotations (highest priority)
-        if manual_annotations_for_file and cmd_args.mode == "train":
-            # Cap number of manual chunks by num_versions_to_generate_final for this species
+        if manual_annotations_for_file: # Process if annotations exist, regardless of mode initially
             num_manual_to_take = min(len(manual_annotations_for_file), num_versions_to_generate_final)
+            # Only take one if in val mode, even if more are available and num_versions_to_generate_final was >1 (which it isn't for val)
+            if cmd_args.mode == "val" and num_manual_to_take > 0: 
+                num_manual_to_take = 1
 
             for i in range(num_manual_to_take):
                 center_time_s = manual_annotations_for_file[i]
-                # Use audio_for_manual_and_birdnet_base (original audio) for manual annotations
                 audio_chunk = _extract_manual_annotation_chunk(
                     audio_for_manual_and_birdnet_base, center_time_s, config, min_samples, target_samples
                 )
@@ -470,15 +497,13 @@ def _process_primary_for_chunking(args):
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
                     if spec is not None: final_specs_list.append(spec)
             
-            # If manual annotations were found and processed, we are done for this file.
-            if final_specs_list:
-                pass # Proceed to saving these specs
+            # For val mode, if we got a manual chunk, we are done.
+            if cmd_args.mode == "val" and final_specs_list:
+                pass 
 
-        # Strategy 2: BirdNET (Aves with detections) - only if no manual annotations processed
-        if (use_birdnet_strategy and 
-            cmd_args.mode == "train" and 
-            not final_specs_list): 
-            
+        # Strategy 2: BirdNET (Aves with detections) - only if no manual annotations processed to fill the quota
+        # MODIFICATION: Allow for val mode. num_versions_to_generate_final will be 1 for val.
+        if use_birdnet_strategy and not final_specs_list: # If no manual spec was generated (or not enough for train)
             if audio_for_manual_and_birdnet_base is None or len(audio_for_manual_and_birdnet_base) == 0:
                 return samplename, None, "Audio for BirdNet chunks is unusable (None or empty)."
             
@@ -487,39 +512,48 @@ def _process_primary_for_chunking(args):
             except Exception as e_sort: print(f"Warning: Error sorting BirdNET detections for {samplename}: {e_sort}.")
 
             num_birdnet_chunks_generated = 0
+            # For val mode, we only want 1 BirdNET chunk at most if no manual was found.
+            # num_versions_to_generate_final is already 1 for val mode.
+            # For train mode, it tries to fill up to num_versions_to_generate_final.
             for i in range(len(sorted_detections)):
-                if num_birdnet_chunks_generated >= num_versions_to_generate_final: break
+                if num_birdnet_chunks_generated >= num_versions_to_generate_final: break 
                 audio_chunk_from_birdnet = _extract_birdnet_chunk(
                     audio_for_manual_and_birdnet_base, sorted_detections[i], config, min_samples, target_samples 
                 )
                 if audio_chunk_from_birdnet is not None and len(audio_chunk_from_birdnet) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk_from_birdnet, config)
-                    if spec is not None: final_specs_list.append(spec); num_birdnet_chunks_generated +=1
+                    if spec is not None: 
+                        final_specs_list.append(spec)
+                        num_birdnet_chunks_generated +=1
             
-            # Fallback to random if not enough BirdNET chunks were generated
-            num_random_fallbacks_needed = num_versions_to_generate_final - num_birdnet_chunks_generated
-            if num_random_fallbacks_needed > 0 and audio_for_random_base is not None and len(audio_for_random_base) > 0:
-                for _ in range(num_random_fallbacks_needed):
-                    audio_chunk = _extract_random_chunk(audio_for_random_base, target_samples)
-                    if audio_chunk is not None and len(audio_chunk) == target_samples:
-                        spec = _generate_spectrogram_from_chunk(audio_chunk, config)
-                        if spec is not None: final_specs_list.append(spec)
+            # Fallback to random if not enough BirdNET chunks were generated (ONLY FOR TRAIN MODE)
+            # MODIFICATION: Add cmd_args.mode == "train" check here
+            if cmd_args.mode == "train":
+                num_random_fallbacks_needed = num_versions_to_generate_final - num_birdnet_chunks_generated
+                if num_random_fallbacks_needed > 0 and audio_for_random_base is not None and len(audio_for_random_base) > 0:
+                    for _ in range(num_random_fallbacks_needed):
+                        audio_chunk = _extract_random_chunk(audio_for_random_base, target_samples)
+                        if audio_chunk is not None and len(audio_chunk) == target_samples:
+                            spec = _generate_spectrogram_from_chunk(audio_chunk, config)
+                            if spec is not None: final_specs_list.append(spec)
         
         # Strategy 3: Random Chunks (Non-Aves or Aves without enough detections, and no manual annotations processed)
-        # Also handles val mode or short audio initial num_versions_to_generate_final = 1 case.
         if not final_specs_list: # If no specs from manual or BirdNET yet
-            # Determine how many chunks to make. If val mode or short audio, it will be 1.
-            # Otherwise, it's the dynamically calculated num_versions_to_generate_final.
+            if cmd_args.mode == "val":
+                return samplename, None, "VAL_MODE_SKIP: No manual or BirdNET chunk found."
+            
+            # This part now only runs for TRAIN mode if above conditions met
             actual_chunks_to_make_random = num_versions_to_generate_final 
-            if cmd_args.mode == "val" or base_duration_for_versions < target_samples : # Ensure val/short always gets 1 try
+            # The following if condition related to val mode is now effectively dead code due to the explicit skip above,
+            # but harmless to keep for structural clarity if this block were ever reached by val mode.
+            if cmd_args.mode == "val" or base_duration_for_versions < target_samples : 
                  actual_chunks_to_make_random = 1 
             
             audio_source_for_random = audio_for_random_base
             if audio_source_for_random is None or len(audio_source_for_random) == 0:
-                # Fallback to original audio if cleaned audio is unusable
                 audio_source_for_random = audio_for_manual_and_birdnet_base 
                 if audio_source_for_random is None or len(audio_source_for_random) == 0:
-                    return samplename, None, "All audio sources unusable for random chunks."
+                    return samplename, None, "All audio sources unusable for random chunks (train mode)."
             
             for _ in range(actual_chunks_to_make_random):
                 audio_chunk = _extract_random_chunk(audio_source_for_random, target_samples)
@@ -536,8 +570,10 @@ def _process_primary_for_chunking(args):
                     if spec is not None: final_specs_list.append(spec)
         
         if not final_specs_list:
-            return samplename, None, "No valid spectrograms generated after all strategies."
+            # This message will now correctly reflect if it's a val mode skip or a train mode complete failure
+            return samplename, None, "No valid spectrograms generated after all strategies (or VAL_MODE_SKIP)."
 
+        # If final_specs_list is populated (e.g., with 1 spec for val mode), stack and return
         final_specs_array = np.stack([s.astype(np.float32) for s in final_specs_list], axis=0)
         return samplename, final_specs_array, None
 
@@ -584,21 +620,24 @@ def _load_auxiliary_data(config):
 
     # Load Manual Annotations
     print(f"\nAttempting to load Manual Annotations from: {config.ANNOTATED_SEGMENTS_CSV_PATH}")
-    try:
-        manual_ann_df = pd.read_csv(config.ANNOTATED_SEGMENTS_CSV_PATH)
-        # Ensure filename is normalized (forward slashes)
-        if 'filename' in manual_ann_df.columns: 
-            manual_ann_df['filename'] = manual_ann_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
-        # Filter out low quality and NaN center_time_s, then group
-        valid_manual_anns = manual_ann_df[
-            (manual_ann_df['is_low_quality'] == False) & 
-            (manual_ann_df['center_time_s'].notna())
-        ]
-        if not valid_manual_anns.empty:
-            all_manual_annotations = valid_manual_anns.groupby('filename')['center_time_s'].apply(list).to_dict()
-        print(f"Successfully loaded and grouped manual annotations for {len(all_manual_annotations)} files.")
-    except FileNotFoundError: print(f"Info: Manual annotations file not found at {config.ANNOTATED_SEGMENTS_CSV_PATH}. Skipping manual annotations.")
-    except Exception as e: print(f"Warning: Error loading manual annotations CSV: {e}. Skipping manual annotations.")
+    if config.USE_MANUAL_ANNOTATIONS:
+        try:
+            manual_ann_df = pd.read_csv(config.ANNOTATED_SEGMENTS_CSV_PATH)
+            # Ensure filename is normalized (forward slashes)
+            if 'filename' in manual_ann_df.columns: 
+                manual_ann_df['filename'] = manual_ann_df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
+            # Filter out low quality and NaN center_time_s, then group
+            valid_manual_anns = manual_ann_df[
+                (manual_ann_df['is_low_quality'] == False) & 
+                (manual_ann_df['center_time_s'].notna())
+            ]
+            if not valid_manual_anns.empty:
+                all_manual_annotations = valid_manual_anns.groupby('filename')['center_time_s'].apply(list).to_dict()
+            print(f"Successfully loaded and grouped manual annotations for {len(all_manual_annotations)} files.")
+        except FileNotFoundError: print(f"Info: Manual annotations file not found at {config.ANNOTATED_SEGMENTS_CSV_PATH}. Skipping manual annotations as per config or file missing.")
+        except Exception as e: print(f"Warning: Error loading manual annotations CSV: {e}. Skipping manual annotations.")
+    else:
+        print("USE_MANUAL_ANNOTATIONS is False. Skipping manual annotations.")
 
     # Load Taxonomy for Class/Scientific Name
     print("\nLoading taxonomy data...")
@@ -827,7 +866,7 @@ def main(config):
     print("Starting BirdCLEF Preprocessing Pipeline...")
     
     static_versions_info = f", StaticVersionsFallback={config.PRECOMPUTE_VERSIONS}" if config.DYNAMIC_CHUNK_COUNTING else f", Versions={config.PRECOMPUTE_VERSIONS}"
-    print(f"Configuration: Debug={config.debug}, Seed={config.seed}, UseRare={config.USE_RARE_DATA}, RemoveSpeech={config.REMOVE_SPEECH_INTERVALS}{static_versions_info}")
+    print(f"Configuration: Debug={config.debug}, Seed={config.seed}, UseRare={config.USE_RARE_DATA}, UseManualAnns={config.USE_MANUAL_ANNOTATIONS}, RemoveSpeech={config.REMOVE_SPEECH_INTERVALS}{static_versions_info}")
     
     print(f"Dynamic Chunking Enabled: {config.DYNAMIC_CHUNK_COUNTING}")
     if config.DYNAMIC_CHUNK_COUNTING:

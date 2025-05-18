@@ -20,7 +20,7 @@ if project_root not in sys.path:
 
 from config import config
 from models.efficient_at.preprocess import AugmentMelSTFT # Import spectrogram generator
-from src.training.birdclef_training import _apply_adain_transformation, _load_adain_per_freq_stats
+from src.training.train_mn import _apply_adain_transformation, _load_adain_per_freq_stats
 
 warnings.filterwarnings("ignore")
 
@@ -125,7 +125,7 @@ if not soundscape_files:
 else:
     print(f"Found {len(soundscape_files)} soundscape files to process.")
     worker_func = partial(_process_soundscape_file, config_obj=config)
-        soundscape_results_raw = []
+    soundscape_results_raw = []
     pool = None
     try:
         try: multiprocessing.set_start_method('spawn', force=True)
@@ -133,9 +133,9 @@ else:
         print(f"Starting soundscape processing pool with {NUM_WORKERS} workers...")
         pool = multiprocessing.Pool(processes=NUM_WORKERS)
         results_iterator = pool.imap_unordered(worker_func, [str(p) for p in soundscape_files])
-            for result in tqdm(results_iterator, total=len(soundscape_files), desc="Processing Soundscapes"):
-                if isinstance(result, Exception): print(f"Worker Error: {result}")
-                elif result: soundscape_results_raw.extend(result)
+        for result in tqdm(results_iterator, total=len(soundscape_files), desc="Processing Soundscapes"):
+            if isinstance(result, Exception): print(f"Worker Error: {result}")
+            elif result: soundscape_results_raw.extend(result)
     except Exception as e_pool:
             print(f"CRITICAL ERROR during multiprocessing: {e_pool}\\n{traceback.format_exc()}")
     finally:

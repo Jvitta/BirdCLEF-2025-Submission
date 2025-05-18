@@ -9,7 +9,6 @@ import contextlib
 import argparse
 import numpy as np
 import pandas as pd
-import cv2
 import matplotlib.pyplot as plt
 import optuna
 import wandb
@@ -21,18 +20,16 @@ import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, GroupKFold, StratifiedGroupKFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
-from sklearn.utils import resample
 from torch.utils.data.sampler import WeightedRandomSampler
 from collections import Counter
 import math
 
 from config import config
-import src.utils.utils as utils
 from src.models.efficient_at.mn.model import get_model as get_efficient_at_model
-from src.models.efficient_at.dymn.model import get_model as get_dymn_model
 from src.training.losses import FocalLossBCE
+from src.datasets.birdclef_dataset import BirdCLEFDataset, _load_adain_per_freq_stats, _apply_adain_transformation
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -51,271 +48,6 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# --- Global cache for AdaIN per-frequency stats ---
-_adain_per_freq_stats_cache = None
-
-def _load_adain_per_freq_stats(config_obj):
-    global _adain_per_freq_stats_cache
-    if _adain_per_freq_stats_cache is None:
-        try:
-            _adain_per_freq_stats_cache = np.load(config_obj.ADAIN_PER_FREQUENCY_STATS_PATH)
-            expected_keys = ['mu_t_mean_per_freq', 'sigma_t_mean_per_freq', 'mu_t_std_per_freq', 'sigma_t_std_per_freq',
-                               'mu_ss_mean_per_freq', 'sigma_ss_mean_per_freq', 'mu_ss_std_per_freq', 'sigma_ss_std_per_freq']
-            if not all(key in _adain_per_freq_stats_cache for key in expected_keys):
-                print(f"ERROR: AdaIN per-frequency stats file ({config_obj.ADAIN_PER_FREQUENCY_STATS_PATH}) is missing one or more expected keys. Per-frequency AdaIN cannot proceed. Exiting.")
-                sys.exit(1)
-        except Exception as e:
-            print(f"ERROR loading AdaIN per-frequency stats from {config_obj.ADAIN_PER_FREQUENCY_STATS_PATH}: {e}. Per-frequency AdaIN cannot proceed. Exiting.")
-            sys.exit(1)
-    return _adain_per_freq_stats_cache
-
-def _apply_adain_transformation(spec_np, adain_config):
-    """Applies AdaIN transformation to a numpy spectrogram.
-    Supports 'global' or 'per_frequency' mode based on adain_config.ADAIN_MODE.
-    """
-    if adain_config.ADAIN_MODE == 'global':
-        # Calculate original mean and std of the current spectrogram (overall)
-        mu_s_train = np.mean(spec_np)
-        sigma_s_train = np.std(spec_np)
-
-        # Calculate the target mean for this specific spectrogram (overall)
-        mu_s_train_new = ((mu_s_train - adain_config.MU_T_MEAN) / (adain_config.SIGMA_T_MEAN + adain_config.ADAIN_EPSILON)) * \
-                         adain_config.SIGMA_SS_MEAN + adain_config.MU_SS_MEAN
-
-        # Calculate the target internal standard deviation for this specific spectrogram (overall)
-        sigma_s_train_new = ((sigma_s_train - adain_config.MU_T_STD) / (adain_config.SIGMA_T_STD + adain_config.ADAIN_EPSILON)) * \
-                            adain_config.SIGMA_SS_STD + adain_config.MU_SS_STD
-        
-        # Apply the AdaIN transformation (overall)
-        transformed_spec = ((spec_np - mu_s_train) / (sigma_s_train + adain_config.ADAIN_EPSILON)) * \
-                           sigma_s_train_new + mu_s_train_new
-        
-    elif adain_config.ADAIN_MODE == 'per_frequency':
-        stats = _load_adain_per_freq_stats(adain_config)
-        if stats is None:
-            print("Skipping per-frequency AdaIN due to stats loading issue.")
-            return spec_np.astype(np.float32) # Return original if stats not loaded
-
-        # Extract per-frequency stats from loaded NPZ
-        mu_t_mean_pf = stats['mu_t_mean_per_freq']
-        sigma_t_mean_pf = stats['sigma_t_mean_per_freq']
-        mu_t_std_pf = stats['mu_t_std_per_freq']
-        sigma_t_std_pf = stats['sigma_t_std_per_freq']
-        mu_ss_mean_pf = stats['mu_ss_mean_per_freq']
-        sigma_ss_mean_pf = stats['sigma_ss_mean_per_freq']
-        mu_ss_std_pf = stats['mu_ss_std_per_freq']
-        sigma_ss_std_pf = stats['sigma_ss_std_per_freq']
-
-        if not (mu_t_mean_pf.shape[0] == spec_np.shape[0] == adain_config.N_MELS):
-            print(f"ERROR: Mismatch in N_MELS for per-frequency AdaIN stats ({mu_t_mean_pf.shape[0]}) and spectrogram ({spec_np.shape[0]}). Expected {adain_config.N_MELS}. Skipping.")
-            return spec_np.astype(np.float32)
-
-        # Calculate original mean and std for each frequency bin of the current spectrogram
-        mu_s_train_pf = np.mean(spec_np, axis=1)  # Shape: (N_MELS,)
-        sigma_s_train_pf = np.std(spec_np, axis=1) # Shape: (N_MELS,)
-
-        # Calculate the target mean for each frequency bin
-        # Ensure broadcasting for per-element operations (N_MELS,)
-        mu_s_train_new_pf = ((mu_s_train_pf - mu_t_mean_pf) / (sigma_t_mean_pf + adain_config.ADAIN_EPSILON)) * \
-                             sigma_ss_mean_pf + mu_ss_mean_pf
-
-        # Calculate the target std for each frequency bin
-        sigma_s_train_new_pf = ((sigma_s_train_pf - mu_t_std_pf) / (sigma_t_std_pf + adain_config.ADAIN_EPSILON)) * \
-                               sigma_ss_std_pf + mu_ss_std_pf
-        
-        # Apply the AdaIN transformation per frequency bin
-        # spec_np is (N_MELS, N_TIMEBINS)
-        # mu_s_train_pf, sigma_s_train_pf are (N_MELS,)
-        # mu_s_train_new_pf, sigma_s_train_new_pf are (N_MELS,)
-        # We need to reshape for broadcasting: (N_MELS, 1)
-        transformed_spec = ((spec_np - mu_s_train_pf[:, np.newaxis]) / (sigma_s_train_pf[:, np.newaxis] + adain_config.ADAIN_EPSILON)) * \
-                           sigma_s_train_new_pf[:, np.newaxis] + mu_s_train_new_pf[:, np.newaxis]
-    else: # 'none' or unknown mode
-        return spec_np.astype(np.float32)
-    
-    # Ensure spec remains float32 after transformation
-    return transformed_spec.astype(np.float32)
-
-class BirdCLEFDataset(Dataset):
-    """Dataset class for BirdCLEF.
-    Handles loading pre-computed spectrograms from a pre-loaded dictionary
-    or generating them on-the-fly.
-    """
-    def __init__(self, df, config, mode="train", all_spectrograms=None):
-        self.df = df.copy()
-        self.config = config
-        self.mode = mode
-        self.all_spectrograms = all_spectrograms
-
-        # Load taxonomy data
-        taxonomy_df = pd.read_csv(self.config.taxonomy_path)
-        self.species_ids = taxonomy_df['primary_label'].tolist()
-
-        assert len(self.species_ids) == self.config.num_classes, \
-            f"Number of species in taxonomy ({len(self.species_ids)}) does not match config.num_classes ({self.config.num_classes})."
-
-        self.num_classes = self.config.num_classes
-        self.label_to_idx = {label: idx for idx, label in enumerate(self.species_ids)}
-
-        if self.all_spectrograms is not None:
-            print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
-            print(f"Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
-        elif self.config.LOAD_PREPROCESSED_DATA:
-            print(f"Dataset mode '{self.mode}': ERROR - Configured to load preprocessed data, but none provided. Dataset will be empty.")
-        else:
-            print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files.")
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        samplename = row['samplename']
-        
-        primary_label = row['primary_label']
-        secondary_labels = row.get('secondary_labels', [])
-        filename_for_error = row.get('filename', samplename) # Use filename if available
-        data_source = row['data_source'] 
-        
-        spec = None # This will hold the final (H_5s, W_5s) processed chunk
-
-        if samplename in self.all_spectrograms:
-            spec_data_from_npz = self.all_spectrograms[samplename]
-            raw_selected_chunk_2d = None # This will be the 2D chunk selected, potentially >5s wide
-
-            if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 3:
-                # Assumes data is always (N, H, W) N is number of chunks, H is height, W is width
-                num_available_chunks = spec_data_from_npz.shape[0]
-                
-                if num_available_chunks > 0:
-                    selected_idx = 0
-                    if self.mode == 'train' and num_available_chunks > 1:
-                        selected_idx = random.randint(0, num_available_chunks - 1)
-                    raw_selected_chunk_2d = spec_data_from_npz[selected_idx]
-                else:
-                    print(f"WARNING: Data for '{samplename}' is a 3D array but has 0 chunks. Using zeros.")
-                    
-            else:
-                ndim_info = spec_data_from_npz.ndim if isinstance(spec_data_from_npz, np.ndarray) else "Not an ndarray"
-                print(f"WARNING: Data for '{samplename}' has unexpected ndim {ndim_info} or type. Expected 3D ndarray. Using zeros.")
-
-            # Now, raw_selected_chunk_2d should be a single 2D spectrogram.
-            if raw_selected_chunk_2d is not None:
-                expected_shape = tuple(self.config.PREPROCESS_TARGET_SHAPE)
-                if raw_selected_chunk_2d.shape == expected_shape:
-                    spec = raw_selected_chunk_2d
-                else:
-                    current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
-                    print(f"WARNING: Samplename '{current_samplename}' - "
-                          f"loaded chunk shape {raw_selected_chunk_2d.shape} "
-                          f"does not match PREPROCESS_TARGET_SHAPE {expected_shape}. Attempting resize.")
-                    spec = cv2.resize(raw_selected_chunk_2d,
-                                      (self.config.PREPROCESS_TARGET_SHAPE[1], self.config.PREPROCESS_TARGET_SHAPE[0]),
-                                      interpolation=cv2.INTER_LINEAR)
-            else:
-                # This implies select_version_for_training returned None, or an issue during loading from NPZ for this sample.
-                current_samplename = self.df.iloc[idx]['samplename'] # Use self.df
-                print(f"ERROR: Samplename '{current_samplename}' - "
-                      f"no valid chunk could be selected or loaded from NPZ. Using zeros as fallback.")
-                spec = np.zeros(tuple(self.config.PREPROCESS_TARGET_SHAPE), dtype=np.float32)
-
-            # Fallback if spec is still None or issues occurred during processing
-            if spec is None or spec.shape != self.config.PREPROCESS_TARGET_SHAPE:
-                 original_shape_info = spec_data_from_npz.shape if isinstance(spec_data_from_npz, np.ndarray) else type(spec_data_from_npz)
-                 current_spec_shape_info = spec.shape if spec is not None else "None"
-                 print(f"Fallback: Using zeros for '{samplename}'. Raw NPZ shape: {original_shape_info}, Processed spec shape before fallback: {current_spec_shape_info}.")
-                 spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
-        
-        else:
-            print(f"ERROR: Samplename '{samplename}' not found in pre-loaded dictionary! Using zeros.")
-            spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
-
-        # --- Final Shape Guarantee --- (important for downstream code)
-        if not isinstance(spec, np.ndarray) or spec.shape != tuple(self.config.PREPROCESS_TARGET_SHAPE):
-             print(f"CRITICAL WARNING: Final spec for '{samplename}' has wrong shape/type ({spec.shape if isinstance(spec, np.ndarray) else type(spec)}) before unsqueeze. Forcing zeros.")
-             spec = np.zeros(self.config.PREPROCESS_TARGET_SHAPE, dtype=np.float32)
-
-        # Ensure spec is float32 before AdaIN or other augmentations
-        spec = spec.astype(np.float32)
-
-        # --- AdaIN Transformation (if enabled and in train mode) ---
-        if self.config.ADAIN_MODE != 'none': # Apply if AdaIN is enabled, regardless of mode
-            if self.mode == "train":
-                transform_weight = np.random.uniform(0.0, 0.25)
-                spec = (1-transform_weight)*spec + transform_weight*_apply_adain_transformation(spec, self.config)
-            elif self.mode == "val":
-                spec = 0.875*spec + 0.125*_apply_adain_transformation(spec, self.config)
-        # --- End AdaIN Transformation ---
-
-        # Apply manual SpecAugment (Time/Freq Mask, Contrast) on NumPy array
-        if self.mode == "train":
-            spec = self.apply_spec_augmentations(spec)
-
-        # concatenate the spec with itself to make it 10s long
-        spec = np.concatenate([spec, spec], axis=1)
-
-        # Convert to tensor, add channel dimension
-        spec_tensor = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
-
-        # Encode labels retrieved from the dataframe row
-        target = self.encode_label(primary_label)
-        if secondary_labels and secondary_labels not in [[''], None, np.nan]:
-             # Ensure secondary_labels is a list 
-             if isinstance(secondary_labels, str):
-                 try: 
-                     eval_labels = eval(secondary_labels) 
-                     if isinstance(eval_labels, list): secondary_labels = eval_labels
-                     else: secondary_labels = []
-                 except: secondary_labels = []
-             elif not isinstance(secondary_labels, list): secondary_labels = []
-             
-             # Apply valid secondary labels
-             for label in secondary_labels:
-                  if label in self.label_to_idx:
-                       target[self.label_to_idx[label]] = 1.0 - self.config.label_smoothing_factor
-
-        return {
-            'melspec': spec_tensor,
-            'target': torch.tensor(target, dtype=torch.float32),
-            'filename': filename_for_error,
-            'samplename': samplename,
-            'source': data_source 
-        }
-
-    def apply_spec_augmentations(self, spec_np):
-        """Apply augmentations to a single-channel numpy spectrogram."""
-        # Time masking (horizontal stripes)
-        if random.random() < self.config.time_mask_prob:
-            num_masks = random.randint(1, 3)
-            for _ in range(num_masks):
-                width = random.randint(5, self.config.max_time_mask_width)
-                start = random.randint(0, max(0, spec_np.shape[1] - width))
-                spec_np[:, start:start+width] = 0
-
-        # Frequency masking (vertical stripes)
-        if random.random() < self.config.freq_mask_prob:
-            num_masks = random.randint(1, 3)
-            for _ in range(num_masks):
-                height = random.randint(5, self.config.max_freq_mask_height)
-                start = random.randint(0, max(0, spec_np.shape[0] - height))
-                spec_np[start:start+height, :] = 0
-
-        # Random brightness/contrast
-        if random.random() < self.config.contrast_prob:
-            gain = random.uniform(0.8, 1.2)
-            bias = random.uniform(-0.1, 0.1)
-            spec_np = spec_np * gain + bias
-            spec_np = np.clip(spec_np, 0, 1)
-
-        return spec_np
-
-    def encode_label(self, label):
-        """Encode primary label to one-hot vector."""
-        target = np.zeros(self.num_classes, dtype=np.float32)
-        if label in self.label_to_idx:
-            target[self.label_to_idx[label]] = 1.0 - self.config.label_smoothing_factor
-        return target
-
 def collate_fn(batch):
     """Custom collate function."""
     batch = [item for item in batch if item is not None]
@@ -323,19 +55,39 @@ def collate_fn(batch):
         print("Warning: collate_fn received empty batch, returning None.")
         return None
 
-    expected_keys = {'melspec', 'target', 'filename'}
-    if not all(expected_keys.issubset(item.keys()) for item in batch):
-         print("Warning: Batch items have inconsistent keys. Returning None.")
+    # Check for essential keys first
+    # 'sample_weight' is optional and only present if distance weighting is on and mode is train
+    essential_keys = {'melspec', 'target', 'filename', 'samplename', 'source'}
+    if not all(essential_keys.issubset(item.keys()) for item in batch):
+         print("Warning: Batch items missing one or more essential keys. Returning None.")
+         # Optionally, print which keys are missing from which item for detailed debugging
+         # for i, item in enumerate(batch):
+         #    if not essential_keys.issubset(item.keys()):
+         #        print(f"Item {i} missing keys: {essential_keys - item.keys()}")
          return None
 
-    result = {key: [] for key in batch[0].keys()}
+    result = {key: [] for key in batch[0].keys()} # Initialize with all keys from the first item
+    has_sample_weight = 'sample_weight' in batch[0] # Check if first item has it
+
     for item in batch:
         for key, value in item.items():
             result[key].append(value)
+        # If an item is missing sample_weight (e.g. validation batch), ensure it's handled if key was added from first item
+        if has_sample_weight and 'sample_weight' not in item:
+            # This case should ideally not happen if only train batches have weights and val don't, 
+            # and collate_fn processes batches of same type. 
+            # If it can happen, assign a default weight or handle as error.
+            print("Warning: Inconsistent 'sample_weight' in batch. Appending 1.0.")
+            result['sample_weight'].append(torch.tensor(1.0, dtype=torch.float32)) 
 
     try:
         result['target'] = torch.stack(result['target'])
         result['melspec'] = torch.stack(result['melspec'])
+        if has_sample_weight and result['sample_weight']: # Ensure list is not empty
+            result['sample_weight'] = torch.stack(result['sample_weight'])
+        elif 'sample_weight' in result and not result['sample_weight']: # key exists but list is empty
+            del result['sample_weight'] # remove if it ended up empty
+
     except RuntimeError as e:
         print(f"Error stacking tensors in collate_fn: {e}. Returning None.")
         return None
@@ -343,8 +95,12 @@ def collate_fn(batch):
         print(f"Unexpected error in collate_fn: {e}. Returning None.")
         return None
 
+    # Final check for consistent batch dimensions
     if result['melspec'].shape[0] != len(batch) or result['target'].shape[0] != len(batch):
-        print("Warning: Collated tensors have incorrect batch dimension. Returning None.")
+        print("Warning: Collated melspec/target tensors have incorrect batch dimension. Returning None.")
+        return None
+    if has_sample_weight and 'sample_weight' in result and result['sample_weight'].shape[0] != len(batch):
+        print("Warning: Collated sample_weight tensor has incorrect batch dimension. Returning None.")
         return None
 
     return result
@@ -465,7 +221,7 @@ def get_scheduler(optimizer, config):
     elif config.scheduler == 'ReduceLROnPlateau':
         scheduler = lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
+            mode='min', # Usually val_loss
             factor=0.5,
             patience=2,
             min_lr=config.min_lr,
@@ -485,11 +241,16 @@ def get_scheduler(optimizer, config):
 
 def get_criterion(config):
     """Creates loss criterion based on config settings."""
+    reduction_type = 'mean'
+    if hasattr(config, 'ENABLE_DISTANCE_WEIGHTING') and config.ENABLE_DISTANCE_WEIGHTING:
+        print("INFO: Distance weighting enabled, using reduction='none' for loss criterion.")
+        reduction_type = 'none'
+    
     if config.criterion == 'BCEWithLogitsLoss':
-        criterion = nn.BCEWithLogitsLoss()
+        criterion = nn.BCEWithLogitsLoss(reduction=reduction_type)
     elif config.criterion == 'FocalLossBCE':
-        print("INFO: Using FocalLossBCE with parameters hardcoded in losses.py")
-        criterion = FocalLossBCE(config=config)
+        print(f"INFO: Using FocalLossBCE with reduction='{reduction_type}'.")
+        criterion = FocalLossBCE(config=config, reduction=reduction_type)
     else:
         raise NotImplementedError(f"Criterion '{config.criterion}' not implemented")
     return criterion
@@ -522,6 +283,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
     use_amp = scaler.is_enabled()
     # Check if batch augmentation is globally enabled
     batch_augment_active = config.batch_augment_prob > 0
+    distance_weighting_enabled = hasattr(config, 'ENABLE_DISTANCE_WEIGHTING') and config.ENABLE_DISTANCE_WEIGHTING
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
 
@@ -534,6 +296,15 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
             inputs_orig = batch['melspec'].to(device)
             targets_orig = batch['target'].to(device)
             sources_orig = batch['source'] # List of strings, no .to(device)
+            sample_weights_batch = None
+            if distance_weighting_enabled and 'sample_weight' in batch:
+                sample_weights_batch = batch['sample_weight'].to(device)
+            elif distance_weighting_enabled:
+                # This case should ideally not occur if dataset returns weights for train and collate handles it.
+                # If it does, it means sample_weight was expected but not found in this training batch.
+                print("Warning: Distance weighting enabled, but 'sample_weight' not found in training batch. Using weight 1.0 for all samples in batch.")
+                sample_weights_batch = torch.ones(inputs_orig.size(0), device=device, dtype=torch.float32)
+
         except (AttributeError, TypeError) as e:
             print(f"Error: Skipping batch {step} due to unexpected format: {e}")
             continue
@@ -573,9 +344,24 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
             logits = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
 
             if apply_mixup or apply_cutmix:
-                loss = lam * criterion(logits, targets_a) + (1 - lam) * criterion(logits, targets_b)
+                raw_loss_a = criterion(logits, targets_a) # Per-sample loss
+                raw_loss_b = criterion(logits, targets_b) # Per-sample loss
+                if distance_weighting_enabled and sample_weights_batch is not None:
+                    # Ensure weights are correctly broadcastable: (batch_size, 1) for (batch_size, num_classes) loss
+                    weights_expanded = sample_weights_batch.unsqueeze(1) if raw_loss_a.ndim > sample_weights_batch.ndim else sample_weights_batch
+                    weighted_loss_a = raw_loss_a * weights_expanded
+                    weighted_loss_b = raw_loss_b * weights_expanded 
+                    loss = (lam * weighted_loss_a.mean()) + ((1 - lam) * weighted_loss_b.mean())
+                else:
+                    loss = lam * raw_loss_a.mean() + (1 - lam) * raw_loss_b.mean()
             else:
-                loss = criterion(logits, targets_a) # targets_a is targets_orig here
+                raw_loss = criterion(logits, targets_a) # targets_a is targets_orig here. This is per-sample loss.
+                if distance_weighting_enabled and sample_weights_batch is not None:
+                    weights_expanded = sample_weights_batch.unsqueeze(1) if raw_loss.ndim > sample_weights_batch.ndim else sample_weights_batch
+                    weighted_loss = raw_loss * weights_expanded
+                    loss = weighted_loss.mean()
+                else:
+                    loss = raw_loss.mean() # Default behavior if not weighting or weights missing
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -668,6 +454,10 @@ def validate(model, loader, criterion, device):
     use_amp = config.use_amp
     species_ids = loader.dataset.species_ids 
     num_classes = len(species_ids)
+    # Access the reduction type from the criterion object itself
+    criterion_reduction_type = criterion.reduction if hasattr(criterion, 'reduction') else 'mean'
+    # Determine if distance weighting is active for this validation run
+    distance_weighting_enabled_for_val = hasattr(config, 'ENABLE_DISTANCE_WEIGHTING') and config.ENABLE_DISTANCE_WEIGHTING
 
     with torch.no_grad():
         for step, batch in enumerate(tqdm(loader, desc="Validation")):
@@ -679,6 +469,13 @@ def validate(model, loader, criterion, device):
             try:
                 inputs = batch['melspec'].to(device)
                 targets = batch['target'].to(device)
+                sample_weights_batch_val = None
+                if distance_weighting_enabled_for_val and 'sample_weight' in batch:
+                    sample_weights_batch_val = batch['sample_weight'].to(device)
+                elif distance_weighting_enabled_for_val:
+                    # This might occur if collate_fn or dataset had an issue, or if weighting is on but a specific batch misses weights
+                    print(f"Warning: Distance weighting for validation enabled, but 'sample_weight' not found in batch {step}. Using weight 1.0 for this batch.")
+                    sample_weights_batch_val = torch.ones(inputs.size(0), device=device, dtype=torch.float32)
                 #if 'filename' not in batch or 'samplename' not in batch:
                     #print(f"DEBUG: Validation step {step}, batch loaded. No filename/samplename key in batch.")
 
@@ -690,12 +487,27 @@ def validate(model, loader, criterion, device):
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
                 model_output = model(inputs)
                 outputs = model_output[0] if isinstance(model_output, tuple) else model_output # Get logits
-                #print(f"DEBUG: Validation step {step}, model forward pass complete.") # DEBUG PRINT
-                loss = criterion(outputs, targets)
+                loss_val = criterion(outputs, targets) # This might be a tensor if reduction is 'none'
+
+            # If criterion returned per-element losses (because reduction was 'none'),
+            # take the mean for logging and for scheduler if ReduceLROnPlateau is used with val_loss.
+            batch_mean_loss = 0.0 # Initialize
+            if criterion_reduction_type == 'none' and loss_val.ndim > 0:
+                if distance_weighting_enabled_for_val and sample_weights_batch_val is not None:
+                    # Apply sample weights to per-sample losses
+                    # Ensure weights are correctly broadcastable: (batch_size, 1) for (batch_size, num_classes) loss
+                    weights_expanded_val = sample_weights_batch_val.unsqueeze(1) if loss_val.ndim > sample_weights_batch_val.ndim else sample_weights_batch_val
+                    weighted_loss_val = loss_val * weights_expanded_val
+                    batch_mean_loss = weighted_loss_val.mean()
+                else:
+                    # If not weighting or weights are missing for some reason, take unweighted mean
+                    batch_mean_loss = loss_val.mean()
+            else: # criterion reduction is 'mean' or loss_val is already scalar
+                batch_mean_loss = loss_val # It's already a scalar or reduction was 'mean'
 
             all_outputs_list.append(outputs.float().cpu().numpy())
             all_targets_list.append(torch.ceil(targets).cpu().numpy()) #use ceil to convert to 0/1 targets for label smoothing
-            losses.append(loss.item())
+            losses.append(batch_mean_loss.item())
 
             if config.debug and (step + 1) >= config.debug_limit_batches:
                 print(f"DEBUG: Stopping validation early after {config.debug_limit_batches} batches.")
@@ -760,10 +572,13 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, macro_auc, per_class_metrics_list, all_outputs_cat, all_targets_cat
 
-def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=None):
+def run_training(df, config, trial=None, all_spectrograms=None, 
+                 val_spectrogram_data=None, # New parameter
+                 custom_run_name=None, hpo_step_offset=0):
     """Runs the training loop. 
     
     Accepts pre-loaded spectrograms via the all_spectrograms argument.
+    Accepts dedicated pre-loaded validation spectrograms via val_spectrogram_data.
 
     If trial is provided (from Optuna), runs only the single fold specified 
     in config.selected_folds, enables pruning, and returns the best validation 
@@ -775,26 +590,20 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
     is_hpo_trial = trial is not None
     
     # --- wandb initialization ---
-    # Use custom run name if provided, otherwise generate one
     if custom_run_name:
         run_name = custom_run_name
     else:
         run_name = f"trial_{trial.number}" if is_hpo_trial else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
     
-    group_name = "hpo" if is_hpo_trial else "full_training"
-
-    # Select relevant config parameters for logging
-    relevant_config_params = config.get_wandb_config()
-    
     wandb_run = wandb.init(
-        project="BirdCLEF-2025", # Or your preferred project name
-        config=relevant_config_params, # Use the curated dictionary
+        project="BirdCLEF-2025", 
+        config=config.get_wandb_config(), 
         name=run_name,
-        group=group_name,
+        group="hpo" if is_hpo_trial else "full_training",
         job_type="train",
-        reinit=True # Allows re-initialization if running multiple times in one script (e.g. HPO)
+        reinit=True 
     )
-    # Log specific HPO trial parameters if applicable
+
     if is_hpo_trial:
         wandb.config.update(trial.params, allow_val_change=True)
 
@@ -802,11 +611,7 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
     print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
-
-    if all_spectrograms is not None:
-        print(f"run_training received {len(all_spectrograms)} pre-loaded samples.")
-    else:
-        print("Warning: run_training received no pre-loaded samples")
+    print(f"run_training received {len(all_spectrograms)} pre-loaded samples.")
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
@@ -842,36 +647,23 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
         print("\n--- Loading Rare Species Data (USE_RARE_DATA=True) ---")
         try:
             rare_train_df_full = pd.read_csv(config.train_rare_csv_path)
-            if not rare_train_df_full.empty:
-                # Ensure 'filename' and 'primary_label' exist, which they should from the generator script
-                if 'filename' not in rare_train_df_full.columns or 'primary_label' not in rare_train_df_full.columns:
-                    print("ERROR: train_rare.csv is missing 'filename' or 'primary_label' column. Skipping rare data.")
-                else:
-                    rare_train_df_full['filepath'] = rare_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_rare_dir, f))
-                    # Consistent samplename generation for rare data
-                    rare_train_df_full['samplename'] = rare_train_df_full.filename.map(
-                        lambda x: str(x.split('/')[0]) + '-' + str(x.split('/')[-1].split('.')[0])
-                    )
-                    rare_train_df_full['data_source'] = 'rare' # Add data source identifier
-                    # Ensure secondary_labels exists, even if empty, for consistent concatenation
-                    if 'secondary_labels' not in rare_train_df_full.columns:
-                         rare_train_df_full['secondary_labels'] = [[] for _ in range(len(rare_train_df_full))]
+            rare_train_df_full['filepath'] = rare_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_rare_dir, f))
+            rare_train_df_full['samplename'] = rare_train_df_full.filename.map(
+                lambda x: str(x.split('/')[0]) + '-' + str(x.split('/')[-1].split('.')[0])
+            )
+            rare_train_df_full['data_source'] = 'rare' # Add data source identifier
+            # Ensure secondary_labels exists, even if empty, for consistent concatenation
+            if 'secondary_labels' not in rare_train_df_full.columns:
+                    rare_train_df_full['secondary_labels'] = [[] for _ in range(len(rare_train_df_full))]
 
-                    required_cols_rare = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source']
-                    # Select only necessary columns, ensuring all exist
-                    missing_cols_rare = [col for col in required_cols_rare if col not in rare_train_df_full.columns]
-                    if missing_cols_rare:
-                        print(f"ERROR: Rare DataFrame is missing required columns after processing: {missing_cols_rare}. Skipping rare data.")
-                    else:
-                        rare_train_df = rare_train_df_full[required_cols_rare].copy()
-                        print(f"Loaded and selected columns for {len(rare_train_df)} rare training samples.")
-                        del rare_train_df_full; gc.collect()
-                        
-                        # Concatenate with main training data
-                        working_df = pd.concat([working_df, rare_train_df], ignore_index=True)
-                        print(f"Combined DataFrame size (main + rare): {len(working_df)} samples.")
-            else:
-                print("train_rare.csv found but is empty. No rare data added.")
+            required_cols_rare = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source']
+            rare_train_df = rare_train_df_full[required_cols_rare].copy()
+            print(f"Loaded and selected columns for {len(rare_train_df)} rare training samples.")
+            del rare_train_df_full; gc.collect()
+            
+            # Concatenate with main training data
+            working_df = pd.concat([working_df, rare_train_df], ignore_index=True)
+            print(f"Combined DataFrame size (main + rare): {len(working_df)} samples.")
 
         except Exception as e:
             print(f"CRITICAL ERROR loading or processing rare labels CSV {config.train_rare_csv_path}: {e}")
@@ -901,8 +693,110 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
     else:
         print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
 
-    skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
-   
+    # --- BEGIN: Global Oversampling of Rare Classes (Before K-Fold Split) ---
+    if config.USE_GLOBAL_OVERSAMPLING:
+        min_samples_per_class_global = config.GLOBAL_OVERSAMPLING_MIN_SAMPLES
+        print(f"\nApplying global oversampling for classes with < {min_samples_per_class_global} samples...")
+        
+        class_counts_before_oversampling = working_df['primary_label'].value_counts()
+        labels_to_oversample = class_counts_before_oversampling[class_counts_before_oversampling < min_samples_per_class_global].index
+        
+        oversampled_dfs = [working_df] # Start with the original df
+        
+        if not labels_to_oversample.empty:
+            print(f"  Found {len(labels_to_oversample)} classes to oversample: {list(labels_to_oversample)}")
+            for label in tqdm(labels_to_oversample, desc="Global Oversampling"):
+                class_df = working_df[working_df['primary_label'] == label]
+                current_class_count = len(class_df) # This should be from original df, not accumulating
+                
+                # Re-fetch class_df from the original (non-concatenated) working_df to get correct current_class_count
+                # This is important if a class is oversampled in multiple iterations (though less likely with simple threshold)
+                original_class_df = oversampled_dfs[0][oversampled_dfs[0]['primary_label'] == label] # oversampled_dfs[0] is the original working_df
+                current_class_count = len(original_class_df)
+
+                num_to_add = min_samples_per_class_global - current_class_count
+                
+                if num_to_add > 0 and not original_class_df.empty:
+                    # Simple replication: sample with replacement from the existing samples of this class
+                    replicated_samples = original_class_df.sample(n=num_to_add, replace=True, random_state=config.seed)
+                    oversampled_dfs.append(replicated_samples)
+            
+            if len(oversampled_dfs) > 1: # Only concat if new samples were actually added
+                working_df = pd.concat(oversampled_dfs, ignore_index=True)
+                print(f"  Finished global oversampling. New working_df size: {len(working_df)}")
+            
+        else:
+            print("  No classes found below the global oversampling threshold.")
+    else:
+        print("\nGlobal oversampling disabled or not configured (USE_GLOBAL_OVERSAMPLING).")
+    # --- END: Global Oversampling of Rare Classes ---
+
+    # --- Create groups for StratifiedGroupKFold with conditional ungrouping --- 
+    GROUP_DIVERSITY_THRESHOLD = 30 # Classes with < this many unique groups will be ungrouped
+
+    print("\nCreating groups for StratifiedGroupKFold with conditional ungrouping...")
+    
+    # 1. Create initial group_id based on lat/lon/author
+    working_df['initial_group_id'] = None
+    mask_complete_info = working_df['latitude'].notna() & \
+                            working_df['longitude'].notna() & \
+                            working_df['author'].notna()
+
+    working_df.loc[mask_complete_info, 'initial_group_id'] = (
+        working_df.loc[mask_complete_info, 'latitude'].astype(str) + '_' + 
+        working_df.loc[mask_complete_info, 'longitude'].astype(str) + '_' + 
+        working_df.loc[mask_complete_info, 'author'].astype(str)
+    )
+    # Assign unique group ID for rows with missing lat/lon/author initially
+    # These will also be treated as distinct groups unless their class is common enough
+    # to be subject to potential ungrouping (which is unlikely for these unique IDs).
+    working_df.loc[~mask_complete_info, 'initial_group_id'] = "MISSINGKEY_" + working_df.loc[~mask_complete_info, 'samplename'].astype(str)
+
+    # 2. Calculate per-class group counts using 'initial_group_id'
+    print(f"  Calculating group diversity per class (using threshold: < {GROUP_DIVERSITY_THRESHOLD} unique groups for ungrouping)...")
+    class_group_counts = working_df.groupby('primary_label')['initial_group_id'].nunique()
+    
+    classes_to_ungroup = class_group_counts[class_group_counts < GROUP_DIVERSITY_THRESHOLD].index.tolist()
+    print(f"  Found {len(classes_to_ungroup)} classes to be ungrouped (samples will get unique group IDs). Classes: {classes_to_ungroup if classes_to_ungroup else 'None'}")
+
+    # 3. Create final 'group_id' column for splitting
+    # Initialize final_group_id with initial_group_id
+    working_df['final_group_id'] = working_df['initial_group_id']
+
+    # For classes identified for ungrouping, assign a TRULY unique group ID to each sample row
+    # This ensures StratifiedGroupKFold can split them to maintain stratification for these rare-group classes.
+    ungroup_mask = working_df['primary_label'].isin(classes_to_ungroup)
+    if ungroup_mask.any(): # Check if there are any samples to ungroup
+        # Create a Series of unique IDs for the rows that need ungrouping
+        # Using a combination of a prefix and the DataFrame index ensures uniqueness for these rows.
+        unique_row_ids = working_df.index[ungroup_mask].astype(str)
+        working_df.loc[ungroup_mask, 'final_group_id'] = "UNGROUPED_ROWID_" + unique_row_ids
+    
+    num_actually_ungrouped_samples = ungroup_mask.sum()
+    if num_actually_ungrouped_samples > 0:
+        print(f"  Assigned unique group IDs to {num_actually_ungrouped_samples} samples belonging to these {len(classes_to_ungroup)} classes.")
+
+    groups = working_df['final_group_id']
+    num_unique_final_groups = groups.nunique()
+    print(f"  Total number of unique groups for StratifiedGroupKFold (after conditional ungrouping): {num_unique_final_groups}")
+
+    if num_unique_final_groups < config.n_fold:
+        print(f"  WARNING: Total unique final groups ({num_unique_final_groups}) is less than n_fold ({config.n_fold}). StratifiedGroupKFold might error or behave unexpectedly.")
+
+    print(f"  Attempting to use StratifiedGroupKFold with {config.n_fold} splits using these final groups.")
+    try:
+        sgkf = StratifiedGroupKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
+        fold_iterator = sgkf.split(X=working_df, y=working_df['primary_label'], groups=groups)
+        print(f"  Successfully using StratifiedGroupKFold with conditional ungrouping.")
+    except ValueError as e_sgkf:
+        print(f"  WARNING: StratifiedGroupKFold with conditional ungrouping failed: {e_sgkf}")
+        print(f"  This can happen if a group is too small or if a class is present in too few groups even after ungrouping strategy.")
+        print(f"  Falling back to simple StratifiedKFold as a last resort for this run.")
+        # Fallback to StratifiedKFold if StratifiedGroupKFold still fails with modified groups
+        skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
+        fold_iterator = skf.split(X=working_df, y=working_df['primary_label'])
+        print(f"  Using StratifiedKFold instead.")
+
     all_folds_history = []
     best_epoch_details_all_folds = [] 
     single_fold_best_auc = 0.0 
@@ -912,7 +806,7 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
     logged_original_samplenames_for_spectrograms = [] # Using a list to preserve order of first N logged
     
     try: # Wrap the main training loop in try/finally for wandb.finish()
-        for fold, (train_idx, val_idx) in enumerate(skf.split(working_df, working_df['primary_label'])):
+        for fold, (train_idx, val_idx) in enumerate(fold_iterator):
             if fold not in config.selected_folds:
                 continue
 
@@ -932,24 +826,75 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
             train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
             val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
 
-            # --- Filter Validation Set: Allow 'main' or 'rare' data sources --- 
-            original_val_count = len(val_df_fold)
+            # --- Filter Validation Set: Allow 'main' or 'rare' data sources (existing filter, keep if needed) ---
+            original_val_count_before_source_filter = len(val_df_fold)
             if 'data_source' in val_df_fold.columns:
-                allowed_sources = ['main', 'rare']
+                allowed_sources = ['main', 'rare'] 
                 val_df_fold = val_df_fold[val_df_fold['data_source'].isin(allowed_sources)].reset_index(drop=True)
-                print(f"Filtered validation set to include 'main' or 'rare' data sources.")
-                print(f"  Original val count: {original_val_count}, Filtered val count: {len(val_df_fold)}")
-            else:
-                print("Warning: 'data_source' column not found in validation fold. Cannot filter; proceeding with all samples in val_df_fold.")
-            # --- End Validation Set Filtering ---
+                print(f"Fold {fold}: Filtered validation set by data_source ('main', 'rare'). Count: {original_val_count_before_source_filter} -> {len(val_df_fold)}")
+            # --- End Validation Set Filtering by source ---
             
-            print(f'Training set: {len(train_df_fold)} samples (includes main, rare, and potentially pseudo)')
-            print(f'Validation set: {len(val_df_fold)} samples (main or rare data only)')
+            print(f'Training set size: {len(train_df_fold)} samples')
+            print(f'Initial validation set size (after source filter, before NPZ filter): {len(val_df_fold)} samples')
+
+            # Determine which spectrogram dictionary to use for validation and filter val_df_fold
+            current_val_spectrogram_source_for_dataset = all_spectrograms # Default to main spectrograms for dataset instantiation
+
+            if val_spectrogram_data is not None and len(val_spectrogram_data) > 0:
+                print(f"Fold {fold}: Using dedicated validation spectrograms from PREPROCESSED_NPZ_PATH_VAL.")
+                original_val_fold_count_before_npz_filter = len(val_df_fold)
+                
+                # Filter val_df_fold to include only samplenames present in val_spectrogram_data
+                val_df_fold = val_df_fold[val_df_fold['samplename'].isin(val_spectrogram_data.keys())].reset_index(drop=True)
+                
+                filtered_val_fold_count_after_npz_filter = len(val_df_fold)
+                print(f"  Filtered val_df_fold to {filtered_val_fold_count_after_npz_filter} samples (from {original_val_fold_count_before_npz_filter}) based on keys in dedicated validation NPZ.")
+                
+                if filtered_val_fold_count_after_npz_filter == 0 and original_val_fold_count_before_npz_filter > 0:
+                    print(f"  WARNING: Fold {fold} validation set became empty after filtering against dedicated validation NPZ keys. Check samplenames and VAL NPZ content.")
+                
+                current_val_spectrogram_source_for_dataset = val_spectrogram_data # Use these for val_dataset
+
+            elif val_spectrogram_data is not None and len(val_spectrogram_data) == 0:
+                print(f"Fold {fold}: Dedicated validation spectrograms NPZ was loaded but is empty. Using training set spectrograms for validation if samplenames match.")
+            else: # val_spectrogram_data is None
+                print(f"Fold {fold}: No dedicated validation spectrograms provided or loaded. Using training set spectrograms for validation if samplenames match.")
+
+            # --- DIAGNOSTIC PRINTS FOR CLASS DISTRIBUTION (on the now potentially filtered val_df_fold) ---
+            print(f"\n--- Fold {fold} Class Distribution Diagnostics ---")
+            # Training set distribution
+            train_label_counts = train_df_fold['primary_label'].value_counts().sort_index()
+            print(f"Fold {fold} - Training set primary_label distribution ({len(train_label_counts)} classes):")
+
+            # Validation set distribution
+            val_label_counts = val_df_fold['primary_label'].value_counts().sort_index()
+            print(f"Fold {fold} - Validation set primary_label distribution ({len(val_label_counts)} classes):")
+
+            if not train_label_counts.empty and not val_label_counts.empty:
+                train_classes = set(train_label_counts.index)
+                val_classes = set(val_label_counts.index)
+
+                classes_in_train_only = train_classes - val_classes
+                classes_in_val_only = val_classes - train_classes # Should be rare
+
+                if classes_in_train_only:
+                    print(f"WARNING: Fold {fold} - Classes in TRAIN but NOT in VALIDATION ({len(classes_in_train_only)} classes)")
+                if classes_in_val_only:
+                    print(f"WARNING: Fold {fold} - Classes in VALIDATION but NOT in TRAIN ({len(classes_in_val_only)} classes)")
+
+                # Check for classes with very few validation samples (e.g., < 5, or configurable)
+                low_sample_threshold = 5 # Can be adjusted
+                low_sample_val_classes = val_label_counts[val_label_counts < low_sample_threshold]
+                if not low_sample_val_classes.empty:
+                    print(f"WARNING: Fold {fold} - Classes in VALIDATION with < {low_sample_threshold} samples ({len(low_sample_val_classes)} classes):")
+            print(f"--- End Fold {fold} Class Distribution Diagnostics ---\n")
+            # --- END DIAGNOSTIC PRINTS ---
 
             # Pass the pre-loaded dictionary (or None) to the Dataset
             # NOW, pass both the hardcoded targets AND the shared tracking set (REMOVED THESE)
-            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms) 
-            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=all_spectrograms) 
+            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
+            # Use the potentially filtered val_df_fold and the correct spectrogram source for val_dataset
+            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=current_val_spectrogram_source_for_dataset)
 
             # Get species_ids from the first validation dataset instance created
             if overall_species_ids_for_run is None and hasattr(val_dataset, 'species_ids'):
@@ -962,28 +907,25 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
                 print("Using WeightedRandomSampler for training data based on 'samplename'.")
                 # Extract species identifiers from the 'samplename' column of the current fold's training data
                 # Assumes train_df_fold['samplename'] exists and is in format 'species_id-other_info'
-                if 'samplename' not in train_df_fold.columns:
-                    print("ERROR: 'samplename' column not found in train_df_fold. Cannot apply weighted sampling. Defaulting to shuffle=True")
+                try:
+                    all_species_ids_for_fold_samples = [sn.split('-')[0] for sn in train_df_fold['samplename']]
+                    species_id_counts_in_fold = Counter(all_species_ids_for_fold_samples)
+                    
+                    # Calculate log-based weights: 1 / log(count + 1)
+                    log_weights_raw = []
+                    for sid in all_species_ids_for_fold_samples:
+                        count = species_id_counts_in_fold[sid] 
+                        weight = 1.0 / math.log(count + 1) 
+                        log_weights_raw.append(weight)
+
+                    weights_tensor = torch.tensor(log_weights_raw, dtype=torch.float)
+                    train_sampler = WeightedRandomSampler(weights_tensor, num_samples=len(weights_tensor), replacement=True)
+                    shuffle_train_loader = False # Sampler handles shuffling
+                    print(f"  WeightedRandomSampler created for fold {fold} with {len(weights_tensor)} log-based weights.")
+                except Exception as e_sampler:
+                    print(f"ERROR creating WeightedRandomSampler for fold {fold}: {e_sampler}. Defaulting to shuffle=True")
                     train_sampler = None
                     shuffle_train_loader = True
-                else:
-                    try:
-                        all_species_ids_for_fold_samples = [sn.split('-')[0] for sn in train_df_fold['samplename']]
-                        
-                        # Calculate frequency of each species_id in this fold
-                        species_id_counts_in_fold = Counter(all_species_ids_for_fold_samples)
-                        
-                        # Calculate weight for each sample in this fold: 1 / sqrt(count of its species_id)
-                        sample_weights_for_fold = [1.0 / math.sqrt(max(1, species_id_counts_in_fold[sid])) for sid in all_species_ids_for_fold_samples]
-                        
-                        weights_tensor = torch.tensor(sample_weights_for_fold, dtype=torch.float)
-                        train_sampler = WeightedRandomSampler(weights_tensor, num_samples=len(weights_tensor), replacement=True)
-                        shuffle_train_loader = False # Sampler handles shuffling
-                        print(f"  WeightedRandomSampler created for fold {fold} with {len(weights_tensor)} weights.")
-                    except Exception as e_sampler:
-                        print(f"ERROR creating WeightedRandomSampler for fold {fold}: {e_sampler}. Defaulting to shuffle=True")
-                        train_sampler = None
-                        shuffle_train_loader = True
             else:
                 print("Not using WeightedRandomSampler for training data. Standard shuffling will be used.")
 
@@ -1019,7 +961,8 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
                     width_mult=config.width_mult,                         
                     head_type="mlp",                         
                     input_dim_f=config.TARGET_SHAPE[0],     
-                    input_dim_t=config.TARGET_SHAPE[1]      
+                    input_dim_t=config.TARGET_SHAPE[1],
+                    dropout=config.dropout
                 ).to(config.device)
             
             optimizer = get_optimizer(model, config)
@@ -1092,9 +1035,16 @@ def run_training(df, config, trial=None, all_spectrograms=None, custom_run_name=
 
                 # --- HPO Pruning --- #
                 if is_hpo_trial:
-                    trial.report(val_auc, epoch) # Report intermediate val_auc
+                    current_global_step = hpo_step_offset + epoch # Use offset here
+                    trial.report(val_auc, current_global_step) # Report intermediate val_auc with global step
                     if trial.should_prune():
-                        print(f"  Pruning trial based on intermediate value at epoch {epoch+1}.")
+                        print(f"  Pruning trial based on intermediate value at epoch {epoch+1} (global step {current_global_step}).")
+                        # Clean up before pruning to release GPU memory if possible for next trial
+                        del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
+                        if 'train_df_fold' in locals(): del train_df_fold
+                        if 'val_df_fold' in locals(): del val_df_fold
+                        torch.cuda.empty_cache()
+                        gc.collect()
                         raise optuna.TrialPruned() # Raise exception to stop training
 
                 # --- Model Checkpointing --- #
@@ -1416,7 +1366,7 @@ if __name__ == "__main__":
         main_train_df_full['data_source'] = 'main'
         
         # Select only necessary columns for training
-        required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source']
+        required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source', 'latitude', 'longitude', 'author'] # Added author
         main_train_df = main_train_df_full[required_cols_main].copy()
         print(f"Loaded and selected columns for {len(main_train_df)} main training samples.")
         del main_train_df_full; gc.collect()
@@ -1515,6 +1465,32 @@ if __name__ == "__main__":
     else:
         print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
 
-    run_training(training_df, config, all_spectrograms=all_spectrograms, custom_run_name=cmd_args.run_name)
+    # --- Load Preprocessed Validation Spectrograms (if available) ---
+    loaded_val_spectrograms = None # Initialize
+    if hasattr(config, 'PREPROCESSED_NPZ_PATH_VAL') and config.PREPROCESSED_NPZ_PATH_VAL:
+        val_npz_path = config.PREPROCESSED_NPZ_PATH_VAL
+        print(f"\nAttempting to load DEDICATED VALIDATION spectrograms from: {val_npz_path}")
+        if os.path.exists(val_npz_path):
+            try:
+                start_load_time_val = time.time()
+                with np.load(val_npz_path) as data_archive_val:
+                    # Ensure tqdm is available if you use it here, or remove for simplicity if not essential for this loading step
+                    loaded_val_spectrograms = {key: data_archive_val[key] for key in tqdm(data_archive_val.keys(), desc="Loading DEDICATED VAL Specs")}
+                end_load_time_val = time.time()
+                print(f"Successfully loaded {len(loaded_val_spectrograms) if loaded_val_spectrograms is not None else 0} DEDICATED VALIDATION sample entries in {end_load_time_val - start_load_time_val:.2f} seconds.")
+                if loaded_val_spectrograms is not None and not loaded_val_spectrograms: # Check if loaded but empty
+                    print("Warning: DEDICATED VALIDATION NPZ file was loaded but contained no spectrograms.")
+            except Exception as e_val_load:
+                print(f"ERROR loading DEDICATED VALIDATION NPZ file {val_npz_path}: {e_val_load}. Proceeding without dedicated validation specs.")
+                loaded_val_spectrograms = None # Ensure it's None on error
+        else:
+            print(f"Info: DEDICATED VALIDATION NPZ file not found at {val_npz_path}. Validation may use training spectrogram processing rules or be empty if filtered by missing keys.")
+    else:
+        print("\nInfo: config.PREPROCESSED_NPZ_PATH_VAL not defined. Validation may use training spectrogram processing rules.")
+
+    # Pass the loaded_val_spectrograms to run_training
+    run_training(training_df, config, all_spectrograms=all_spectrograms, 
+                 val_spectrogram_data=loaded_val_spectrograms, # Pass the loaded validation specs
+                 custom_run_name=cmd_args.run_name)
 
     print("\nTraining script finished!")
