@@ -106,9 +106,9 @@ def _process_pseudo_label_row(args):
 def generate_pseudo_spectrograms(config):
     """Loads pseudo labels, processes segments in parallel, and saves spectrograms to NPZ."""
     print("--- Loading Pseudo Labels --- ")
-    pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
+    pseudo_df = pd.read_csv(config.soundscape_pseudo_csv_path)
     pseudo_df = pseudo_df[pseudo_df['confidence'] >= 0.90]
-    print(f"Loaded {len(pseudo_df)} pseudo labels from {config.train_pseudo_csv_path}")
+    print(f"Loaded {len(pseudo_df)} pseudo labels from {config.soundscape_pseudo_csv_path}")
 
     if pseudo_df.empty:
         print("Pseudo labels dataframe is empty. No spectrograms to generate.")
@@ -199,7 +199,7 @@ def main(config):
     """Main function to run the pseudo-label preprocessing steps."""
     overall_start = time.time()
     print("Starting BirdCLEF Pseudo-Label Preprocessing Pipeline...")
-    print(f"Input CSV: {config.train_pseudo_csv_path}")
+    print(f"Input CSV: {config.soundscape_pseudo_csv_path}")
     print(f"Input Audio Dir: {config.unlabeled_audio_dir}")
     print(f"Output NPZ Dir: {config._PREPROCESSED_OUTPUT_DIR}")
 

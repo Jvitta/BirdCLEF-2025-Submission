@@ -1,11 +1,24 @@
+import sys
+import os
+
+models_package_parent_dir = '/kaggle/input'
+if models_package_parent_dir not in sys.path:
+    sys.path.insert(0, models_package_parent_dir)
+    print(f"Added {models_package_parent_dir} to sys.path to locate the 'models' package in /kaggle/input/models/")
+
 import os
 import gc
 import warnings
 import logging
 import time
 import math
-import cv2
+import random
+import cv2 
 from pathlib import Path
+import multiprocessing
+from functools import partial
+import traceback
+import matplotlib.pyplot as plt # Added for visualization
 
 import numpy as np
 import pandas as pd
@@ -13,64 +26,72 @@ import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 from tqdm.auto import tqdm
-import torchvision.transforms as transforms
 
-# Assuming 'config.py' is in the same directory or accessible via PYTHONPATH
-from config import config # Import central config
-# Optionally import utils if audio processing functions are moved there
-# import utils
+from config_en import config # Import central config
+import birdclef_utils as utils # Import utils
+from birdclef_utils import _preprocess_audio_file_worker # Import the worker
 
-# Suppress warnings and limit logging output
+# EfficientAT model and preprocessing
+from models.efficient_at.mn.model import get_model as get_efficient_at_model
+
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
+# --- New Post-Processing Function ---
+def apply_power_to_low_ranked_cols(
+    p: np.ndarray,
+    top_k: int = 30, # Default from the provided code
+    exponent: Union[int, float] = 2, # Default from the provided code
+    inplace: bool = True
+) -> np.ndarray:
+    """
+    Rank columns by their column-wise maximum and raise every column whose
+    rank falls below `top_k` to a given power.
+
+    Parameters
+    ----------
+    p : np.ndarray
+        A 2-D array of shape **(n_chunks, n_classes)**.
+    top_k : int, default=30
+        The highest-ranked columns (by their maximum value) that remain
+        unchanged.
+    exponent : int or float, default=2
+        The power applied to the selected low-ranked columns.
+    inplace : bool, default=True
+        If `True`, modify `p` in place.  
+        If `False`, operate on a copy and leave the original array intact.
+
+    Returns
+    -------
+    np.ndarray
+        The transformed array.
+    """
+    if not inplace:
+        p = p.copy()
+
+    if p.ndim != 2:
+        print(f"Warning: apply_power_to_low_ranked_cols expects a 2D array, got {p.ndim}D. Skipping.")
+        return p
+    if p.shape[0] == 0: # Empty batch
+        return p
+
+    # Identify columns whose max value ranks below `top_k`
+    # Ensure p.max(axis=0) is used on a non-empty first dimension
+    col_maxes = p.max(axis=0)
+    tail_cols = np.argsort(-col_maxes)[top_k:]
+
+    # Apply the power transformation to those columns
+    if tail_cols.size > 0: # Check if there are any tail columns to modify
+        p[:, tail_cols] = p[:, tail_cols] ** exponent
+    return p
+# --- End New Post-Processing Function ---
 
 class BirdCLEF2025Pipeline:
     """
     Pipeline for the BirdCLEF-2025 inference task.
     Organizes model loading, audio processing, prediction, and submission generation.
     """
-
-    # Nested Model Class (uses config passed to pipeline)
-    class BirdCLEFModel(nn.Module):
-        """Internal model definition, mirrors training structure."""
-        def __init__(self, config, num_classes):
-            super().__init__()
-            self.config = config # Store config if needed internally
-
-            self.backbone = timm.create_model(
-                config.model_name,
-                pretrained=False, # Inference should load trained weights, not pretrained imagenet
-                in_chans=config.in_channels,
-                drop_rate=0.0, # Usually set drop rates to 0 for inference
-                drop_path_rate=0.0
-            )
-            # Adjust final layers based on model type
-            if 'efficientnet' in self.config.model_name:
-                backbone_out = self.backbone.classifier.in_features
-                self.backbone.classifier = nn.Identity()
-            elif 'resnet' in self.config.model_name:
-                backbone_out = self.backbone.fc.in_features
-                self.backbone.fc = nn.Identity()
-            else:
-                backbone_out = self.backbone.get_classifier().in_features
-                self.backbone.reset_classifier(0, '')
-            
-            self.pooling = nn.AdaptiveAvgPool2d(1)
-            self.feat_dim = backbone_out
-            self.classifier = nn.Linear(backbone_out, num_classes)
-
-        def forward(self, x):
-            features = self.backbone(x)
-            if isinstance(features, dict):
-                features = features['features']
-            # If features are 4D, apply global average pooling.
-            if len(features.shape) == 4:
-                features = self.pooling(features)
-                features = features.view(features.size(0), -1)
-            logits = self.classifier(features)
-            return logits
 
     def __init__(self, config): # Accept central config
         """Initialize the inference pipeline with the central configuration."""
@@ -98,51 +119,6 @@ class BirdCLEF2025Pipeline:
             print(f"Error loading taxonomy: {e}")
             raise
 
-    # --- Audio Processing Methods (Kept within Pipeline, using config) --- #
-    # Note: Consider moving these to utils.py if used elsewhere
-
-    def audio_to_melspec(self, audio_data):
-        """Convert audio segment to mel spectrogram using config parameters."""
-        if np.isnan(audio_data).any():
-            mean_signal = np.nanmean(audio_data)
-            audio_data = np.nan_to_num(audio_data, nan=mean_signal)
-
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio_data,
-            sr=self.config.FS,
-            n_fft=self.config.N_FFT,
-            hop_length=self.config.HOP_LENGTH,
-            n_mels=self.config.N_MELS,
-            fmin=self.config.FMIN,
-            fmax=self.config.FMAX,
-            power=2.0
-        )
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-        # Normalize
-        min_val = mel_spec_db.min()
-        max_val = mel_spec_db.max()
-        if max_val > min_val:
-            mel_spec_norm = (mel_spec_db - min_val) / (max_val - min_val)
-        else:
-            mel_spec_norm = np.zeros_like(mel_spec_db)
-        return mel_spec_norm
-
-    def process_audio_segment(self, audio_data):
-        """Process a 5-second audio segment for model input."""
-        target_len = int(self.config.TARGET_DURATION * self.config.FS)
-        if len(audio_data) < target_len:
-            audio_data = np.pad(audio_data, (0, target_len - len(audio_data)), mode='constant')
-        elif len(audio_data) > target_len:
-            audio_data = audio_data[:target_len] # Ensure exact length
-
-        mel_spec = self.audio_to_melspec(audio_data)
-
-        # Resize if necessary to match TARGET_SHAPE
-        if mel_spec.shape != self.config.PREPROCESS_TARGET_SHAPE:
-            mel_spec = cv2.resize(mel_spec, self.config.PREPROCESS_TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
-
-        return mel_spec.astype(np.float32)
-
     def find_model_files(self):
         """
         Find all .pth model files in the specified model directory.
@@ -150,6 +126,7 @@ class BirdCLEF2025Pipeline:
         :return: List of model file paths.
         """
         model_files = []
+        print(f"Looking for Model files in {self.config.MODEL_INPUT_DIR}")
         model_dir = Path(self.config.MODEL_INPUT_DIR)
         for path in model_dir.glob('**/*.pth'):
             model_files.append(str(path))
@@ -184,7 +161,16 @@ class BirdCLEF2025Pipeline:
             try:
                 print(f"Loading model: {model_path}")
                 checkpoint = torch.load(model_path, map_location=torch.device(self.config.device))
-                model = self.BirdCLEFModel(self.config, self.num_classes)
+                
+                model = get_efficient_at_model(
+                    num_classes=self.config.num_classes, # Use self.config
+                    pretrained_name=None,               # Pass None to prevent loading base weights from URL
+                    width_mult=2.0,                     # Explicitly set for mn20_as like architecture
+                    head_type="mlp",                    # Explicitly set for mn20_as like architecture
+                    input_dim_f=self.config.TARGET_SHAPE[0],  # Use self.config
+                    input_dim_t=self.config.TARGET_SHAPE[1]   # Use self.config
+                )
+                
                 model.load_state_dict(checkpoint['model_state_dict'])
                 model = model.to(self.config.device)
                 model.eval()
@@ -196,136 +182,178 @@ class BirdCLEF2025Pipeline:
         return self.models
 
     def apply_tta(self, spec, tta_idx):
-        """Apply basic Test-Time Augmentation (flip)."""
+        """Apply Test-Time Augmentation.
+        tta_idx=0: Original
+        tta_idx > 0: Random time shift within +/- max_shift_ratio.
+        """
         if tta_idx == 0:
-            return spec
-        elif tta_idx == 1:
-            return np.flip(spec, axis=1).copy() # Horizontal flip
-        elif tta_idx == 2:
-            return np.flip(spec, axis=0).copy() # Vertical flip
-        # Add more TTA types here if needed
+            return spec # Return original for index 0
         else:
-            return spec
-
-    def predict_on_audio_file(self, audio_path):
-        """Predict on all 5-second segments of a single audio file."""
-        all_predictions = []
-        row_ids = []
-        soundscape_id = Path(audio_path).stem
-
-        try:
-            print(f"Processing {soundscape_id}...")
-            # Load the entire audio file
-            audio_data, _ = librosa.load(audio_path, sr=self.config.FS, mono=True)
-
-            segment_length_samples = int(self.config.TARGET_DURATION * self.config.FS)
-            total_duration_samples = len(audio_data)
-            num_segments = total_duration_samples // segment_length_samples # Integer division for full segments
-
-            if num_segments == 0:
-                print(f"Warning: Audio file {audio_path} is shorter than target duration ({self.config.TARGET_DURATION}s). Skipping.")
-                return [], []
-
-            print(f"  Found {num_segments} segments.")
-            segments_processed = 0
+            # Apply random time shift for other indices
+            height, width = spec.shape
+            max_shift_ratio = 0.15 # Max shift percentage (e.g., 15%)
             
-            # Process segments in batches for efficiency
-            for i in range(0, num_segments, self.config.inference_batch_size):
-                batch_segments = []
-                batch_row_ids = []
-                actual_batch_size = 0
-                
-                for segment_idx in range(i, min(i + self.config.inference_batch_size, num_segments)):
-                    start_sample = segment_idx * segment_length_samples
-                    end_sample = start_sample + segment_length_samples
-                    segment_audio = audio_data[start_sample:end_sample]
+            # Generate random shift amount (-max_shift to +max_shift)
+            shift_ratio = random.uniform(-max_shift_ratio, max_shift_ratio)
+            shift_pixels = int(width * shift_ratio)
 
-                    end_time_sec = (segment_idx + 1) * self.config.TARGET_DURATION
-                    row_id = f"{soundscape_id}_{int(end_time_sec)}" # Ensure integer end time
-                    batch_row_ids.append(row_id)
-
-                    # Process segment (convert to spectrogram)
-                    mel_spec = self.process_audio_segment(segment_audio)
-                    batch_segments.append(mel_spec)
-                    actual_batch_size += 1
-
-                if actual_batch_size == 0:
-                    continue
-                
-                # Convert the list of numpy arrays to a single numpy array
-                batch_specs_np = np.array(batch_segments) # Shape (B, H, W)
-
-                batch_final_preds = [] # Store predictions for this batch
-
-                # --- TTA Loop (if enabled) --- #
-                tta_iterations = self.config.tta_count if self.config.use_tta else 1
-                all_tta_preds = [] # Store predictions across TTA iterations for this batch
-
-                # Define normalization transform once
-                normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                
-                for tta_idx in range(tta_iterations):
-                    # Apply TTA to the numpy batch
-                    tta_specs_np = np.array([self.apply_tta(spec, tta_idx) for spec in batch_specs_np])
-
-                    # Convert augmented numpy batch to 3-channel, normalized tensor
-                    batch_specs_tta = torch.tensor(tta_specs_np, dtype=torch.float32) # Shape (B, H, W)
-                    # Add channel dim, repeat, move to device, normalize
-                    batch_specs_tta = batch_specs_tta.unsqueeze(1).repeat(1, 3, 1, 1) # Shape (B, 3, H, W)
-                    batch_specs_tta = batch_specs_tta.to(self.config.device)
-                    batch_specs_tta = normalize(batch_specs_tta)
-                
-                    # --- Model Ensemble Loop --- #
-                    batch_model_preds = [] # Store predictions from each model for this TTA batch
-                    for model in self.models:
-                        with torch.no_grad():
-                            outputs = model(batch_specs_tta)
-                            probs = torch.sigmoid(outputs)
-                            batch_model_preds.append(probs.cpu().numpy())
-                    
-                    # Average predictions across models for this TTA iteration
-                    avg_model_preds = np.mean(batch_model_preds, axis=0)
-                    all_tta_preds.append(avg_model_preds)
-                    
-                # Average predictions across TTA iterations for the batch
-                final_batch_preds = np.mean(all_tta_preds, axis=0)
-                # batch_final_preds.extend(final_batch_preds) # This was incorrect, extend overwrites
-
-                # Append batch results to overall lists
-                all_predictions.extend(final_batch_preds) # Extend with the averaged predictions for the batch
-                row_ids.extend(batch_row_ids)
-                segments_processed += actual_batch_size
-                print(f"    Processed segments {segments_processed}/{num_segments}", end='\r')
-
-            print(f"\n  Finished processing {soundscape_id}.")
-
-        except Exception as e:
-            print(f"Error processing {audio_path}: {e}")
-            # Optionally return partial results or empty lists
-            return [], []
-
-        return row_ids, all_predictions
+            if shift_pixels == 0:
+                return spec # No shift
+            
+            if shift_pixels > 0: # Positive shift -> Shift content right (pad left)
+                padded = np.pad(spec, ((0, 0), (shift_pixels, 0)), mode='reflect')
+                return padded[:, :width] # Crop from left
+            else: # Negative shift -> Shift content left (pad right)
+                shift_pixels = abs(shift_pixels)
+                padded = np.pad(spec, ((0, 0), (0, shift_pixels)), mode='reflect')
+                return padded[:, -width:] # Crop from right
 
     def run_inference(self):
         """
-        Run inference on all test soundscape audio files.
-        
-        :return: Tuple (all_row_ids, all_predictions) aggregated from all files.
+        Run inference: Preprocess all files in parallel, then predict in batches.
         """
-        test_files = list(Path(self.config.test_audio_dir).glob('*.ogg'))
-        if self.config.debug:
-            print(f"Debug mode enabled, using only {self.config.debug_limit_files} files")
+        if not self.config.debug:
+            test_files = list(Path(self.config.test_audio_dir).glob('*.ogg'))
+        else:
+            test_files = list(Path(self.config.unlabeled_audio_dir).glob('*.ogg'))
+            print(f"Debug mode enabled, using only {self.config.debug_limit_files} files from unlabeled_audio_dir for testing inference pipeline.")
             test_files = test_files[:self.config.debug_limit_files]
         print(f"Found {len(test_files)} test soundscapes")
 
+        # --- Stage 1: Parallel Preprocessing --- 
+        print("Starting parallel preprocessing of audio files...")
+        start_preprocess = time.time()
         all_row_ids = []
-        all_predictions = []
-
-        for audio_path in tqdm(test_files, desc="Inferring on Test Set"):
-            row_ids, predictions = self.predict_on_audio_file(str(audio_path))
-            all_row_ids.extend(row_ids)
-            all_predictions.extend(predictions)
+        all_specs_list = []
+        num_workers = max(1, multiprocessing.cpu_count() - 1)
+        print(f"Using {num_workers} workers for preprocessing.")
         
+        # Use functools.partial to pass the config to the *imported* worker function
+        # Ensure the function name matches the one imported from utils
+        worker_func = partial(_preprocess_audio_file_worker, config=self.config)
+        
+        pool = None
+        try:
+            pool = multiprocessing.Pool(processes=num_workers)
+            # Process files and collect results
+            results_iterator = pool.imap_unordered(worker_func, [str(p) for p in test_files])
+            
+            for result in tqdm(results_iterator, total=len(test_files), desc="Preprocessing Files"):
+                row_ids_part, specs_part = result
+                if row_ids_part: # Only extend if results are not empty (error handling in worker)
+                    all_row_ids.extend(row_ids_part)
+                    all_specs_list.extend(specs_part)
+        except Exception as e:
+            print(f"\nCRITICAL ERROR during multiprocessing: {e}")
+            print(traceback.format_exc())
+            # Decide how to proceed: exit or try inference on partial data?
+            print("Exiting due to multiprocessing error.")
+            if pool: pool.terminate()
+            return [], []
+        finally:
+            if pool:
+                pool.close()
+                pool.join()
+        
+        specs_to_visualize = all_specs_list[:12] # Ensure we don't exceed list length
+
+        # --- Visualize Spectrograms ---
+        if specs_to_visualize:
+            visualization_output_dir = "visualized_spectrograms"
+            os.makedirs(visualization_output_dir, exist_ok=True)
+            print(f"Saving {len(specs_to_visualize)} spectrograms to '{visualization_output_dir}'...")
+            for idx, spec_to_vis in enumerate(specs_to_visualize):
+                try:
+                    file_path = os.path.join(visualization_output_dir, f"spec_{idx}.png")
+                    # Ensure spectrogram is 2D (remove channel if it was added, though worker returns 2D)
+                    if spec_to_vis.ndim == 3 and spec_to_vis.shape[0] == 1:
+                        spec_to_vis_2d = spec_to_vis.squeeze(0)
+                    else:
+                        spec_to_vis_2d = spec_to_vis
+                    
+                    plt.imsave(file_path, spec_to_vis_2d, cmap='gray', origin='lower')
+                except Exception as e:
+                    print(f"Could not save spectrogram {idx}: {e}")
+            print(f"Finished saving spectrograms.")
+        # --- End Visualize Spectrograms ---
+
+        end_preprocess = time.time()
+        print(f"Preprocessing finished in {end_preprocess - start_preprocess:.2f} seconds.")
+        print(f"Total spectrogram segments generated: {len(all_specs_list)}")
+
+        if not all_specs_list:
+            print("No spectrograms were generated. Exiting inference.")
+            return [], []
+
+        # Consolidate into NumPy array (potential memory bottleneck)
+        try:
+            print("Consolidating spectrograms into NumPy array...")
+            all_specs_np = np.array(all_specs_list)
+            del all_specs_list # Free up memory
+            gc.collect()
+            print(f"Consolidated array shape: {all_specs_np.shape}")
+        except MemoryError:
+            print("MemoryError: Could not create NumPy array of all spectrograms. Not enough RAM.")
+            print("Consider reducing NUM_EXAMPLES_TO_VISUALIZE in debug mode or using a machine with more RAM.")
+            return [], []
+        except Exception as e:
+            print(f"Error converting spectrogram list to NumPy array: {e}")
+            return [], []
+
+        # --- Stage 2: Batched Inference --- 
+        print("Starting batched inference...")
+        start_inference = time.time()
+        all_predictions = []
+        # Define normalization transform once -- REMOVE THIS, NOT NEEDED FOR EFFICIENTAT
+        # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        num_total_specs = all_specs_np.shape[0]
+
+        for i in tqdm(range(0, num_total_specs, self.config.inference_batch_size), desc="Inference Batches"):
+            batch_specs_np = all_specs_np[i : i + self.config.inference_batch_size]
+            
+            # --- TTA Logic --- 
+            tta_iterations = self.config.tta_count if self.config.use_tta else 1
+            batch_tta_preds = [] # Store preds for each TTA variant for this batch
+            for tta_idx in range(tta_iterations):
+                # Apply TTA to the numpy batch
+                tta_batch_np = np.array([self.apply_tta(spec, tta_idx) for spec in batch_specs_np])
+                
+                # Convert TTA'd batch to tensor for EfficientAT
+                # Spectrograms from process_audio_segment are (N_MELS, 1000)
+                batch_tensor = torch.tensor(tta_batch_np, dtype=torch.float32)
+                # Add channel dimension: (Batch, Channels, Mels, Time) -> (B, 1, N_MELS, 1000)
+                batch_tensor = batch_tensor.unsqueeze(1) 
+                batch_tensor = batch_tensor.to(self.config.device)
+                
+                # --- Ensemble Logic --- 
+                batch_model_preds = []
+                for model in self.models:
+                    with torch.no_grad():
+                        outputs = model(batch_tensor) # model returns a tuple (logits, features)
+                        logits = outputs[0] # Select the logits
+                        probs = torch.sigmoid(logits) # Apply sigmoid to logits
+                        batch_model_preds.append(probs.cpu().numpy())
+                         
+                # Average predictions across models for this TTA iteration
+                avg_model_preds = np.mean(batch_model_preds, axis=0)
+                batch_tta_preds.append(avg_model_preds)
+                
+            # Average predictions across TTA iterations for the final batch prediction
+            final_batch_preds = np.mean(batch_tta_preds, axis=0)
+
+            final_batch_preds = apply_power_to_low_ranked_cols(final_batch_preds)
+
+            all_predictions.extend(final_batch_preds)
+            
+        end_inference = time.time()
+        print(f"Inference finished in {end_inference - start_inference:.2f} seconds.")
+
+        # Ensure prediction count matches row_id count
+        if len(all_predictions) != len(all_row_ids):
+            print(f"CRITICAL WARNING: Mismatch between number of predictions ({len(all_predictions)}) and row_ids ({len(all_row_ids)}). Submission will likely fail.")
+            # Handle this error - maybe return empty? 
+            return [], []
+
         return all_row_ids, all_predictions
 
     def create_submission(self, row_ids, predictions):
@@ -381,7 +409,7 @@ class BirdCLEF2025Pipeline:
             
             if predictions.shape[0] > 1:
                 # Smooth the predictions using neighboring segments
-                neighbor_weight = self.config.smoothing_neighbor_weight
+                neighbor_weight = 0.1
                 center_weight = 1.0 - (2 * neighbor_weight)
                 edge_weight = 1.0 - neighbor_weight
 
@@ -398,7 +426,7 @@ class BirdCLEF2025Pipeline:
     def run(self):
         """Main method to execute the full inference pipeline."""
         start_time = time.time()
-        print("\n--- Starting BirdCLEF-2025 Inference Pipeline ---")
+        print("\n--- Starting BirdCLEF-2025 Inference Pipeline (Parallel Preprocessing) ---")
         print(f"Using Device: {self.config.device}")
         print(f"Debug Mode: {self.config.debug}")
         print(f"TTA Enabled: {self.config.use_tta} (Variations: {self.config.tta_count if self.config.use_tta else 1})")
@@ -407,12 +435,17 @@ class BirdCLEF2025Pipeline:
         # 1. Load Models
         self.load_models()
         if not self.models:
-            print("Error: No models loaded! Please check model paths and fold configuration. Exiting.")
+            print("Error: No models loaded! Exiting.")
             return
         print(f"Model usage: {'Single model' if len(self.models) == 1 else f'Ensemble of {len(self.models)} models'}")
+        
+        # 2. Run Inference (Now includes parallel preprocessing)
         row_ids, predictions = self.run_inference()
+    
+        # 3. Create Submission
         submission_df = self.create_submission(row_ids, predictions)
         
+        # 4. Save and Smooth
         submission_path = 'submission.csv'
         submission_df.to_csv(submission_path, index=False)
         print(f"Initial submission saved to {submission_path}")
@@ -425,6 +458,16 @@ class BirdCLEF2025Pipeline:
 
 # Run the BirdCLEF2025 Pipeline:
 if __name__ == "__main__":
+    # Force 'spawn' start method for multiprocessing in interactive environments
+    # This often prevents hangs/deadlocks.
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+        print("Multiprocessing start method set to 'spawn'.")
+    except RuntimeError:
+        # Might already be set or not applicable
+        print("Could not set multiprocessing start method (might be already set or unsupported).")
+        pass 
+
     print(f"Initializing pipeline with device: {config.device}")
     pipeline = BirdCLEF2025Pipeline(config) # Pass the imported config
     pipeline.run()

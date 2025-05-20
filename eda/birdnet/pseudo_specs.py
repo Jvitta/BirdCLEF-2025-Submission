@@ -34,7 +34,7 @@ try:
         taxonomy_df = pd.DataFrame() # Empty if problematic
 
     # 1. Soundscape Pseudo-Labels (Metadata & Spectrograms)
-    soundscape_pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
+    soundscape_pseudo_df = pd.read_csv(config.soundscape_pseudo_csv_path)
     soundscape_pseudo_df_filtered = soundscape_pseudo_df[soundscape_pseudo_df['confidence'] >= SOUNDSCAPE_PSEUDO_CONF_THRESHOLD].copy()
     print(f"Loaded {len(soundscape_pseudo_df_filtered)} high-confidence soundscape pseudo-labels (>= {SOUNDSCAPE_PSEUDO_CONF_THRESHOLD})")
     

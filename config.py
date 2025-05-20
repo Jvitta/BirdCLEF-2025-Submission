@@ -27,14 +27,14 @@ class Config:
 
     # Pseudo-label paths
     unlabeled_audio_dir = os.path.join(RAW_DATA_DIR, 'train_soundscapes')
-    train_pseudo_csv_path = os.path.join(RAW_DATA_DIR, 'train_pseudo.csv')
+    soundscape_pseudo_csv_path = os.path.join(RAW_DATA_DIR, 'soundscape_pseudo.csv')
+    soundscape_pseudo_calibrated_csv_path = os.path.join(RAW_DATA_DIR, 'soundscape_pseudo_calibrated.csv')
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
     VOICE_SEPARATION_DIR = os.path.join(DATA_ROOT, "BC25 voice separation")
     FABIO_CSV_PATH = os.path.join(VOICE_SEPARATION_DIR, "fabio.csv")
-    VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data.pkl") # Original VAD data
-    TRANSFORMED_VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "transformed_train_voice_data.pkl") # Transformed VAD data
-
+    VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data_cleaned.pkl") # Original VAD data
+ 
     # Path for manual annotations from the UI
     ANNOTATED_SEGMENTS_CSV_PATH = os.path.join(PROJECT_ROOT, "annotator_ui", "annotated_segments.csv")
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
@@ -42,6 +42,8 @@ class Config:
  
     EL_SILENCIO_LAT = 6.76       # Latitude of target location (El Silencio, Yondó)
     EL_SILENCIO_LON = -74.21     # Longitude of target location
+
+    BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.05 # Threshold for BirdNET-generated pseudo labels
 
     seed = 43
     num_workers = max(1, multiprocessing.cpu_count() - 1)
@@ -143,8 +145,8 @@ class Config:
         smoothing_neighbor_weight = 0.125
 
         # --- BirdNET Preprocessing Config ---
-        BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.25 # Threshold for BirdNET-generated pseudo labels
-        birdnet_confidence_threshold = 0.1 # Minimum confidence for BirdNET detection to be considered
+        birdnet_confidence_threshold = 0.05
+         # Minimum confidence for BirdNET detection to be considered
     
         # --- AdaIN Statistics ---
         ADAIN_MODE = 'none'  # Options: 'none', 'global', 'per_frequency'
@@ -248,7 +250,6 @@ class Config:
 
         # Other Parameters
         smoothing_neighbor_weight = 0.125
-        BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD = 0.25
         birdnet_confidence_threshold = 0.1
         
         ADAIN_MODE = 'none'

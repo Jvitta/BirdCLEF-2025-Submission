@@ -194,8 +194,9 @@ def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_inter
             if start_idx_fabio < end_idx_fabio:
                 temp_cleaned_audio = final_primary_audio[start_idx_fabio:end_idx_fabio]
         # Else, attempt VAD speech removal (if applicable)
-        elif filepath in vad_intervals:
-            speech_timestamps = vad_intervals[filepath]
+        elif filename in vad_intervals: 
+            print(f"DEBUG: Applying VAD removal for {filename}")
+            speech_timestamps = vad_intervals[filename]
 
             if speech_timestamps: # Ensure there are timestamps to process
                 non_speech_segments = []
@@ -507,18 +508,32 @@ def _process_primary_for_chunking(args):
             if audio_for_manual_and_birdnet_base is None or len(audio_for_manual_and_birdnet_base) == 0:
                 return samplename, None, "Audio for BirdNet chunks is unusable (None or empty)."
             
-            sorted_detections = []
-            try: sorted_detections = sorted([d for d in birdnet_dets_for_file if isinstance(d,dict) and 'confidence' in d], key=lambda x:x.get('confidence',0), reverse=True)
-            except Exception as e_sort: print(f"Warning: Error sorting BirdNET detections for {samplename}: {e_sort}.")
+            # MODIFIED SECTION: Filter, shuffle, and iterate through BirdNET detections
+            valid_detections = []
+            try:
+                # Ensure birdnet_dets_for_file is iterable and filter for valid dicts
+                # A detection is valid if it's a dict and has 'start_time' and 'end_time'
+                if hasattr(birdnet_dets_for_file, '__iter__'):
+                    valid_detections = [
+                        d for d in birdnet_dets_for_file 
+                        if isinstance(d, dict) and 'start_time' in d and 'end_time' in d
+                    ]
+                
+                if valid_detections: # Only shuffle if there are detections
+                    random.shuffle(valid_detections) # Shuffle in-place
+            except Exception as e_proc_shuffle:
+                print(f"Warning: Error processing or shuffling BirdNET detections for {samplename}: {e_proc_shuffle}.")
+                valid_detections = [] # Ensure it's an empty list on error
+            # END MODIFIED SECTION
 
             num_birdnet_chunks_generated = 0
             # For val mode, we only want 1 BirdNET chunk at most if no manual was found.
             # num_versions_to_generate_final is already 1 for val mode.
             # For train mode, it tries to fill up to num_versions_to_generate_final.
-            for i in range(len(sorted_detections)):
+            for detection_to_use in valid_detections: # Iterate through shuffled (or empty) valid_detections
                 if num_birdnet_chunks_generated >= num_versions_to_generate_final: break 
                 audio_chunk_from_birdnet = _extract_birdnet_chunk(
-                    audio_for_manual_and_birdnet_base, sorted_detections[i], config, min_samples, target_samples 
+                    audio_for_manual_and_birdnet_base, detection_to_use, config, min_samples, target_samples 
                 )
                 if audio_chunk_from_birdnet is not None and len(audio_chunk_from_birdnet) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk_from_birdnet, config)
@@ -601,12 +616,12 @@ def _load_auxiliary_data(config):
         except Exception as e: print(f"Warning: Could not load Fabio intervals: {e}")
 
         try:
-            with open(config.TRANSFORMED_VOICE_DATA_PKL_PATH, 'rb') as f:
+            with open(config.VOICE_DATA_PKL_PATH, 'rb') as f:
                     vad_data = pickle.load(f)
                     if isinstance(vad_data, dict): vad_intervals = {k: v for k, v in vad_data.items() if isinstance(v, list)}
                     else: print(f"Warning: VAD pickle file does not contain a dictionary.")
             print(f"Loaded VAD intervals for {len(vad_intervals)} files.")
-        except FileNotFoundError: print(f"Info: VAD intervals pickle file not found at {config.TRANSFORMED_VOICE_DATA_PKL_PATH}. Skipping.")
+        except FileNotFoundError: print(f"Info: VAD intervals pickle file not found at {config.VOICE_DATA_PKL_PATH}. Skipping.")
         except Exception as e: print(f"Warning: Could not load VAD intervals: {e}")
         
     # Load BirdNET Detections

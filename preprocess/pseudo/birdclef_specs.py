@@ -89,13 +89,13 @@ def generate_pseudo_spectrograms(config):
     """Loads pseudo labels, processes segments in parallel, and saves spectrograms to NPZ."""
     print("--- Loading Pseudo Labels --- ")
     try:
-        pseudo_df = pd.read_csv(config.train_pseudo_csv_path)
-        print(f"Loaded {len(pseudo_df)} pseudo labels from {config.train_pseudo_csv_path}")
+        pseudo_df = pd.read_csv(config.soundscape_pseudo_csv_path)
+        print(f"Loaded {len(pseudo_df)} pseudo labels from {config.soundscape_pseudo_csv_path}")
     except FileNotFoundError:
-        print(f"CRITICAL ERROR: Pseudo labels file not found at {config.train_pseudo_csv_path}. Exiting.")
+        print(f"CRITICAL ERROR: Pseudo labels file not found at {config.soundscape_pseudo_csv_path}. Exiting.")
         sys.exit(1)
     except Exception as e:
-        print(f"CRITICAL ERROR loading pseudo labels {config.train_pseudo_csv_path}: {e}. Exiting.")
+        print(f"CRITICAL ERROR loading pseudo labels {config.soundscape_pseudo_csv_path}: {e}. Exiting.")
         sys.exit(1)
 
     if pseudo_df.empty:
@@ -187,7 +187,7 @@ def main(config):
     """Main function to run the pseudo-label preprocessing steps."""
     overall_start = time.time()
     print("Starting BirdCLEF Pseudo-Label Preprocessing Pipeline...")
-    print(f"Input CSV: {config.train_pseudo_csv_path}")
+    print(f"Input CSV: {config.soundscape_pseudo_csv_path}")
     print(f"Input Audio Dir: {config.unlabeled_audio_dir}")
     print(f"Output NPZ Dir: {config._PREPROCESSED_OUTPUT_DIR}")
 

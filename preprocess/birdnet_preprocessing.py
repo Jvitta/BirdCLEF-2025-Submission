@@ -25,8 +25,9 @@ from config import config
 
 # --- Configuration ---
 NUM_WORKERS = config.num_workers
-CONFIDENCE_THRESHOLD = config.birdnet_confidence_threshold
+CONFIDENCE_THRESHOLD = 0.05
 OUTPUT_PATH = config.BIRDNET_DETECTIONS_NPZ_PATH
+BIRDNET_OVERLAP_SECONDS = 2 # Added for training data overlap
 # Hardcode the single species not covered based on previous EDA
 UNCOVERED_AVES_SCIENTIFIC_NAME = 'Chrysuronia goudoti'
 
@@ -105,6 +106,7 @@ def process_file_birdnet(args):
                 min_conf=CONFIDENCE_THRESHOLD,
                 lat=lat_val, 
                 lon=lon_val,
+                overlap=BIRDNET_OVERLAP_SECONDS # Use the constant
             )
             # Analyze within the suppressed block as well if it's noisy
             recording.analyze()
@@ -135,6 +137,8 @@ def process_file_birdnet(args):
 def main(config):
     """Main function to run BirdNET analysis and save detections."""
     print("--- Starting BirdNET Detection Preprocessing ---")
+    print(f"Using BirdNET Confidence Threshold: {CONFIDENCE_THRESHOLD}")
+    print(f"Using BirdNET Overlap: {BIRDNET_OVERLAP_SECONDS} seconds (Effective Step: {3.0 - BIRDNET_OVERLAP_SECONDS:.1f}s)") # Added print
     start_time = time.time()
 
     train_df, taxonomy_df = load_metadata(config)

@@ -397,7 +397,7 @@ class BirdCLEF2025Pipeline:
         pseudo_labels_df = self.create_pseudo_labels_df(row_ids, predictions)
         
         # 4. Save Pseudo-Labels
-        pseudo_labels_path = self.config.train_pseudo_csv_path # Save directly to the path expected by preprocessing/training
+        pseudo_labels_path = self.config.soundscape_pseudo_csv_path # Save directly to the path expected by preprocessing/training
         output_dir_for_pseudo = os.path.dirname(pseudo_labels_path)
         os.makedirs(output_dir_for_pseudo, exist_ok=True) # Ensure the specific directory for the CSV exists
         pseudo_labels_df.to_csv(pseudo_labels_path, index=False)

@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 from sklearn.model_selection import StratifiedKFold, GroupKFold, StratifiedGroupKFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, multilabel_confusion_matrix
@@ -29,7 +29,7 @@ import math
 from config import config
 from src.models.efficient_at.mn.model import get_model as get_efficient_at_model
 from src.training.losses import FocalLossBCE
-from src.datasets.birdclef_dataset import BirdCLEFDataset, _load_adain_per_freq_stats, _apply_adain_transformation
+from src.datasets.birdclef_dataset import BirdCLEFDataset
 # Attempt to import the user's EfficientNet model
 # The user needs to ensure this file and class exist.
 # Example: src/models/birdclef_model.py contains class BirdCLEFModel
@@ -1414,7 +1414,6 @@ def run_training(df, config, trial=None, all_spectrograms=None,
                 if wandb_run: # Use the local wandb_run variable
                     try:
                         wandb.summary['mean_oof_auc'] = mean_oof_auc_final
-                        print(f"DEBUG: Updated wandb.summary['mean_oof_auc'] = {mean_oof_auc_final:.4f}")
                     except Exception as e_summary:
                         print(f"DEBUG: Error updating wandb.summary for mean_oof_auc: {e_summary}")
 
@@ -1496,7 +1495,7 @@ if __name__ == "__main__":
             print("\n--- Loading Pseudo-Label Data (USE_PSEUDO_LABELS=True) ---")
             
             try:
-                pseudo_labels_df_full = pd.read_csv(config.train_pseudo_csv_path)
+                pseudo_labels_df_full = pd.read_csv(config.soundscape_pseudo_csv_path)
                 if not pseudo_labels_df_full.empty:
                     # Create required derived columns
                     pseudo_labels_df_full['samplename'] = pseudo_labels_df_full.apply(
@@ -1534,7 +1533,7 @@ if __name__ == "__main__":
                     print("Pseudo labels CSV found but is empty. Skipping.")
 
             except Exception as e:
-                print(f"CRITICAL ERROR loading or processing pseudo labels CSV {config.train_pseudo_csv_path}: {e}")
+                print(f"CRITICAL ERROR loading or processing pseudo labels CSV {config.soundscape_pseudo_csv_path}: {e}")
                 sys.exit(1)
         else:
             print("\nSkipping pseudo-label data (USE_PSEUDO_LABELS=False).")

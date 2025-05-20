@@ -832,4 +832,4 @@ if __name__ == "__main__":
         print("Warning: No audio folders found in train_audio_dir. The first dropdown will be empty.")
     print(f"Existing annotations loaded: {len(annotations_df)} rows.")
     print(f"Annotations will be saved to: {OUTPUT_ANNOTATIONS_FILE}")
-    demo.launch(share=False)
+    demo.launch(share=True)
