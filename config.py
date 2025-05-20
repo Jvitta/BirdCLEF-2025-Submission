@@ -13,6 +13,8 @@ class Config:
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
     PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
     PREPROCESSED_NPZ_PATH_VAL = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms_val.npz')
+    SOUNDSCAPE_VAL_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'soundscape_val.npz')
+    PROCESSED_DATA_DIR = os.path.join(DATA_ROOT, 'processed')
 
     # These derived paths use the mount point
     train_audio_dir = os.path.join(RAW_DATA_DIR, 'train_audio')
@@ -33,7 +35,7 @@ class Config:
     # Paths for VAD/Fabio - used via mount point in interactive mode
     VOICE_SEPARATION_DIR = os.path.join(DATA_ROOT, "BC25 voice separation")
     FABIO_CSV_PATH = os.path.join(VOICE_SEPARATION_DIR, "fabio.csv")
-    VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data_cleaned.pkl") # Original VAD data
+    VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data_final.pkl") # Original VAD data
  
     # Path for manual annotations from the UI
     ANNOTATED_SEGMENTS_CSV_PATH = os.path.join(PROJECT_ROOT, "annotator_ui", "annotated_segments.csv")

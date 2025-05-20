@@ -5,6 +5,7 @@ import pickle
 from datetime import datetime
 import sys
 import json # For storing list of VAD segments as string
+import numpy as np # Added for loading NPZ file
 
 # --- Project Setup ---
 # Assuming this app.py is in src/vad_review_ui/
@@ -29,6 +30,7 @@ except ImportError:
         train_audio_dir = os.path.join(project_root_from_app, "data", "raw", "train_audio") # Example
         train_audio_rare_dir = os.path.join(project_root_from_app, "data", "raw", "train_audio_rare") # Example
         PROJECT_ROOT = project_root_from_app
+        BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(PROJECT_ROOT, "outputs", "preprocessed", "birdnet_detections.npz") # Added for mock
     config = MockConfig()
     print("Warning: Using mock config paths as config.py import failed. Please check your setup.")
 
@@ -43,21 +45,34 @@ REVIEW_LOG_CSV_PATH = os.path.join(current_script_dir, REVIEW_LOG_CSV_NAME) # Sa
 
 def get_audio_file_path(filename_key):
     """Constructs the full path to an audio file, checking main and rare directories."""
-    # filename_key is expected to be 'species_folder/basename.ogg'
     path_main = os.path.join(config.train_audio_dir, filename_key)
     if os.path.exists(path_main):
         return path_main
     
     path_rare = os.path.join(config.train_audio_rare_dir, filename_key)
-    if os.path.exists(config.train_audio_rare_dir) and os.path.exists(path_rare):
+    if hasattr(config, 'train_audio_rare_dir') and os.path.exists(config.train_audio_rare_dir) and os.path.exists(path_rare):
         return path_rare
     
-    # Fallback: if filename_key itself is an absolute path (less likely for this app's input)
     if os.path.exists(filename_key):
         return filename_key
         
     print(f"Warning: Audio file not found for key: {filename_key} in main or rare dirs.")
     return None
+
+def load_birdnet_detections_filenames(npz_path):
+    """Loads BirdNET NPZ and returns a set of filenames that have detections."""
+    if not os.path.exists(npz_path):
+        print(f"Info: BirdNET detections NPZ file not found at {npz_path}. No files will be excluded based on BirdNET presence.")
+        return set()
+    try:
+        with np.load(npz_path, allow_pickle=True) as data:
+            # data.files directly gives the list of keys (filenames) in the NPZ
+            filenames_with_detections = set(data.files)
+        print(f"Successfully loaded BirdNET detection keys for {len(filenames_with_detections)} files from {npz_path}.")
+        return filenames_with_detections
+    except Exception as e:
+        print(f"Error loading BirdNET detections NPZ {npz_path}: {e}. Assuming no files have BirdNET detections for filtering.")
+        return set()
 
 def load_vad_data(pickle_path):
     """Loads the VAD dictionary (filename_key: [segments])."""
@@ -74,25 +89,87 @@ def load_vad_data(pickle_path):
         return {}
 
 def load_train_metadata(csv_path):
-    """Loads train.csv and creates a filename_key -> author mapping."""
-    filename_to_author_map = {}
+    """Loads train.csv and creates a filename_key -> {author, target_common_name} mapping."""
+    filename_to_metadata_map = {}
     if not os.path.exists(csv_path):
         print(f"Error: Train metadata CSV not found at {csv_path}")
-        return filename_to_author_map # Return empty if no metadata
+        return filename_to_metadata_map # Return empty if no metadata
     try:
         df = pd.read_csv(csv_path)
-        # Ensure 'filename' and 'author' columns exist
-        if 'filename' in df.columns and 'author' in df.columns:
-            # Normalize filename to match VAD keys (e.g., 'species/file.ogg')
+        if 'filename' in df.columns and 'author' in df.columns and 'common_name' in df.columns:
             df['filename'] = df['filename'].astype(str).str.replace(r'[\\\\/]+', '/', regex=True)
-            filename_to_author_map = pd.Series(df.author.values, index=df.filename).to_dict()
-            print(f"Successfully loaded train metadata from {csv_path} and created author map.")
+            for _, row in df.iterrows():
+                filename_to_metadata_map[row['filename']] = {
+                    'author': row['author'],
+                    'target_common_name': row['common_name']
+                }
+            print(f"Successfully loaded train metadata from {csv_path} and created filename_to_metadata_map for {len(filename_to_metadata_map)} files.")
         else:
-            print(f"Error: 'filename' or 'author' column missing in {csv_path}.")
+            print(f"Error: 'filename', 'author', or 'common_name' column missing in {csv_path}.")
     except Exception as e:
         print(f"Error loading train metadata {csv_path}: {e}")
-    return filename_to_author_map
+    return filename_to_metadata_map
 
+def get_files_to_exclude_based_on_birdnet(raw_vad_file_keys, birdnet_npz_path, filename_to_metadata_map, debug_limit=15):
+    """Identifies files from VAD list that should be excluded because BirdNET detected their target species."""
+    files_to_exclude = set()
+    birdnet_all_detections = {}
+    debug_printed_count = 0
+
+    if not os.path.exists(birdnet_npz_path):
+        print(f"Info: BirdNET detections NPZ file not found at {birdnet_npz_path}. No files will be excluded based on BirdNET presence.")
+        return files_to_exclude
+    try:
+        birdnet_all_detections_loaded = np.load(birdnet_npz_path, allow_pickle=True)
+        if hasattr(birdnet_all_detections_loaded, 'files'):
+             birdnet_all_detections = {key: birdnet_all_detections_loaded[key] for key in birdnet_all_detections_loaded.files}
+        else:
+             birdnet_all_detections = dict(birdnet_all_detections_loaded)
+        print(f"Successfully loaded BirdNET detections for {len(birdnet_all_detections)} files from {birdnet_npz_path}.")
+    except Exception as e:
+        print(f"Error loading BirdNET detections NPZ {birdnet_npz_path}: {e}. Assuming no files have BirdNET detections for filtering.")
+        return files_to_exclude
+
+    print(f"\n--- Debugging BirdNET based exclusion (first ~{debug_limit} VAD files) ---")
+    for filename_key in raw_vad_file_keys:
+        metadata = filename_to_metadata_map.get(filename_key)
+        target_common_name_for_debug = metadata.get('target_common_name', 'N/A') if metadata else 'N/A'
+
+        if filename_key in birdnet_all_detections:
+            detections_for_file = birdnet_all_detections[filename_key]
+            # Check if detections_for_file is a list/array and is not empty
+            if (isinstance(detections_for_file, (list, np.ndarray)) and len(detections_for_file) > 0):
+                files_to_exclude.add(filename_key)
+                if debug_printed_count < debug_limit:
+                    print(f"  VAD file: {filename_key:<40} | Target: {target_common_name_for_debug:<25} | Status: EXCLUDED (Target species detections found in BirdNET NPZ)")
+                    debug_printed_count += 1
+            else:
+                # File is in NPZ, but the detection list is empty (shouldn't happen if birdnet_preprocessing.py only saves non-empty)
+                if debug_printed_count < debug_limit:
+                    print(f"  VAD file: {filename_key:<40} | Target: {target_common_name_for_debug:<25} | Status: Kept (Present in BirdNET NPZ but with EMPTY detection list)")
+                    debug_printed_count += 1
+        else:
+            # File is not in BirdNET NPZ at all
+            if debug_printed_count < debug_limit:
+                print(f"  VAD file: {filename_key:<40} | Target: {target_common_name_for_debug:<25} | Status: Kept (Not found in BirdNET NPZ keys)")
+                debug_printed_count += 1
+        
+        if not metadata and debug_printed_count < debug_limit and filename_key not in files_to_exclude : # Add this check to print missing metadata for files that weren't excluded already
+             # Check if it was already printed due to other reasons
+            already_printed_status = False
+            if filename_key in birdnet_all_detections:
+                if not (isinstance(birdnet_all_detections[filename_key], (list, np.ndarray)) and len(birdnet_all_detections[filename_key]) > 0):
+                    already_printed_status = True # Printed as "Kept (Present in BirdNET NPZ but with EMPTY detection list)"
+            else:
+                already_printed_status = True # Printed as "Kept (Not found in BirdNET NPZ keys)"
+
+            if not already_printed_status:
+                 print(f"  VAD file: {filename_key:<40} | Target: N/A                     | Status: Kept (No metadata in train.csv; BirdNET status handled above)")
+                 debug_printed_count +=1
+
+
+    print("--- End of BirdNET exclusion debugging ---")
+    return files_to_exclude
 
 def load_review_log(log_path):
     """Loads existing review decisions. Initializes an empty log if not found."""
@@ -148,23 +225,43 @@ def save_review_log(df, log_path):
 # --- Initial Data Loading & Preparation ---
 print("Starting VAD Review UI: Loading initial data...")
 raw_vad_data = load_vad_data(VAD_PICKLE_PATH)
-filename_to_author_map = load_train_metadata(config.train_csv_path)
+filename_to_metadata_map = load_train_metadata(config.train_csv_path)
 review_log_df_global, reviewed_filenames_set_global = load_review_log(REVIEW_LOG_CSV_PATH)
+
+# Get set of files to exclude based on BirdNET detecting the target species
+files_to_exclude_set = get_files_to_exclude_based_on_birdnet(
+    raw_vad_data.keys(), 
+    config.BIRDNET_DETECTIONS_NPZ_PATH, 
+    filename_to_metadata_map
+)
 
 # Prepare the master list of all VAD files with their info
 # This list will be filtered for display.
 all_vad_files_info_list = []
 if raw_vad_data:
+    files_in_vad_data_count = 0
+    files_excluded_count = 0
     for fn_key, segments in raw_vad_data.items():
-        species = fn_key.split('/')[0] if '/' in fn_key else "unknown_species"
-        author = filename_to_author_map.get(fn_key, "unknown_author")
+        files_in_vad_data_count += 1
+        if fn_key in files_to_exclude_set:
+            files_excluded_count += 1
+            continue
+            
+        metadata = filename_to_metadata_map.get(fn_key, {})
+        author = metadata.get("author", "unknown_author")
+        # Use target_common_name as species for display, fallback to folder name
+        species_display_name = metadata.get("target_common_name", fn_key.split('/')[0] if '/' in fn_key else "unknown_species")
+        
         all_vad_files_info_list.append({
             "filename_key": fn_key,
-            "species": species,
+            "species": species_display_name, # This is now common_name
             "author": author,
             "vad_segments": segments
         })
-    print(f"Prepared master list of {len(all_vad_files_info_list)} VAD files with details.")
+    print(f"\nProcessed {files_in_vad_data_count} files from VAD data source.")
+    if files_excluded_count > 0:
+        print(f"Excluded {files_excluded_count} files because their target species was detected by BirdNET.")
+    print(f"Prepared master list of {len(all_vad_files_info_list)} VAD files for review (after target BirdNET exclusion).")
 else:
     print("Warning: No VAD data loaded. The application will have no files to review.")
 
@@ -173,6 +270,7 @@ else:
 def get_initial_dropdown_choices(all_info, reviewed_set):
     """Gets unique species and authors from unreviewed files."""
     unreviewed_files = [f_info for f_info in all_info if f_info["filename_key"] not in reviewed_set]
+    # 'species' field in all_info now holds the common_name
     species_choices = sorted(list(set(f_info["species"] for f_info in unreviewed_files)))
     author_choices = sorted(list(set(f_info["author"] for f_info in unreviewed_files)))
     return ["All"] + species_choices, ["All"] + author_choices
@@ -209,7 +307,7 @@ with gr.Blocks(title="VAD Segment Review UI") as demo:
 
     with gr.Row():
         with gr.Column(scale=1):
-            species_dropdown = gr.Dropdown(label="Filter by Species", choices=initial_species_choices, value="All")
+            species_dropdown = gr.Dropdown(label="Filter by Species (Common Name)", choices=initial_species_choices, value="All")
         with gr.Column(scale=1):
             author_dropdown = gr.Dropdown(label="Filter by Author", choices=initial_author_choices, value="All")
         with gr.Column(scale=1, min_width=150):
@@ -283,6 +381,7 @@ with gr.Blocks(title="VAD Segment Review UI") as demo:
         vad_display = format_vad_segments_for_display(file_info["vad_segments"])
         
         author_name = file_info.get("author", "Unknown Author")
+        # species field now contains common name
         file_display_md = f"**Current File:** `{file_info['filename_key']}` (Species: `{file_info['species']}`, Author: `{author_name}`)"
         
         return (
@@ -407,8 +506,9 @@ with gr.Blocks(title="VAD Segment Review UI") as demo:
 
         # 1. Log the decision
         filename_key = current_fn_key_state
-        species = filename_key.split('/')[0] if '/' in filename_key else "unknown_species"
-        author = next((f["author"] for f in all_vad_info_list_state if f["filename_key"] == filename_key), "unknown_author")
+        file_info = next((f for f in all_vad_info_list_state if f["filename_key"] == filename_key), {})
+        species = file_info.get("species", "unknown_species") # species is now common_name
+        author = file_info.get("author", "unknown_author")
         
         # Convert VAD segments to JSON string for CSV storage
         vad_segments_str = json.dumps(current_vad_segments_state) if current_vad_segments_state else "[]"
@@ -592,8 +692,8 @@ if __name__ == "__main__":
     print(f"VAD data source: {VAD_PICKLE_PATH}")
     print(f"Number of initial species choices (incl. All): {len(initial_species_choices)}")
     print(f"Number of initial author choices (incl. All): {len(initial_author_choices)}")
-    print(f"Total files in VAD data: {len(all_vad_files_info_list)}")
-    print(f"Total already reviewed files: {len(reviewed_filenames_set_global)}")
+    print(f"Total files in VAD data prepared for UI (after exclusions): {len(all_vad_files_info_list)}")
+    print(f"Total already reviewed files according to log: {len(reviewed_filenames_set_global)}")
 
     demo.launch(share=False, debug=True)
 
