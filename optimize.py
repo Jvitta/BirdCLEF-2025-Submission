@@ -3,18 +3,15 @@ import pandas as pd
 import copy
 import sys
 import os
-import logging
-import matplotlib
-import plotly
-import shutil # Add shutil for file copying
-import numpy as np # Add numpy for loading
-from tqdm.auto import tqdm # Add tqdm for loading progress
-import time # Add time for loading timer
-import functools # Add functools for passing args to objective
+import shutil
+import numpy as np
+from tqdm.auto import tqdm
+import time
+import functools
 
 from config import config as base_config
 
-from src.training.train_mn import run_training, set_seed, calculate_auc # Import calculate_auc
+from src.training.train_mn import run_training
 
 # load data once for HPO
 print("Loading main training metadata for HPO...")
@@ -65,37 +62,18 @@ def objective(trial, preloaded_data, preloaded_val_data):
 
     # --- Hyperparameter Suggestions --- #
     # Keep learning rate search tight around the known good value
-    cfg.lr = trial.suggest_float("lr", 2e-4, 7e-4, log=True) 
-
-    # Keep weight decay search tight around the known good value
-    cfg.weight_decay = trial.suggest_float("weight_decay", 5e-5, 1e-3, log=True) 
-
-    # Dropout
-    cfg.dropout = trial.suggest_float("dropout", 0.1, 0.4)
-
-    # Max Frequency Mask Height (for 128 mel bins)
-    cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 8, 24)
-
-    # Max Time Mask Width (for 500 time frames in preprocessed spec)
-    cfg.max_time_mask_width = trial.suggest_int("max_time_mask_width", 20, 80)
-
-    # Augmentation Probabilities
-    cfg.time_mask_prob = trial.suggest_float("time_mask_prob", 0.2, 0.7)
-    cfg.freq_mask_prob = trial.suggest_float("freq_mask_prob", 0.1, 0.5)
-
-    # Label Smoothing
-    cfg.label_smoothing_factor = trial.suggest_float("label_smoothing_factor", 0.0, 0.25)
-
-    # Mixup Alpha
-    cfg.mixup_alpha = trial.suggest_float("mixup_alpha", 0.2, 0.6)
-    
-    # Focal Loss Gamma
-    cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 1.5, 3.0)
-
-    # Keep other augmentation probabilities fixed for this study, as their effect might be captured by mask sizes
-    # cfg.time_mask_prob = base_config.time_mask_prob # Now tuned
-    # cfg.freq_mask_prob = base_config.freq_mask_prob # Now tuned
-    # cfg.contrast_prob = base_config.contrast_prob # Now tuned
+    cfg.lr = trial.suggest_float("lr", 5e-5, 1e-3, log=True) 
+    cfg.weight_decay = trial.suggest_float("weight_decay", 1e-5, 5e-3, log=True) 
+    cfg.dropout = trial.suggest_float("dropout", 0.1, 0.5)
+    cfg.max_freq_mask_height = trial.suggest_int("max_freq_mask_height", 5, 30)
+    cfg.max_time_mask_width = trial.suggest_int("max_time_mask_width", 15, 100)
+    cfg.label_smoothing_factor = trial.suggest_float("label_smoothing_factor", 0.0, 0.3)
+    cfg.mixup_alpha = trial.suggest_float("mixup_alpha", 0.1, 0.8)
+    cfg.focal_loss_gamma = trial.suggest_float("focal_loss_gamma", 1.0, 3.5)
+    cfg.focal_loss_bce_weight = trial.suggest_float("focal_loss_bce_weight", 0.0, 2.0)
+    # Fix mask probabilities to a moderate default, reducing HPO dimensions
+    cfg.time_mask_prob = 0.45 
+    cfg.freq_mask_prob = 0.3 
     # --- End Hyperparameter Suggestions ---
 
     # --- Trial Configuration ---
@@ -110,12 +88,11 @@ def objective(trial, preloaded_data, preloaded_val_data):
     cfg.debug = False
     cfg.debug_limit_batches = float('inf')
 
-    trial_seed = base_config.seed + trial.number # Use a consistent seed derivation for the trial
-    # Seed will be set per fold inside run_training if needed, or use trial_seed globally if preferred for HPO
-    # For now, run_training sets its own seed based on config.seed which will be trial_seed here.
+    trial_seed = base_config.seed + trial.number
     cfg.seed = trial_seed 
 
     print(f"\n--- Starting Optuna Trial {trial.number} (Overall Seed: {cfg.seed}) ---")
+    print(f"Fixed time_mask_prob: {cfg.time_mask_prob}, Fixed freq_mask_prob: {cfg.freq_mask_prob}")
     print(f"Parameters: {trial.params}")
 
     fold_aucs = []
@@ -151,14 +128,12 @@ def objective(trial, preloaded_data, preloaded_val_data):
                  print(f"--- Trial {trial.number}, Fold {fold_num} | Best Val AUC for Fold: {fold_best_auc:.4f} ---")
                  fold_aucs.append(fold_best_auc)
         
-        # If any fold was pruned, optuna.TrialPruned would have been raised and caught below.
-        # If we reach here, both folds completed (or returned a value that wasn't a prune exception).
         final_objective_value = np.mean(fold_aucs) if fold_aucs else 0.0
         print(f"\n--- Finished Optuna Trial {trial.number} | Average Val AUC (Folds {folds_to_run_hpo}): {final_objective_value:.4f} ---")
 
     except optuna.TrialPruned:
         print(f"--- Optuna Trial {trial.number} was pruned during one of its folds ---")
-        raise # Re-raise the exception to signal pruning to Optuna
+        raise
 
     except Exception as e:
         print(f"\n--- Non-pruning Exception occurred during Optuna trial {trial.number} ---")
@@ -178,14 +153,13 @@ def objective(trial, preloaded_data, preloaded_val_data):
 
 if __name__ == "__main__":
     # --- Study Configuration ---
-    study_name = "BirdCLEF_HPO_New_Validation_Set2" # Focused study name
-    n_trials = 200 # Adjust number of trials as needed for this focused study
+    study_name = "BirdCLEF_HPO_SoundscapeVal_V2"
+    n_trials = 250
 
     # --- Define paths for GCP --- #
-    # Database will be stored in the OUTPUT_DIR defined in config.py
-    db_filename = "hpo_new_validation_set_study_results2.db" # Specific DB file
+    db_filename = "hpo_soundscapeval_v2.db"
     db_filepath = os.path.join(base_config.OUTPUT_DIR, db_filename)
-    storage_path = f"sqlite:///{db_filepath}" # Use absolute path for Optuna
+    storage_path = f"sqlite:///{db_filepath}"
 
     # --- Database Handling (Simplified for GCP) --- #
     storage_path_to_use = storage_path
@@ -194,12 +168,10 @@ if __name__ == "__main__":
         print("Existing database found. Optuna will load study if it exists.")
     else:
         print("No existing database found. Optuna will create a new one.")
-        # Ensure the output directory exists for the new database
         os.makedirs(base_config.OUTPUT_DIR, exist_ok=True)
 
     # Define HPO settings for clarity
-    hpo_trial_epochs = base_config.epochs # Use base epochs
-    # hpo_trial_folds = [0, 1, 2, 3, 4] # We run one fold per trial
+    hpo_trial_epochs = base_config.epochs 
 
     print(f"\n--- Starting Optuna Optimization --- ")
     print(f"Study Name: {study_name}")
@@ -210,19 +182,16 @@ if __name__ == "__main__":
     # print(f"HPO Trial Folds: {hpo_trial_folds}")
 
     # Adjust n_warmup_steps for MedianPruner based on epochs per HPO fold
-    hpo_trial_epochs_per_fold = base_config.epochs # Assuming this is epochs PER FOLD in HPO
-    # Allow each fold a few epochs to start learning before pruning becomes aggressive.
-    # For a 2-fold HPO trial, this means pruning effectively starts a few epochs into the second fold.
-    warmup_steps_for_pruner = hpo_trial_epochs_per_fold // 2 # e.g., if 10 epochs/fold, warmup is 5 steps.
+    hpo_trial_epochs_per_fold = base_config.epochs 
+    warmup_steps_for_pruner = hpo_trial_epochs_per_fold // 2 
 
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
         sampler=optuna.samplers.TPESampler(seed=base_config.seed),
-        # Configure MedianPruner: Prune if value is worse than median after n_warmup_steps epochs
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=warmup_steps_for_pruner, interval_steps=1),
-        storage=storage_path_to_use, # Use the defined path
-        load_if_exists=True # Load if the db file exists and study_name matches
+        storage=storage_path_to_use,
+        load_if_exists=True
     )
 
     # Add base config parameters and tuned parameters as user attributes for reference
@@ -231,13 +200,9 @@ if __name__ == "__main__":
     study.set_user_attr("hpo_fixed_fold", 2) # Indicate that HPO runs on a fixed fold
     # study.set_user_attr("hpo_trial_folds", hpo_trial_folds) # Removed as we use a fixed fold
     # Updated list of tuned parameters
-    tuned_params_list = [
-        "lr", "weight_decay", "dropout", 
-        "max_freq_mask_height", "max_time_mask_width", 
-        "time_mask_prob", "freq_mask_prob",
-        "label_smoothing_factor", "mixup_alpha", "focal_loss_gamma"
-    ]
-    study.set_user_attr("tuned_parameters", tuned_params_list)
+    tuned_params_list_v3 = ["lr", "weight_decay", "dropout", "max_freq_mask_height", "max_time_mask_width",
+                             "label_smoothing_factor", "mixup_alpha", "focal_loss_gamma", "focal_loss_bce_weight"]
+    study.set_user_attr("tuned_parameters", tuned_params_list_v3)
     # Store fixed parameters for reference
     study.set_user_attr("fixed_optimizer", base_config.optimizer)
     study.set_user_attr("fixed_scheduler", base_config.scheduler)
@@ -283,8 +248,8 @@ if __name__ == "__main__":
 
     # --- Pre-load DEDICATED VALIDATION Spectrograms (if available) ---
     global_val_spectrograms = None
-    if hasattr(base_config, 'PREPROCESSED_NPZ_PATH_VAL') and base_config.PREPROCESSED_NPZ_PATH_VAL:
-        val_npz_path = base_config.PREPROCESSED_NPZ_PATH_VAL
+    if hasattr(base_config, 'SOUNDSCAPE_VAL_NPZ_PATH') and base_config.SOUNDSCAPE_VAL_NPZ_PATH:
+        val_npz_path = base_config.SOUNDSCAPE_VAL_NPZ_PATH
         print(f"Attempting to pre-load DEDICATED VALIDATION NPZ file into RAM for HPO: {val_npz_path}")
         if os.path.exists(val_npz_path):
             try:
@@ -300,7 +265,7 @@ if __name__ == "__main__":
         else:
             print(f"Info: DEDICATED VALIDATION NPZ file not found at {val_npz_path}. HPO will proceed without it.")
     else:
-        print("\nInfo: config.PREPROCESSED_NPZ_PATH_VAL not defined. HPO will proceed without dedicated validation specs.")
+        print("\nInfo: config.SOUNDSCAPE_VAL_NPZ_PATH not defined. HPO will proceed without dedicated validation specs.")
     # --- End DEDICATED VALIDATION Pre-loading ---
 
     try:

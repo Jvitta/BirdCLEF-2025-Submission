@@ -648,26 +648,17 @@ def validate(model, loader, criterion, device):
     return avg_loss, macro_auc, per_class_metrics_list, all_outputs_cat, all_targets_cat
 
 def run_training(df, config, trial=None, all_spectrograms=None, 
-                 val_spectrogram_data=None, # New parameter
+                 val_spectrogram_data=None, # Dedicated validation spectrograms
                  custom_run_name=None, hpo_step_offset=0):
-    """Runs the training loop. 
-    
-    Accepts pre-loaded spectrograms via the all_spectrograms argument.
-    Accepts dedicated pre-loaded validation spectrograms via val_spectrogram_data.
-
-    If trial is provided (from Optuna), runs only the single fold specified 
-    in config.selected_folds, enables pruning, and returns the best validation 
-    AUC for that fold.
-    
-    If trial is None, runs the folds specified in config.selected_folds 
-    (can be multiple) without pruning and returns the mean OOF AUC.
+    """
+    Runs the training loop. 
+    Uses a fixed soundscape validation set if val_spectrogram_data and config.soundscape_val_path are provided.
+    Otherwise, uses standard K-fold validation.
     """
     is_hpo_trial = trial is not None
     
-    # --- wandb initialization ---
     wandb_run = None # Initialize to None
     if not is_hpo_trial: # Only init if not an HPO trial
-        # Determine run_name only for non-HPO runs that will use W&B
         actual_run_name = custom_run_name if custom_run_name else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
         wandb_run = wandb.init(
             project="BirdCLEF-2025", 
@@ -688,7 +679,39 @@ def run_training(df, config, trial=None, all_spectrograms=None,
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-    working_df = df.copy()
+    working_df = df.copy() # This is the primary training data (train.csv + rare/pseudo if used)
+
+    # --- Load Fixed Soundscape Validation Metadata (if path is set) --- #
+    df_fixed_soundscape_val_meta = None
+    use_fixed_soundscape_val = False
+    if hasattr(config, 'soundscape_val_path') and config.soundscape_val_path and \
+       val_spectrogram_data is not None and len(val_spectrogram_data) > 0:
+        try:
+            print(f"\n--- Loading Fixed Soundscape Validation Metadata from: {config.soundscape_val_path} ---")
+            df_fixed_soundscape_val_meta = pd.read_csv(config.soundscape_val_path)
+            required_val_meta_cols = ['detection_id', 'original_filename', 'primary_label'] # Ensure these exist
+            if not all(col in df_fixed_soundscape_val_meta.columns for col in required_val_meta_cols):
+                print(f"ERROR: Fixed soundscape validation metadata missing required columns: {required_val_meta_cols}. Will use K-Fold validation.")
+                df_fixed_soundscape_val_meta = None
+            else:
+                # Filter this metadata based on keys in the loaded val_spectrogram_data NPZ
+                original_val_meta_count = len(df_fixed_soundscape_val_meta)
+                df_fixed_soundscape_val_meta = df_fixed_soundscape_val_meta[
+                    df_fixed_soundscape_val_meta['detection_id'].isin(val_spectrogram_data.keys())
+                ].reset_index(drop=True)
+                print(f"  Loaded {len(df_fixed_soundscape_val_meta)} records from soundscape val metadata.")
+                print(f"  Filtered to {len(df_fixed_soundscape_val_meta)} records based on NPZ keys (from {original_val_meta_count}).")
+                if not df_fixed_soundscape_val_meta.empty:
+                    use_fixed_soundscape_val = True
+                    print("  Will use this fixed soundscape set for validation across all folds.")
+                else:
+                    print("  Warning: Fixed soundscape validation metadata is empty after filtering with NPZ keys. Will use K-Fold validation.")
+        except FileNotFoundError:
+            print(f"Warning: Fixed soundscape validation metadata file not found at {config.soundscape_val_path}. Will use K-Fold validation.")
+        except Exception as e_val_meta:
+            print(f"Warning: Error loading or processing fixed soundscape validation metadata: {e_val_meta}. Will use K-Fold validation.")
+    else:
+        print("\nFixed soundscape validation set not configured or validation NPZ not provided/empty. Will use standard K-Fold validation.")
 
     # --- Filter pseudo-labels based on usage threshold --- 
     if config.USE_PSEUDO_LABELS and 'data_source' in working_df.columns and 'confidence' in working_df.columns:
@@ -829,7 +852,7 @@ def run_training(df, config, trial=None, all_spectrograms=None,
     class_group_counts = working_df.groupby('primary_label')['initial_group_id'].nunique()
     
     classes_to_ungroup = class_group_counts[class_group_counts < GROUP_DIVERSITY_THRESHOLD].index.tolist()
-    print(f"  Found {len(classes_to_ungroup)} classes to be ungrouped (samples will get unique group IDs). Classes: {classes_to_ungroup if classes_to_ungroup else 'None'}")
+    print(f"  Found {len(classes_to_ungroup)} classes to be ungrouped (samples will get unique group IDs).")
 
     # 3. Create final 'group_id' column for splitting
     # Initialize final_group_id with initial_group_id
@@ -878,7 +901,7 @@ def run_training(df, config, trial=None, all_spectrograms=None,
     logged_original_samplenames_for_spectrograms = [] # Using a list to preserve order of first N logged
     
     try: # Wrap the main training loop in try/finally for wandb.finish()
-        for fold, (train_idx, val_idx) in enumerate(fold_iterator):
+        for fold, (train_idx, val_idx_from_kfold) in enumerate(fold_iterator): # val_idx_from_kfold is now potentially unused for val_df
             if fold not in config.selected_folds:
                 continue
 
@@ -896,41 +919,25 @@ def run_training(df, config, trial=None, all_spectrograms=None,
             }
 
             train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
-            val_df_fold = working_df.iloc[val_idx].reset_index(drop=True)
 
-            # --- Filter Validation Set: Allow 'main' or 'rare' data sources (existing filter, keep if needed) ---
-            original_val_count_before_source_filter = len(val_df_fold)
-            if 'data_source' in val_df_fold.columns:
-                allowed_sources = ['main', 'rare'] 
-                val_df_fold = val_df_fold[val_df_fold['data_source'].isin(allowed_sources)].reset_index(drop=True)
-                print(f"Fold {fold}: Filtered validation set by data_source ('main', 'rare'). Count: {original_val_count_before_source_filter} -> {len(val_df_fold)}")
-            # --- End Validation Set Filtering by source ---
+            # --- Determine Validation DataFrame and Spectrogram Source --- #
+            if use_fixed_soundscape_val and df_fixed_soundscape_val_meta is not None:
+                val_df_fold = df_fixed_soundscape_val_meta.copy() # Use the pre-loaded, pre-filtered fixed val set
+                current_val_spectrogram_source_for_dataset = val_spectrogram_data
+                print(f"Fold {fold}: Using FIXED soundscape validation set ({len(val_df_fold)} detections).")
+            else: # Fallback to standard K-Fold validation split from working_df
+                val_df_fold = working_df.iloc[val_idx_from_kfold].reset_index(drop=True)
+                current_val_spectrogram_source_for_dataset = all_spectrograms # Use main spectrograms for this val split
+                print(f"Fold {fold}: Using K-Fold validation split from training data ({len(val_df_fold)} samples).")
+                # Filter this K-Fold val_df_fold if using main spectrograms and LOAD_PREPROCESSED_DATA is true
+                if config.LOAD_PREPROCESSED_DATA and all_spectrograms is not None:
+                    original_val_fold_count_kfold = len(val_df_fold)
+                    val_df_fold = val_df_fold[val_df_fold['samplename'].isin(all_spectrograms.keys())].reset_index(drop=True)
+                    if len(val_df_fold) < original_val_fold_count_kfold:
+                        print(f"  Filtered K-Fold val_df_fold to {len(val_df_fold)} samples based on main NPZ keys.")
             
             print(f'Training set size: {len(train_df_fold)} samples')
             print(f'Initial validation set size (after source filter, before NPZ filter): {len(val_df_fold)} samples')
-
-            # Determine which spectrogram dictionary to use for validation and filter val_df_fold
-            current_val_spectrogram_source_for_dataset = all_spectrograms # Default to main spectrograms for dataset instantiation
-
-            if val_spectrogram_data is not None and len(val_spectrogram_data) > 0:
-                print(f"Fold {fold}: Using dedicated validation spectrograms from PREPROCESSED_NPZ_PATH_VAL.")
-                original_val_fold_count_before_npz_filter = len(val_df_fold)
-                
-                # Filter val_df_fold to include only samplenames present in val_spectrogram_data
-                val_df_fold = val_df_fold[val_df_fold['samplename'].isin(val_spectrogram_data.keys())].reset_index(drop=True)
-                
-                filtered_val_fold_count_after_npz_filter = len(val_df_fold)
-                print(f"  Filtered val_df_fold to {filtered_val_fold_count_after_npz_filter} samples (from {original_val_fold_count_before_npz_filter}) based on keys in dedicated validation NPZ.")
-                
-                if filtered_val_fold_count_after_npz_filter == 0 and original_val_fold_count_before_npz_filter > 0:
-                    print(f"  WARNING: Fold {fold} validation set became empty after filtering against dedicated validation NPZ keys. Check samplenames and VAL NPZ content.")
-                
-                current_val_spectrogram_source_for_dataset = val_spectrogram_data # Use these for val_dataset
-
-            elif val_spectrogram_data is not None and len(val_spectrogram_data) == 0:
-                print(f"Fold {fold}: Dedicated validation spectrograms NPZ was loaded but is empty. Using training set spectrograms for validation if samplenames match.")
-            else: # val_spectrogram_data is None
-                print(f"Fold {fold}: No dedicated validation spectrograms provided or loaded. Using training set spectrograms for validation if samplenames match.")
 
             # --- DIAGNOSTIC PRINTS FOR CLASS DISTRIBUTION (on the now potentially filtered val_df_fold) ---
             print(f"\n--- Fold {fold} Class Distribution Diagnostics ---")
@@ -1562,28 +1569,24 @@ if __name__ == "__main__":
 
     # --- Load Preprocessed Validation Spectrograms (if available) ---
     loaded_val_spectrograms = None # Initialize
-    if hasattr(config, 'PREPROCESSED_NPZ_PATH_VAL') and config.PREPROCESSED_NPZ_PATH_VAL:
-        val_npz_path = config.PREPROCESSED_NPZ_PATH_VAL
-        print(f"\nAttempting to load DEDICATED VALIDATION spectrograms from: {val_npz_path}")
-        if os.path.exists(val_npz_path):
-            try:
-                start_load_time_val = time.time()
-                with np.load(val_npz_path) as data_archive_val:
-                    # Ensure tqdm is available if you use it here, or remove for simplicity if not essential for this loading step
-                    loaded_val_spectrograms = {key: data_archive_val[key] for key in tqdm(data_archive_val.keys(), desc="Loading DEDICATED VAL Specs")}
-                end_load_time_val = time.time()
-                print(f"Successfully loaded {len(loaded_val_spectrograms) if loaded_val_spectrograms is not None else 0} DEDICATED VALIDATION sample entries in {end_load_time_val - start_load_time_val:.2f} seconds.")
-                if loaded_val_spectrograms is not None and not loaded_val_spectrograms: # Check if loaded but empty
-                    print("Warning: DEDICATED VALIDATION NPZ file was loaded but contained no spectrograms.")
-            except Exception as e_val_load:
-                print(f"ERROR loading DEDICATED VALIDATION NPZ file {val_npz_path}: {e_val_load}. Proceeding without dedicated validation specs.")
-                loaded_val_spectrograms = None # Ensure it's None on error
-        else:
-            print(f"Info: DEDICATED VALIDATION NPZ file not found at {val_npz_path}. Validation may use training spectrogram processing rules or be empty if filtered by missing keys.")
-    else:
-        print("\nInfo: config.PREPROCESSED_NPZ_PATH_VAL not defined. Validation may use training spectrogram processing rules.")
 
-    # Pass the loaded_val_spectrograms to run_training
+    val_npz_path = config.SOUNDSCAPE_VAL_NPZ_PATH
+    print(f"\nAttempting to load DEDICATED SOUNDSCAPE VALIDATION spectrograms from: {val_npz_path}")
+    try:
+        start_load_time_val = time.time()
+        with np.load(val_npz_path) as data_archive_val:
+            loaded_val_spectrograms = {key: data_archive_val[key] for key in tqdm(data_archive_val.keys(), desc="Loading Soundscape VAL Specs")}
+        end_load_time_val = time.time()
+        print(f"Successfully loaded {len(loaded_val_spectrograms) if loaded_val_spectrograms is not None else 0} DEDICATED SOUNDSCAPE VALIDATION specs in {end_load_time_val - start_load_time_val:.2f} seconds.")
+        if loaded_val_spectrograms is not None and not loaded_val_spectrograms: # Check if loaded but empty
+            print("Warning: DEDICATED SOUNDSCAPE VALIDATION NPZ file was loaded but contained no spectrograms.")
+    except FileNotFoundError:
+        print(f"INFO: DEDICATED SOUNDSCAPE VALIDATION NPZ file not found at {val_npz_path}. Will use K-Fold validation or main spectrograms for validation.")
+        loaded_val_spectrograms = None 
+    except Exception as e_val_load:
+        print(f"ERROR loading DEDICATED SOUNDSCAPE VALIDATION NPZ file {val_npz_path}: {e_val_load}. Proceeding without it.")
+        loaded_val_spectrograms = None 
+
     run_training(training_df, config, all_spectrograms=all_spectrograms, 
                  val_spectrogram_data=loaded_val_spectrograms, # Pass the loaded validation specs
                  custom_run_name=cmd_args.run_name)

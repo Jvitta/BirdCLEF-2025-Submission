@@ -167,14 +167,18 @@ def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_inter
     Returns:
         final_primary_audio (np.array): Original audio. None if loading failed or initially too short.
         audio_for_random_chunks (np.array): Cleaned audio if successful and non-empty, else final_primary_audio. None if final_primary_audio is None.
+        fabio_applied (bool): True if Fabio speech removal was applied.
+        vad_applied (bool): True if VAD speech removal was applied.
         error_msg (str): Error message, or None.
     """
+    fabio_applied_flag = False
+    vad_applied_flag = False
     try:
         primary_audio_candidate, _ = librosa.load(filepath, sr=config.FS, mono=True)
         if primary_audio_candidate is None or len(primary_audio_candidate) < min_samples:
-            return None, None, f"Primary audio load failed or too short: {filepath}"
+            return None, None, fabio_applied_flag, vad_applied_flag, f"Primary audio load failed or too short: {filepath}"
     except Exception as e_load:
-        return None, None, f"Error loading audio {filepath}: {e_load}"
+        return None, None, fabio_applied_flag, vad_applied_flag, f"Error loading audio {filepath}: {e_load}"
 
     # Initialize outputs
     final_primary_audio = primary_audio_candidate
@@ -193,9 +197,9 @@ def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_inter
 
             if start_idx_fabio < end_idx_fabio:
                 temp_cleaned_audio = final_primary_audio[start_idx_fabio:end_idx_fabio]
+                fabio_applied_flag = True # Set flag
         # Else, attempt VAD speech removal (if applicable)
         elif filename in vad_intervals: 
-            print(f"DEBUG: Applying VAD removal for {filename}")
             speech_timestamps = vad_intervals[filename]
 
             if speech_timestamps: # Ensure there are timestamps to process
@@ -234,6 +238,7 @@ def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_inter
                     non_speech_segments = [s for s in non_speech_segments if len(s) > 0]
                     if non_speech_segments: 
                         temp_cleaned_audio = np.concatenate(non_speech_segments)
+                        vad_applied_flag = True # Set flag
                     else: 
                         temp_cleaned_audio = np.array([]) # No valid non-speech segments found
                 else: 
@@ -245,9 +250,9 @@ def _load_and_clean_audio(filepath, filename, config, fabio_intervals, vad_inter
             audio_for_random_chunks = temp_cleaned_audio
 
     if final_primary_audio is None: # Should not happen if initial check passed, but as safeguard
-        return None, None, "Primary audio became None unexpectedly."
+        return None, None, fabio_applied_flag, vad_applied_flag, "Primary audio became None unexpectedly."
 
-    return final_primary_audio, audio_for_random_chunks, None
+    return final_primary_audio, audio_for_random_chunks, fabio_applied_flag, vad_applied_flag, None
 
 def _pad_or_tile_audio(audio_data, target_samples):
     """Pads or tiles audio to target_samples length."""
@@ -392,14 +397,23 @@ def _process_primary_for_chunking(args):
         UNCOVERED_AVES_SCIENTIFIC_NAME, num_files_for_this_species = args
 
     target_samples = int(config.TARGET_DURATION * config.FS)
-    min_samples = int(0.5 * config.FS) # Min samples for a segment to be considered usable before padding
+    min_samples = int(0.5 * config.FS) 
+
+    strategy_info = {
+        'used_manual': False, 'used_birdnet': False, 'used_random': False, 
+        'used_last_resort_pad': False,
+        'fabio_removed_speech': False, 'vad_removed_speech': False
+    }
 
     try:
-        audio_for_manual_and_birdnet_base, audio_for_random_base, error_msg = _load_and_clean_audio(
+        audio_for_manual_and_birdnet_base, audio_for_random_base, fabio_applied, vad_applied, error_msg = _load_and_clean_audio(
             primary_filepath, primary_filename, config, fabio_intervals, vad_intervals, min_samples
         )
         if error_msg:
-            return samplename, None, error_msg 
+            return samplename, None, error_msg, strategy_info
+        
+        strategy_info['fabio_removed_speech'] = fabio_applied
+        strategy_info['vad_removed_speech'] = vad_applied
 
         base_duration_for_versions = len(audio_for_manual_and_birdnet_base) 
         
@@ -496,7 +510,7 @@ def _process_primary_for_chunking(args):
                 )
                 if audio_chunk is not None and len(audio_chunk) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
-                    if spec is not None: final_specs_list.append(spec)
+                    if spec is not None: final_specs_list.append(spec); strategy_info['used_manual'] = True
             
             # For val mode, if we got a manual chunk, we are done.
             if cmd_args.mode == "val" and final_specs_list:
@@ -506,7 +520,7 @@ def _process_primary_for_chunking(args):
         # MODIFICATION: Allow for val mode. num_versions_to_generate_final will be 1 for val.
         if use_birdnet_strategy and not final_specs_list: # If no manual spec was generated (or not enough for train)
             if audio_for_manual_and_birdnet_base is None or len(audio_for_manual_and_birdnet_base) == 0:
-                return samplename, None, "Audio for BirdNet chunks is unusable (None or empty)."
+                return samplename, None, "Audio for BirdNet chunks is unusable.", strategy_info
             
             # MODIFIED SECTION: Filter, shuffle, and iterate through BirdNET detections
             valid_detections = []
@@ -540,6 +554,7 @@ def _process_primary_for_chunking(args):
                     if spec is not None: 
                         final_specs_list.append(spec)
                         num_birdnet_chunks_generated +=1
+                        strategy_info['used_birdnet'] = True
             
             # Fallback to random if not enough BirdNET chunks were generated (ONLY FOR TRAIN MODE)
             # MODIFICATION: Add cmd_args.mode == "train" check here
@@ -551,11 +566,12 @@ def _process_primary_for_chunking(args):
                         if audio_chunk is not None and len(audio_chunk) == target_samples:
                             spec = _generate_spectrogram_from_chunk(audio_chunk, config)
                             if spec is not None: final_specs_list.append(spec)
+                            strategy_info['used_random'] = True
         
         # Strategy 3: Random Chunks (Non-Aves or Aves without enough detections, and no manual annotations processed)
         if not final_specs_list: # If no specs from manual or BirdNET yet
             if cmd_args.mode == "val":
-                return samplename, None, "VAL_MODE_SKIP: No manual or BirdNET chunk found."
+                return samplename, None, "VAL_MODE_SKIP: No manual or BirdNET chunk found.", strategy_info
             
             # This part now only runs for TRAIN mode if above conditions met
             actual_chunks_to_make_random = num_versions_to_generate_final 
@@ -568,13 +584,14 @@ def _process_primary_for_chunking(args):
             if audio_source_for_random is None or len(audio_source_for_random) == 0:
                 audio_source_for_random = audio_for_manual_and_birdnet_base 
                 if audio_source_for_random is None or len(audio_source_for_random) == 0:
-                    return samplename, None, "All audio sources unusable for random chunks (train mode)."
+                    return samplename, None, "All audio sources unusable for random chunks (train mode).", strategy_info
             
             for _ in range(actual_chunks_to_make_random):
                 audio_chunk = _extract_random_chunk(audio_source_for_random, target_samples)
                 if audio_chunk is not None and len(audio_chunk) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
                     if spec is not None: final_specs_list.append(spec)
+                    strategy_info['used_random'] = True
 
         if not final_specs_list:
             # Last resort for train mode if absolutely nothing: Pad/tile original audio once
@@ -583,18 +600,19 @@ def _process_primary_for_chunking(args):
                 if audio_chunk is not None and len(audio_chunk) == target_samples:
                     spec = _generate_spectrogram_from_chunk(audio_chunk, config)
                     if spec is not None: final_specs_list.append(spec)
+                    strategy_info['used_last_resort_pad'] = True
         
         if not final_specs_list:
             # This message will now correctly reflect if it's a val mode skip or a train mode complete failure
-            return samplename, None, "No valid spectrograms generated after all strategies (or VAL_MODE_SKIP)."
+            return samplename, None, "No valid spectrograms generated after all strategies (or VAL_MODE_SKIP).", strategy_info
 
         # If final_specs_list is populated (e.g., with 1 spec for val mode), stack and return
         final_specs_array = np.stack([s.astype(np.float32) for s in final_specs_list], axis=0)
-        return samplename, final_specs_array, None
+        return samplename, final_specs_array, None, strategy_info
 
     except Exception as e_main:
         tb_str = traceback.format_exc()
-        return samplename, None, f"Outer error processing {primary_filepath}: {e_main}\n{tb_str}"
+        return samplename, None, f"Outer error processing {primary_filepath}: {e_main}\n{tb_str}", strategy_info
 
 def _load_auxiliary_data(config):
     """Loads auxiliary data (VAD, Fabio, BirdNET, Taxonomy)."""
@@ -773,33 +791,83 @@ def _aggregate_results(results_list):
     grouped_results = {}
     processed_count = 0
     error_count = 0
-    skipped_files = 0
+    skipped_files = 0 # Files that had an error_msg but no spec, or spec was None
     errors_list = []
 
+    # New counters for strategies
+    fabio_removed_count = 0
+    vad_removed_count = 0
+    manual_chunks_files_count = 0 # Files where at least one manual chunk was used
+    birdnet_chunks_files_count = 0 # Files where at least one BirdNET chunk was used
+    random_chunks_files_count = 0  # Files where at least one random chunk was used (could be primary or fallback)
+    last_resort_pad_files_count = 0 # Files where only the last resort padding was used
+    
+    # Track which files used which strategy to avoid double counting for file-level stats
+    files_using_manual = set()
+    files_using_birdnet = set()
+    files_using_random = set()
+    files_using_last_resort = set()
+
     for result_tuple in results_list:
-        samplename, spec_array, error_msg = result_tuple
+        samplename, spec_array, error_msg, strategy_info = result_tuple # Unpack new strategy_info
+        
+        if strategy_info.get('fabio_removed_speech', False):
+            fabio_removed_count += 1
+        if strategy_info.get('vad_removed_speech', False):
+            vad_removed_count += 1
+
         if error_msg:
             errors_list.append(f"{samplename}: {error_msg}")
-            error_count += 1
-        elif spec_array is not None and spec_array.ndim == 3: # (N, H, W)
+            error_count += 1 # This is error in processing the file itself
+        elif spec_array is not None and spec_array.ndim == 3: # Successfully got some spectrograms
             grouped_results[samplename] = spec_array
             processed_count += 1
+            # Check which strategies contributed to the successful specs for this file
+            if strategy_info.get('used_manual', False):
+                files_using_manual.add(samplename)
+            if strategy_info.get('used_birdnet', False):
+                files_using_birdnet.add(samplename)
+            if strategy_info.get('used_random', False):
+                 files_using_random.add(samplename)
+            if strategy_info.get('used_last_resort_pad', False):
+                files_using_last_resort.add(samplename)
         else:
-            skipped_files += 1
-            errors_list.append(f"{samplename}: Skipped (No valid spec array)")
+            skipped_files += 1 # File processed by worker but no valid spec array produced
+            errors_list.append(f"{samplename}: Skipped by worker (No valid spec array and no error_msg).")
 
-    return grouped_results, processed_count, error_count, skipped_files, errors_list
+    manual_chunks_files_count = len(files_using_manual)
+    birdnet_chunks_files_count = len(files_using_birdnet)
+    random_chunks_files_count = len(files_using_random)
+    last_resort_pad_files_count = len(files_using_last_resort)
 
-def _report_summary(total_tasks, processed_count, error_count, skipped_files, errors_list):
+    strategy_counts = {
+        'fabio_removed_speech': fabio_removed_count,
+        'vad_removed_speech': vad_removed_count,
+        'files_w_manual_chunks': manual_chunks_files_count,
+        'files_w_birdnet_chunks': birdnet_chunks_files_count,
+        'files_w_random_chunks': random_chunks_files_count,
+        'files_w_last_resort_pad': last_resort_pad_files_count
+    }
+
+    return grouped_results, processed_count, error_count, skipped_files, errors_list, strategy_counts
+
+def _report_summary(total_tasks, processed_count, error_count, skipped_files, errors_list, strategy_counts):
     """Prints a summary of the processing results."""
     print(f"\n--- Processing Summary ---")
-    print(f"Attempted to process {total_tasks} files.")
+    print(f"Attempted to process {total_tasks} primary audio files.")
     print(f"Successfully generated spectrograms for {processed_count} primary files.") 
-    if processed_count > 0:
-        pass # Cannot calculate total chunks without grouped_results here
-    print(f"Encountered errors for {error_count} primary files.")
+    print(f"Encountered errors for {error_count} primary files during processing attempt.")
     if skipped_files > 0:
-         print(f"{skipped_files} primary files yielded no valid spectrograms (skipped).")
+         print(f"{skipped_files} primary files yielded no valid spectrograms (skipped by worker without explicit error).")
+    
+    print("\n--- Strategy Usage Summary (counts are for files) ---")
+    print(f"  Files with Fabio speech interval used for cleaning: {strategy_counts['fabio_removed_speech']}")
+    print(f"  Files with VAD speech intervals used for cleaning: {strategy_counts['vad_removed_speech']}")
+    print(f"  Files where at least one MANUAL annotation chunk was used: {strategy_counts['files_w_manual_chunks']}")
+    print(f"  Files where at least one BIRDNET detection chunk was used: {strategy_counts['files_w_birdnet_chunks']}")
+    print(f"  Files where at least one RANDOM chunk was used (incl. fallbacks): {strategy_counts['files_w_random_chunks']}")
+    print(f"  Files where only LAST RESORT padding/tiling was used: {strategy_counts['files_w_last_resort_pad']}")
+
     if errors_list:
         print("\n--- Errors/Skips Encountered (sample) ---")
         for err in errors_list[:20]: print(err)
@@ -862,10 +930,10 @@ def generate_and_save_spectrograms(df, config, species_file_counts):
     results_list = _run_parallel_processing(tasks, _process_primary_for_chunking, num_workers)
 
     # 5. Aggregate results
-    grouped_results, processed_count, error_count, skipped_files, errors_list = _aggregate_results(results_list)
+    grouped_results, processed_count, error_count, skipped_files, errors_list, strategy_counts = _aggregate_results(results_list)
 
     # 6. Report summary statistics
-    _report_summary(len(tasks), processed_count, error_count, skipped_files, errors_list)
+    _report_summary(len(tasks), processed_count, error_count, skipped_files, errors_list, strategy_counts)
 
     # 7. Save NPZ file (pass project_root needed for debug path construction)
     _save_spectrogram_npz(grouped_results, output_npz_path, project_root)

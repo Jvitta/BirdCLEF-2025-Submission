@@ -6,13 +6,13 @@ import sys
 import numpy as np
 import librosa
 
-PROJECT_ROOT_APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT_APP = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT_APP not in sys.path:
     sys.path.append(PROJECT_ROOT_APP)
 
 from config import config
 
-OUTPUT_ANNOTATIONS_FILE = os.path.join(config.PROJECT_ROOT, "annotator_ui", "annotated_segments.csv")
+OUTPUT_ANNOTATIONS_FILE = os.path.join(config.PROJECT_ROOT, "src", "annotator_ui", "annotated_segments.csv")
 
 # --- Helper Functions ---
 def load_audio_structure():

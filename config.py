@@ -31,6 +31,7 @@ class Config:
     unlabeled_audio_dir = os.path.join(RAW_DATA_DIR, 'train_soundscapes')
     soundscape_pseudo_csv_path = os.path.join(RAW_DATA_DIR, 'soundscape_pseudo.csv')
     soundscape_pseudo_calibrated_csv_path = os.path.join(RAW_DATA_DIR, 'soundscape_pseudo_calibrated.csv')
+    soundscape_val_path = os.path.join(RAW_DATA_DIR, 'soundscape_val_metadata.csv')
 
     # Paths for VAD/Fabio - used via mount point in interactive mode
     VOICE_SEPARATION_DIR = os.path.join(DATA_ROOT, "BC25 voice separation")

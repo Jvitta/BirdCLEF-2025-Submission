@@ -2,6 +2,7 @@ notes
 
 .ipynb_checkpoints
 __pycache__
+.cursor/
 
 kaggle_training.py
 wandb/
@@ -13,6 +14,6 @@ data/raw/train_soundscapes/
 
 outputs
 eda/plots
-
+.gradio/
 
 resources/
