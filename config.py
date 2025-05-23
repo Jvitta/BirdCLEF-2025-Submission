@@ -11,9 +11,6 @@ class Config:
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
-    PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
-    PREPROCESSED_NPZ_PATH_VAL = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms_val.npz')
-    SOUNDSCAPE_VAL_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'soundscape_val.npz')
     PROCESSED_DATA_DIR = os.path.join(DATA_ROOT, 'processed')
 
     # These derived paths use the mount point
@@ -39,7 +36,7 @@ class Config:
     VOICE_DATA_PKL_PATH = os.path.join(VOICE_SEPARATION_DIR, "train_voice_data_final.pkl") # Original VAD data
  
     # Path for manual annotations from the UI
-    ANNOTATED_SEGMENTS_CSV_PATH = os.path.join(PROJECT_ROOT, "annotator_ui", "annotated_segments.csv")
+    ANNOTATED_SEGMENTS_CSV_PATH = os.path.join(PROJECT_ROOT, "src", "annotator_ui", "annotated_segments.csv")
     BIRDNET_DETECTIONS_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'birdnet_detections.npz')
     ADAIN_PER_FREQUENCY_STATS_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, "adain_per_frequency_stats.npz")
  
@@ -61,10 +58,10 @@ class Config:
 
         epochs = 10 # 10
         optimizer = 'AdamW'
-        lr = 0.0006124336720699518 #0.0004 
+        lr = 0.001072 #0.0006124336720699518 # Doubled from 0.000536 for batch_size 128
         min_lr = 1e-6
-        weight_decay = 0.0009586824835340106 #1e-4 
-        dropout = 0.2
+        weight_decay = 0.000285 #0.0009586824835340106 
+        dropout = 0.482918 #0.2
         scheduler = 'CosineAnnealingLR' 
         T_max = 15
 
@@ -84,7 +81,7 @@ class Config:
         LOAD_PREPROCESSED_DATA = True
         REMOVE_SPEECH_INTERVALS = True
         USE_RARE_DATA = True
-        USE_PSEUDO_LABELS = False
+        USE_PSEUDO_LABELS = True
         USE_WEIGHTED_SAMPLING = False
         USE_MANUAL_ANNOTATIONS = True 
         REMOVE_SPEECH_ONLY_NON_AVES = True # Apply speech removal only to non-Aves classes if REMOVE_SPEECH_INTERVALS is True
@@ -107,30 +104,30 @@ class Config:
 
         criterion = 'FocalLossBCE'
         focal_loss_alpha = 0.25
-        focal_loss_gamma = 2.0
-        focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
+        focal_loss_gamma = 3.403297 #2.0
+        focal_loss_bce_weight = 0.291471 #0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
-        label_smoothing_factor = 0.17663005428851927 #0.1
+        label_smoothing_factor = 0.188891 #0.17663005428851927
 
         n_fold = 5
         selected_folds = [0, 1, 2, 3, 4]
 
-        train_batch_size = 32
-        val_batch_size = 64
+        train_batch_size = 128
+        val_batch_size = 128
         inference_batch_size = 64
 
         # --- Augmentation Parameters ---
         batch_augment_prob = 1.0  # Probability of applying Mixup OR CutMix to a batch
         mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
-        mixup_alpha = 0.4194592538670868 #0.3901120986458487 
+        mixup_alpha = 0.244065 #0.4194592538670868
         cutmix_alpha = 1.0           
 
         # Spectrogram Augmentation (applied manually in Dataset)
-        time_mask_prob = 0.446875227279031 # Probability of applying time masking
-        freq_mask_prob = 0.263834841662896 # Probability of applying frequency masking
+        time_mask_prob = 0.45 # Probability of applying time masking
+        freq_mask_prob = 0.3 # Probability of applying frequency masking
         contrast_prob = 0.445985839941462  # Probability of applying random contrast
-        max_time_mask_width = 45 #30     # Maximum width of time mask
-        max_freq_mask_height = 15 #26    # Maximum height of frequency mask
+        max_time_mask_width = 90 #45     # Maximum width of time mask
+        max_freq_mask_height = 19 #15    # Maximum height of frequency mask
 
         use_tta = False
         tta_count = 3

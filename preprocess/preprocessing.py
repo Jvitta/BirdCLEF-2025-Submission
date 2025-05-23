@@ -49,17 +49,23 @@ efficient_at_spectrogram_generator = AugmentMelSTFT(
             fmax_aug_range=config.FMAX_AUG_RANGE
         )
 
-output_npz_path = ""
+# Determine output path based on model name and mode
+base_output_filename = f"spectrograms_{config.model_name}_{cmd_args.mode}.npz"
+output_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, base_output_filename)
 
 if cmd_args.mode == "train":
-    print("--- Running Preprocessing in TRAIN mode (augmented) ---")
-    output_npz_path = config.PREPROCESSED_NPZ_PATH
-else:
-    print("--- Running Preprocessing in VAL mode (fixed settings) ---")
-    efficient_at_spectrogram_generator.eval()
-    output_npz_path = config.PREPROCESSED_NPZ_PATH_VAL
+    print(f"--- Running Preprocessing in TRAIN mode (model: {config.model_name}) ---")
+    # Ensure generator is in train mode for 'mn' models if it was previously in eval
+    if 'mn' in config.model_name.lower():
+        efficient_at_spectrogram_generator.train() 
+else: # val mode
+    print(f"--- Running Preprocessing in VAL mode (model: {config.model_name}) ---")
+    # Ensure generator is in eval mode for 'mn' models
+    if 'mn' in config.model_name.lower():
+        efficient_at_spectrogram_generator.eval()
 
 os.makedirs(os.path.dirname(output_npz_path), exist_ok=True)
+print(f"Output NPZ will be saved to: {output_npz_path}")
 
 def load_and_prepare_metadata(config):
     """Loads and prepares the metadata dataframe based on configuration."""

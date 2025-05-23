@@ -52,8 +52,8 @@ def process_audio_file_worker(audio_path, cfg, competition_sci_names, sci_to_pri
     """
     file_detections = []
     analyzer_instance = None
-    original_stdout = sys.stdout 
-    original_stderr = sys.stderr 
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
     captured_stdout_io = io.StringIO()
     captured_stderr_io = io.StringIO()
     worker_error_message = None
@@ -84,7 +84,7 @@ def process_audio_file_worker(audio_path, cfg, competition_sci_names, sci_to_pri
         recording = Recording(
             analyzer=analyzer_instance,
             path=audio_path,
-            lat=6.76, 
+            lat=6.76,
             lon=-74.21,
             date=date_obj,
             min_conf=initial_min_conf, 
@@ -98,7 +98,7 @@ def process_audio_file_worker(audio_path, cfg, competition_sci_names, sci_to_pri
 
         for det in recording.detections:
             sci_name = det.get('scientific_name')
-            if sci_name in competition_sci_names: 
+            if sci_name in competition_sci_names:
                 primary_label = sci_to_prim_label[sci_name]
                 file_detections.append({
                     'filename': filename_full,
@@ -110,7 +110,7 @@ def process_audio_file_worker(audio_path, cfg, competition_sci_names, sci_to_pri
                 })
     except Exception as e:
         # Ensure stdout/stderr are restored before attempting to get value or format error message
-        sys.stdout = original_stdout 
+        sys.stdout = original_stdout
         sys.stderr = original_stderr
         
         # Get captured stderr content
@@ -184,7 +184,7 @@ def generate_labels(config_obj):
     files_with_errors_count = 0
 
     worker_fn = functools.partial(process_audio_file_worker,
-                                  cfg=config_obj, 
+                                  cfg=config_obj,
                                   competition_sci_names=competition_scientific_names,
                                   sci_to_prim_label=sci_to_primary)
 
@@ -206,7 +206,7 @@ def generate_labels(config_obj):
     else:
         final_pseudo_labels_df = pd.DataFrame(all_pseudo_labels) # Use all_pseudo_labels
         print(f"Generated {len(final_pseudo_labels_df)} pseudo-labels (min_conf: {config_obj.BIRDNET_PSEUDO_CONFIDENCE_THRESHOLD}).")
-        
+
     try:
         output_dir = Path(config_obj.train_pseudo_csv_path).parent
         output_dir.mkdir(parents=True, exist_ok=True)

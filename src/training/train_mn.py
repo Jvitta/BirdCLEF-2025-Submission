@@ -615,7 +615,7 @@ def validate(model, loader, criterion, device):
             except Exception as e_auc: # Catch other potential errors like shape mismatches if not caught by check
                 print(f"Error calculating weighted AUC for class {species_name}: {e_auc}. Proceeding unweighted.")
                 class_auc = roc_auc_score(class_targets, class_probs) # Fallback to unweighted
-
+        
         # If class_targets are all 0, precision/recall/f1 for label 1 will be 0 due to zero_division=0
         # Pass sample weights to precision_recall_fscore_support if available and enabled
         current_sample_weights_prfs = None
@@ -647,333 +647,206 @@ def validate(model, loader, criterion, device):
 
     return avg_loss, macro_auc, per_class_metrics_list, all_outputs_cat, all_targets_cat
 
-def run_training(df, config, trial=None, all_spectrograms=None, 
-                 val_spectrogram_data=None, # Dedicated validation spectrograms
-                 custom_run_name=None, hpo_step_offset=0):
+def run_training(
+    main_df: pd.DataFrame, 
+    pseudo_df: pd.DataFrame | None, # Can be None if USE_PSEUDO_LABELS is False or pseudo_df becomes empty
+    config,
+    main_train_spectrograms: dict,
+    main_val_spectrograms: dict,
+    pseudo_train_spectrograms: dict,
+    pseudo_val_spectrograms: dict,
+    trial=None, 
+    custom_run_name=None, 
+    hpo_step_offset=0
+):
     """
-    Runs the training loop. 
-    Uses a fixed soundscape validation set if val_spectrogram_data and config.soundscape_val_path are provided.
-    Otherwise, uses standard K-fold validation.
+    Runs the training loop.
+    Performs separate StratifiedGroupKFold splits for main_df and pseudo_df.
+    Concatenates data for each fold before training.
     """
     is_hpo_trial = trial is not None
     
-    wandb_run = None # Initialize to None
-    if not is_hpo_trial: # Only init if not an HPO trial
+    wandb_run = None 
+    if not is_hpo_trial: 
         actual_run_name = custom_run_name if custom_run_name else f"run_{time.strftime('%Y%m%d-%H%M%S')}"
         wandb_run = wandb.init(
             project="BirdCLEF-2025", 
             config=config.get_wandb_config(), 
             name=actual_run_name,
-            group="full_training", # Always "full_training" for non-HPO
+            group="full_training", 
             job_type="train",
             reinit=True 
         )
-    # No wandb.config.update for HPO trials as W&B is not initialized for them.
 
     print(f"Using Device: {config.device}")
     print(f"Debug Mode: {config.debug}")
     print(f"Using Seed: {config.seed}")
-    print(f"Load Preprocessed Data: {config.LOAD_PREPROCESSED_DATA}")
-    print(f"run_training received {len(all_spectrograms)} pre-loaded samples.")
+    print(f"run_training received {len(main_train_spectrograms)} main train specs, {len(main_val_spectrograms)} main val specs.")
+    if pseudo_df is not None:
+        print(f"run_training received {len(pseudo_train_spectrograms)} pseudo train specs, {len(pseudo_val_spectrograms)} pseudo val specs for {len(pseudo_df)} pseudo_df input samples.")
+    else:
+        print("run_training received no pseudo_df or it was empty.")
 
     os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-    working_df = df.copy() # This is the primary training data (train.csv + rare/pseudo if used)
-
-    # --- Load Fixed Soundscape Validation Metadata (if path is set) --- #
-    df_fixed_soundscape_val_meta = None
-    use_fixed_soundscape_val = False
-    if hasattr(config, 'soundscape_val_path') and config.soundscape_val_path and \
-       val_spectrogram_data is not None and len(val_spectrogram_data) > 0:
-        try:
-            print(f"\n--- Loading Fixed Soundscape Validation Metadata from: {config.soundscape_val_path} ---")
-            df_fixed_soundscape_val_meta = pd.read_csv(config.soundscape_val_path)
-            required_val_meta_cols = ['detection_id', 'original_filename', 'primary_label'] # Ensure these exist
-            if not all(col in df_fixed_soundscape_val_meta.columns for col in required_val_meta_cols):
-                print(f"ERROR: Fixed soundscape validation metadata missing required columns: {required_val_meta_cols}. Will use K-Fold validation.")
-                df_fixed_soundscape_val_meta = None
-            else:
-                # Filter this metadata based on keys in the loaded val_spectrogram_data NPZ
-                original_val_meta_count = len(df_fixed_soundscape_val_meta)
-                df_fixed_soundscape_val_meta = df_fixed_soundscape_val_meta[
-                    df_fixed_soundscape_val_meta['detection_id'].isin(val_spectrogram_data.keys())
-                ].reset_index(drop=True)
-                print(f"  Loaded {len(df_fixed_soundscape_val_meta)} records from soundscape val metadata.")
-                print(f"  Filtered to {len(df_fixed_soundscape_val_meta)} records based on NPZ keys (from {original_val_meta_count}).")
-                if not df_fixed_soundscape_val_meta.empty:
-                    use_fixed_soundscape_val = True
-                    print("  Will use this fixed soundscape set for validation across all folds.")
-                else:
-                    print("  Warning: Fixed soundscape validation metadata is empty after filtering with NPZ keys. Will use K-Fold validation.")
-        except FileNotFoundError:
-            print(f"Warning: Fixed soundscape validation metadata file not found at {config.soundscape_val_path}. Will use K-Fold validation.")
-        except Exception as e_val_meta:
-            print(f"Warning: Error loading or processing fixed soundscape validation metadata: {e_val_meta}. Will use K-Fold validation.")
-    else:
-        print("\nFixed soundscape validation set not configured or validation NPZ not provided/empty. Will use standard K-Fold validation.")
-
-    # --- Filter pseudo-labels based on usage threshold --- 
-    if config.USE_PSEUDO_LABELS and 'data_source' in working_df.columns and 'confidence' in working_df.columns:
-        usage_threshold = config.pseudo_label_usage_threshold
-        initial_count = len(working_df)
-        pseudo_count_before = len(working_df[working_df['data_source'] == 'pseudo'])
+    # --- Prepare main_df for CV ---
+    print("\n--- Preparing main_df for Cross-Validation ---")
+    if main_df.empty:
+        print("CRITICAL ERROR: main_df is empty. Cannot proceed with training.")
+        if wandb_run: wandb_run.finish()
+        sys.exit(1)
         
-        # Identify pseudo rows below threshold
-        rows_to_drop = working_df[
-            (working_df['data_source'] == 'pseudo') &
-            (working_df['confidence'] < usage_threshold)
-        ].index
-        
-        if not rows_to_drop.empty:
-            working_df = working_df.drop(rows_to_drop).reset_index(drop=True)
-            pseudo_count_after = len(working_df[working_df['data_source'] == 'pseudo'])
-            print(f"Applied pseudo-label usage threshold ({usage_threshold}):")
-            print(f"Removed {len(rows_to_drop)} pseudo labels (Confidence < {usage_threshold}).")
-            print(f"Pseudo count: {pseudo_count_before} -> {pseudo_count_after}")
-            print(f"Total training df size: {initial_count} -> {len(working_df)}")
-        else:
-            print(f"No pseudo-labels found below usage threshold {usage_threshold}. All {pseudo_count_before} pseudo labels kept.")
-    elif config.USE_PSEUDO_LABELS:
-         print("Warning: Could not filter pseudo-labels by confidence. 'data_source' or 'confidence' column missing.")
-    # --- End filtering --- 
+    main_df_processed = main_df.copy() # Start with a copy of the input main_df
 
-    if config.USE_RARE_DATA:
-        print("\n--- Loading Rare Species Data (USE_RARE_DATA=True) ---")
-        try:
-            rare_train_df_full = pd.read_csv(config.train_rare_csv_path)
-            rare_train_df_full['filepath'] = rare_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_rare_dir, f))
-            rare_train_df_full['samplename'] = rare_train_df_full.filename.map(
-                lambda x: str(x.split('/')[0]) + '-' + str(x.split('/')[-1].split('.')[0])
-            )
-            rare_train_df_full['data_source'] = 'rare' # Add data source identifier
-            # Ensure secondary_labels exists, even if empty, for consistent concatenation
-            if 'secondary_labels' not in rare_train_df_full.columns:
-                    rare_train_df_full['secondary_labels'] = [[] for _ in range(len(rare_train_df_full))]
-
-            required_cols_rare = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source']
-            rare_train_df = rare_train_df_full[required_cols_rare].copy()
-            print(f"Loaded and selected columns for {len(rare_train_df)} rare training samples.")
-            del rare_train_df_full; gc.collect()
-            
-            # Concatenate with main training data
-            working_df = pd.concat([working_df, rare_train_df], ignore_index=True)
-            print(f"Combined DataFrame size (main + rare): {len(working_df)} samples.")
-
-        except Exception as e:
-            print(f"CRITICAL ERROR loading or processing rare labels CSV {config.train_rare_csv_path}: {e}")
-            sys.exit(1)
-    else:
-        print("\nSkipping rare-species data (USE_RARE_DATA=False).")
-
-    # Final check on combined dataframe and spectrograms
-    print(f"\nFinal training dataframe size: {len(working_df)} samples.")
-    
-    # --- Filter training_df based on loaded spectrogram keys if configured to load them --- #
-    if config.LOAD_PREPROCESSED_DATA:
-        print(f"\nConfigured to load preprocessed data. Filtering dataframe...")
-        print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
-        
-        original_count = len(working_df)
-
-        loaded_keys = set(all_spectrograms.keys())
-        working_df = working_df[working_df['samplename'].isin(loaded_keys)].reset_index(drop=True)
-        filtered_count = len(working_df)
-        
-        removed_count = original_count - filtered_count
-        if removed_count > 0:
-            print(f"  WARNING: Removed {removed_count} samples from training_df because their spectrograms were not found in the loaded NPZ file(s).")
-        
-        print(f"  Final training_df size after filtering: {filtered_count} samples.")
-    else:
-        print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
-
-    # --- BEGIN: Global Oversampling of Rare Classes (Before K-Fold Split) ---
+    # Global Oversampling for main_df_processed
     if config.USE_GLOBAL_OVERSAMPLING:
-        min_samples_per_class_global = config.GLOBAL_OVERSAMPLING_MIN_SAMPLES
-        print(f"\nApplying global oversampling for classes with < {min_samples_per_class_global} samples...")
+        min_samples_global = config.GLOBAL_OVERSAMPLING_MIN_SAMPLES
+        print(f"Applying global oversampling to main_df_processed (min samples per class: {min_samples_global})...")
+        class_counts_main = main_df_processed['primary_label'].value_counts()
+        labels_to_oversample_main = class_counts_main[class_counts_main < min_samples_global].index
         
-        class_counts_before_oversampling = working_df['primary_label'].value_counts()
-        labels_to_oversample = class_counts_before_oversampling[class_counts_before_oversampling < min_samples_per_class_global].index
-        
-        oversampled_dfs = [working_df] # Start with the original df
-        
-        if not labels_to_oversample.empty:
-            print(f"  Found {len(labels_to_oversample)} classes to oversample: {list(labels_to_oversample)}")
-            for label in tqdm(labels_to_oversample, desc="Global Oversampling"):
-                class_df = working_df[working_df['primary_label'] == label]
-                current_class_count = len(class_df) # This should be from original df, not accumulating
-                
-                # Re-fetch class_df from the original (non-concatenated) working_df to get correct current_class_count
-                # This is important if a class is oversampled in multiple iterations (though less likely with simple threshold)
-                original_class_df = oversampled_dfs[0][oversampled_dfs[0]['primary_label'] == label] # oversampled_dfs[0] is the original working_df
-                current_class_count = len(original_class_df)
-
-                num_to_add = min_samples_per_class_global - current_class_count
-                
-                if num_to_add > 0 and not original_class_df.empty:
-                    # Simple replication: sample with replacement from the existing samples of this class
-                    replicated_samples = original_class_df.sample(n=num_to_add, replace=True, random_state=config.seed)
-                    oversampled_dfs.append(replicated_samples)
-            
-            if len(oversampled_dfs) > 1: # Only concat if new samples were actually added
-                working_df = pd.concat(oversampled_dfs, ignore_index=True)
-                print(f"  Finished global oversampling. New working_df size: {len(working_df)}")
-            
+        if not labels_to_oversample_main.empty:
+            oversampled_dfs_list_main = [main_df_processed] 
+            for label in tqdm(labels_to_oversample_main, desc="Global Oversampling (Main)"):
+                class_df_main_original_state = main_df_processed[main_df_processed['primary_label'] == label]
+                num_to_add = min_samples_global - len(class_df_main_original_state)
+                if num_to_add > 0 and not class_df_main_original_state.empty:
+                    oversampled_dfs_list_main.append(class_df_main_original_state.sample(n=num_to_add, replace=True, random_state=config.seed))
+            if len(oversampled_dfs_list_main) > 1:
+                 main_df_processed = pd.concat(oversampled_dfs_list_main, ignore_index=True)
+            print(f"  main_df_processed size after global oversampling: {len(main_df_processed)}")
         else:
-            print("  No classes found below the global oversampling threshold.")
-    else:
-        print("\nGlobal oversampling disabled or not configured (USE_GLOBAL_OVERSAMPLING).")
-    # --- END: Global Oversampling of Rare Classes ---
-
-    # --- Create groups for StratifiedGroupKFold with conditional ungrouping --- 
-    GROUP_DIVERSITY_THRESHOLD = 30 # Classes with < this many unique groups will be ungrouped
-
-    print("\nCreating groups for StratifiedGroupKFold with conditional ungrouping...")
+            print("  No classes in main_df_processed needed global oversampling.")
     
-    # 1. Create initial group_id based on lat/lon/author
-    working_df['initial_group_id'] = None
-    mask_complete_info = working_df['latitude'].notna() & \
-                            working_df['longitude'].notna() & \
-                            working_df['author'].notna()
-
-    working_df.loc[mask_complete_info, 'initial_group_id'] = (
-        working_df.loc[mask_complete_info, 'latitude'].astype(str) + '_' + 
-        working_df.loc[mask_complete_info, 'longitude'].astype(str) + '_' + 
-        working_df.loc[mask_complete_info, 'author'].astype(str)
+    # Grouping for main_df_processed
+    GROUP_DIVERSITY_THRESHOLD = getattr(config, 'GROUP_DIVERSITY_THRESHOLD', 30)
+    main_df_processed['initial_group_id'] = (
+        main_df_processed['latitude'].astype(str) + '_' +
+        main_df_processed['longitude'].astype(str) + '_' +
+        main_df_processed['author'].astype(str)
     )
-    # Assign unique group ID for rows with missing lat/lon/author initially
-    # These will also be treated as distinct groups unless their class is common enough
-    # to be subject to potential ungrouping (which is unlikely for these unique IDs).
-    working_df.loc[~mask_complete_info, 'initial_group_id'] = "MISSINGKEY_" + working_df.loc[~mask_complete_info, 'samplename'].astype(str)
+    missing_geo_author_mask_main = main_df_processed['latitude'].isna() | main_df_processed['longitude'].isna() | main_df_processed['author'].isna()
+    main_df_processed.loc[missing_geo_author_mask_main, 'initial_group_id'] = \
+        "MISSINGKEY_" + main_df_processed.loc[missing_geo_author_mask_main, 'samplename'].astype(str)
 
-    # 2. Calculate per-class group counts using 'initial_group_id'
-    print(f"  Calculating group diversity per class (using threshold: < {GROUP_DIVERSITY_THRESHOLD} unique groups for ungrouping)...")
-    class_group_counts = working_df.groupby('primary_label')['initial_group_id'].nunique()
+    class_group_counts_main = main_df_processed.groupby('primary_label')['initial_group_id'].nunique()
+    classes_to_ungroup_main = class_group_counts_main[class_group_counts_main < GROUP_DIVERSITY_THRESHOLD].index.tolist()
+    main_df_processed['cv_group_id'] = main_df_processed['initial_group_id']
+    ungroup_mask_main = main_df_processed['primary_label'].isin(classes_to_ungroup_main)
+    if ungroup_mask_main.any():
+        main_df_processed.loc[ungroup_mask_main, 'cv_group_id'] = "UNGROUPED_ROWID_" + main_df_processed.index[ungroup_mask_main].astype(str)
+    print(f"  Created 'cv_group_id' for main_df_processed ({main_df_processed['cv_group_id'].nunique()} unique groups, {len(classes_to_ungroup_main)} classes ungrouped using threshold {GROUP_DIVERSITY_THRESHOLD}).")
     
-    classes_to_ungroup = class_group_counts[class_group_counts < GROUP_DIVERSITY_THRESHOLD].index.tolist()
-    print(f"  Found {len(classes_to_ungroup)} classes to be ungrouped (samples will get unique group IDs).")
-
-    # 3. Create final 'group_id' column for splitting
-    # Initialize final_group_id with initial_group_id
-    working_df['final_group_id'] = working_df['initial_group_id']
-
-    # For classes identified for ungrouping, assign a TRULY unique group ID to each sample row
-    # This ensures StratifiedGroupKFold can split them to maintain stratification for these rare-group classes.
-    ungroup_mask = working_df['primary_label'].isin(classes_to_ungroup)
-    if ungroup_mask.any(): # Check if there are any samples to ungroup
-        # Create a Series of unique IDs for the rows that need ungrouping
-        # Using a combination of a prefix and the DataFrame index ensures uniqueness for these rows.
-        unique_row_ids = working_df.index[ungroup_mask].astype(str)
-        working_df.loc[ungroup_mask, 'final_group_id'] = "UNGROUPED_ROWID_" + unique_row_ids
-    
-    num_actually_ungrouped_samples = ungroup_mask.sum()
-    if num_actually_ungrouped_samples > 0:
-        print(f"  Assigned unique group IDs to {num_actually_ungrouped_samples} samples belonging to these {len(classes_to_ungroup)} classes.")
-
-    groups = working_df['final_group_id']
-    num_unique_final_groups = groups.nunique()
-    print(f"  Total number of unique groups for StratifiedGroupKFold (after conditional ungrouping): {num_unique_final_groups}")
-
-    if num_unique_final_groups < config.n_fold:
-        print(f"  WARNING: Total unique final groups ({num_unique_final_groups}) is less than n_fold ({config.n_fold}). StratifiedGroupKFold might error or behave unexpectedly.")
-
-    print(f"  Attempting to use StratifiedGroupKFold with {config.n_fold} splits using these final groups.")
+    sgkf_main = StratifiedGroupKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
     try:
-        sgkf = StratifiedGroupKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
-        fold_iterator = sgkf.split(X=working_df, y=working_df['primary_label'], groups=groups)
-        print(f"  Successfully using StratifiedGroupKFold with conditional ungrouping.")
-    except ValueError as e_sgkf:
-        print(f"  WARNING: StratifiedGroupKFold with conditional ungrouping failed: {e_sgkf}")
-        print(f"  This can happen if a group is too small or if a class is present in too few groups even after ungrouping strategy.")
-        print(f"  Falling back to simple StratifiedKFold as a last resort for this run.")
-        # Fallback to StratifiedKFold if StratifiedGroupKFold still fails with modified groups
-        skf = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
-        fold_iterator = skf.split(X=working_df, y=working_df['primary_label'])
-        print(f"  Using StratifiedKFold instead.")
+        main_splits = list(sgkf_main.split(main_df_processed, main_df_processed['primary_label'], groups=main_df_processed['cv_group_id']))
+    except ValueError as e_sgkf_main:
+        print(f"  WARNING: StratifiedGroupKFold for main_df_processed failed: {e_sgkf_main}. Falling back to StratifiedKFold.")
+        skf_main_fallback = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
+        main_splits = list(skf_main_fallback.split(main_df_processed, main_df_processed['primary_label']))
 
+    # --- Prepare pseudo_df for CV (if it was provided and is not empty) ---
+    pseudo_splits = None
+    pseudo_df_processed = None 
+    if pseudo_df is not None and not pseudo_df.empty:
+        print("\n--- Preparing pseudo_df for Cross-Validation ---")
+        pseudo_df_processed = pseudo_df.copy()
+        # No confidence filtering here, as pseudo_df is assumed to be pre-calibrated and deduplicated.
+        
+        if pseudo_df_processed.empty: 
+            print("  pseudo_df_processed is empty (e.g. if input pseudo_df was empty). No pseudo-data will be used in CV.")
+            pseudo_df_processed = None 
+        else:
+            # Global oversampling for pseudo_df should have been done in __main__ before passing to run_training.
+            # The pseudo_df received here is assumed to be ready for CV splitting in terms of sample counts per class.
+            
+            if 'filename' not in pseudo_df_processed.columns:
+                 print("ERROR: 'filename' column missing in pseudo_df_processed. Cannot group. Pseudo-data will not be used for CV splits.")
+                 pseudo_splits = None 
+                 pseudo_df_processed = None 
+            else:
+                pseudo_df_processed['cv_group_id'] = pseudo_df_processed['filename'] 
+                print(f"  Using 'filename' as 'cv_group_id' for pseudo_df_processed ({pseudo_df_processed['cv_group_id'].nunique()} unique groups).")
+                sgkf_pseudo = StratifiedGroupKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
+                try:
+                    pseudo_splits = list(sgkf_pseudo.split(pseudo_df_processed, pseudo_df_processed['primary_label'], groups=pseudo_df_processed['cv_group_id']))
+                except ValueError as e_sgkf_pseudo:
+                    print(f"  WARNING: StratifiedGroupKFold for pseudo_df_processed failed: {e_sgkf_pseudo}. Falling back to StratifiedKFold.")
+                    skf_pseudo_fallback = StratifiedKFold(n_splits=config.n_fold, shuffle=True, random_state=config.seed)
+                    pseudo_splits = list(skf_pseudo_fallback.split(pseudo_df_processed, pseudo_df_processed['primary_label']))
+    else:
+        print("\nNo pseudo_df provided or it was initially empty. No pseudo-data used.")
+        # pseudo_splits remains None, pseudo_df_processed remains None
+
+    # --- Fold Loop Starts Here ---
     all_folds_history = []
     best_epoch_details_all_folds = [] 
     single_fold_best_auc = 0.0 
-    overall_species_ids_for_run = None # Initialize to store species_ids
+    overall_species_ids_for_run = None 
+    logged_original_samplenames_for_spectrograms = [] 
     
-    # New tracker for spectrograms logged in train_one_epoch
-    logged_original_samplenames_for_spectrograms = [] # Using a list to preserve order of first N logged
-    
-    try: # Wrap the main training loop in try/finally for wandb.finish()
-        for fold, (train_idx, val_idx_from_kfold) in enumerate(fold_iterator): # val_idx_from_kfold is now potentially unused for val_df
-            if fold not in config.selected_folds:
+    try: 
+        for fold_idx in range(config.n_fold):
+            if fold_idx not in config.selected_folds:
                 continue
 
-            # --- wandb: Define custom step for this fold's metrics ---
-            if wandb_run: # Check if wandb run is active
-                wandb.define_metric(f"fold_{fold}/epoch")
-                wandb.define_metric(f"fold_{fold}/*", step_metric=f"fold_{fold}/epoch")
+            if wandb_run: 
+                wandb.define_metric(f"fold_{fold_idx}/epoch")
+                wandb.define_metric(f"fold_{fold_idx}/*", step_metric=f"fold_{fold_idx}/epoch")
 
-            print(f'\n{"="*30} Fold {fold} {"="*30}')
-            # --- Initialize history for the CURRENT fold --- #
-            fold_history = {
-                'epochs': [],
-                'train_loss': [], 'val_loss': [],
-                'train_auc': [], 'val_auc': []
-            }
+            print(f'\n{"="*30} Fold {fold_idx} {"="*30}')
+            fold_history = {'epochs': [], 'train_loss': [], 'val_loss': [], 'train_auc': [], 'val_auc': []}
 
-            train_df_fold = working_df.iloc[train_idx].reset_index(drop=True)
+            # Get main data splits for the current fold
+            main_train_indices, main_val_indices = main_splits[fold_idx]
+            fold_train_main_df = main_df_processed.iloc[main_train_indices].reset_index(drop=True)
+            fold_val_main_df = main_df_processed.iloc[main_val_indices].reset_index(drop=True)
 
-            # --- Determine Validation DataFrame and Spectrogram Source --- #
-            if use_fixed_soundscape_val and df_fixed_soundscape_val_meta is not None:
-                val_df_fold = df_fixed_soundscape_val_meta.copy() # Use the pre-loaded, pre-filtered fixed val set
-                current_val_spectrogram_source_for_dataset = val_spectrogram_data
-                print(f"Fold {fold}: Using FIXED soundscape validation set ({len(val_df_fold)} detections).")
-            else: # Fallback to standard K-Fold validation split from working_df
-                val_df_fold = working_df.iloc[val_idx_from_kfold].reset_index(drop=True)
-                current_val_spectrogram_source_for_dataset = all_spectrograms # Use main spectrograms for this val split
-                print(f"Fold {fold}: Using K-Fold validation split from training data ({len(val_df_fold)} samples).")
-                # Filter this K-Fold val_df_fold if using main spectrograms and LOAD_PREPROCESSED_DATA is true
-                if config.LOAD_PREPROCESSED_DATA and all_spectrograms is not None:
-                    original_val_fold_count_kfold = len(val_df_fold)
-                    val_df_fold = val_df_fold[val_df_fold['samplename'].isin(all_spectrograms.keys())].reset_index(drop=True)
-                    if len(val_df_fold) < original_val_fold_count_kfold:
-                        print(f"  Filtered K-Fold val_df_fold to {len(val_df_fold)} samples based on main NPZ keys.")
+            # Initialize pseudo data splits as empty DataFrames
+            fold_train_pseudo_df = pd.DataFrame()
+            fold_val_pseudo_df = pd.DataFrame()
+
+            # Get pseudo data splits if available and processed
+            if pseudo_splits and pseudo_df_processed is not None and not pseudo_df_processed.empty:
+                if fold_idx < len(pseudo_splits): 
+                    pseudo_train_indices, pseudo_val_indices = pseudo_splits[fold_idx]
+                    fold_train_pseudo_df = pseudo_df_processed.iloc[pseudo_train_indices].reset_index(drop=True)
+                    fold_val_pseudo_df = pseudo_df_processed.iloc[pseudo_val_indices].reset_index(drop=True)
+                else:
+                    print(f"Warning: fold_idx {fold_idx} is out of bounds for pseudo_splits (len {len(pseudo_splits)}). No pseudo data for this fold.")
             
-            print(f'Training set size: {len(train_df_fold)} samples')
-            print(f'Initial validation set size (after source filter, before NPZ filter): {len(val_df_fold)} samples')
+            # Concatenate main and pseudo data for this fold
+            train_df_fold = pd.concat([fold_train_main_df, fold_train_pseudo_df], ignore_index=True)
+            val_df_fold = pd.concat([fold_val_main_df, fold_val_pseudo_df], ignore_index=True)
 
-            # --- DIAGNOSTIC PRINTS FOR CLASS DISTRIBUTION (on the now potentially filtered val_df_fold) ---
-            print(f"\n--- Fold {fold} Class Distribution Diagnostics ---")
-            # Training set distribution
-            train_label_counts = train_df_fold['primary_label'].value_counts().sort_index()
-            print(f"Fold {fold} - Training set primary_label distribution ({len(train_label_counts)} classes):")
+            # Shuffle the concatenated DataFrames
+            train_df_fold = train_df_fold.sample(frac=1, random_state=config.seed + fold_idx).reset_index(drop=True)
+            val_df_fold = val_df_fold.sample(frac=1, random_state=config.seed + fold_idx + 100).reset_index(drop=True)
+            
+            print(f'Training set size (fold {fold_idx}): {len(train_df_fold)} (Main: {len(fold_train_main_df)}, Pseudo: {len(fold_train_pseudo_df)})')
+            print(f'Validation set size (fold {fold_idx}): {len(val_df_fold)} (Main: {len(fold_val_main_df)}, Pseudo: {len(fold_val_pseudo_df)})')
 
-            # Validation set distribution
-            val_label_counts = val_df_fold['primary_label'].value_counts().sort_index()
-            print(f"Fold {fold} - Validation set primary_label distribution ({len(val_label_counts)} classes):")
-
-            if not train_label_counts.empty and not val_label_counts.empty:
-                train_classes = set(train_label_counts.index)
-                val_classes = set(val_label_counts.index)
-
-                classes_in_train_only = train_classes - val_classes
-                classes_in_val_only = val_classes - train_classes # Should be rare
-
-                if classes_in_train_only:
-                    print(f"WARNING: Fold {fold} - Classes in TRAIN but NOT in VALIDATION ({len(classes_in_train_only)} classes)")
-                if classes_in_val_only:
-                    print(f"WARNING: Fold {fold} - Classes in VALIDATION but NOT in TRAIN ({len(classes_in_val_only)} classes)")
-
-                # Check for classes with very few validation samples (e.g., < 5, or configurable)
-                low_sample_threshold = 5 # Can be adjusted
-                low_sample_val_classes = val_label_counts[val_label_counts < low_sample_threshold]
-                if not low_sample_val_classes.empty:
-                    print(f"WARNING: Fold {fold} - Classes in VALIDATION with < {low_sample_threshold} samples ({len(low_sample_val_classes)} classes):")
-            print(f"--- End Fold {fold} Class Distribution Diagnostics ---\n")
-            # --- END DIAGNOSTIC PRINTS ---
-
-            # Pass the pre-loaded dictionary (or None) to the Dataset
-            # NOW, pass both the hardcoded targets AND the shared tracking set (REMOVED THESE)
-            train_dataset = BirdCLEFDataset(train_df_fold, config, mode='train', all_spectrograms=all_spectrograms)
-            # Use the potentially filtered val_df_fold and the correct spectrogram source for val_dataset
-            val_dataset = BirdCLEFDataset(val_df_fold, config, mode='valid', all_spectrograms=current_val_spectrogram_source_for_dataset)
+            # Optional: Detailed class distribution diagnostics (can be re-enabled if needed)
+            # print(f"\n--- Fold {fold_idx} Class Distribution Diagnostics ---")
+            # ... (diagnostics code) ...
+            # print(f"--- End Fold {fold_idx} Class Distribution Diagnostics ---\n")
+            
+            # Create Datasets for the current fold
+            train_dataset = BirdCLEFDataset(
+                df_fold=train_df_fold, 
+                config=config, 
+                mode='train', 
+                main_spectrograms=main_train_spectrograms, # Pass the dict for main train specs
+                pseudo_spectrograms=pseudo_train_spectrograms # Pass the dict for pseudo train specs
+            )
+            val_dataset = BirdCLEFDataset(
+                df_fold=val_df_fold, 
+                config=config, 
+                mode='valid', 
+                main_spectrograms=main_val_spectrograms,   # Pass the dict for main val specs
+                pseudo_spectrograms=pseudo_val_spectrograms  # Pass the dict for pseudo val specs
+            )
 
             # Get species_ids from the first validation dataset instance created
             if overall_species_ids_for_run is None and hasattr(val_dataset, 'species_ids'):
@@ -981,32 +854,25 @@ def run_training(df, config, trial=None, all_spectrograms=None,
 
             train_sampler = None
             shuffle_train_loader = True
-
             if config.USE_WEIGHTED_SAMPLING:
-                print("Using WeightedRandomSampler for training data based on 'samplename'.")
-                # Extract species identifiers from the 'samplename' column of the current fold's training data
-                # Assumes train_df_fold['samplename'] exists and is in format 'species_id-other_info'
+                print("Using WeightedRandomSampler for training data...")
                 try:
-                    all_species_ids_for_fold_samples = [sn.split('-')[0] for sn in train_df_fold['samplename']]
-                    species_id_counts_in_fold = Counter(all_species_ids_for_fold_samples)
+                    class_counts_in_fold = train_df_fold['primary_label'].value_counts()
+                    # Using 1 / log(count + C) where C is small to avoid log(1)=0 or log of small numbers blowing up.
+                    wrs_log_constant = getattr(config, 'WRS_LOG_CONSTANT', 2) # Default to 2 if not in config
+                    weights_per_class = {label: 1.0 / math.log(count + wrs_log_constant) for label, count in class_counts_in_fold.items()}
+                    sample_weights_for_sampler = train_df_fold['primary_label'].map(weights_per_class).tolist()
                     
-                    # Calculate log-based weights: 1 / log(count + 1)
-                    log_weights_raw = []
-                    for sid in all_species_ids_for_fold_samples:
-                        count = species_id_counts_in_fold[sid] 
-                        weight = 1.0 / math.log(count + 1) 
-                        log_weights_raw.append(weight)
-
-                    weights_tensor = torch.tensor(log_weights_raw, dtype=torch.float)
+                    weights_tensor = torch.tensor(sample_weights_for_sampler, dtype=torch.float)
                     train_sampler = WeightedRandomSampler(weights_tensor, num_samples=len(weights_tensor), replacement=True)
-                    shuffle_train_loader = False # Sampler handles shuffling
-                    print(f"  WeightedRandomSampler created for fold {fold} with {len(weights_tensor)} log-based weights.")
+                    shuffle_train_loader = False 
+                    print(f"  WeightedRandomSampler created for fold {fold_idx} using primary_label log-based weights (log_constant={wrs_log_constant}).")
                 except Exception as e_sampler:
-                    print(f"ERROR creating WeightedRandomSampler for fold {fold}: {e_sampler}. Defaulting to shuffle=True")
+                    print(f"ERROR creating WeightedRandomSampler for fold {fold_idx}: {e_sampler}. Defaulting to shuffle=True")
                     train_sampler = None
                     shuffle_train_loader = True
             else:
-                print("Not using WeightedRandomSampler for training data. Standard shuffling will be used.")
+                print("Not using WeightedRandomSampler for training data.")
 
             train_loader = DataLoader(
                 train_dataset,
@@ -1044,7 +910,7 @@ def run_training(df, config, trial=None, all_spectrograms=None,
                         input_dim_f=config.TARGET_SHAPE[0], # Use TARGET_SHAPE from config
                         input_dim_t=config.TARGET_SHAPE[1], # Use TARGET_SHAPE from config
                         dropout=config.dropout # General dropout from config
-                    ).to(config.device)
+                ).to(config.device)
                 print(f"  MobileNet '{config.model_name}' instantiated with input shape {config.TARGET_SHAPE}.")
             elif "efficientnet" in config.model_name.lower():
                 print(f"Loading BirdCLEFModel (EfficientNet): {config.model_name}")
@@ -1111,12 +977,12 @@ def run_training(df, config, trial=None, all_spectrograms=None,
 
                 # --- wandb logging for epoch metrics ---
                 log_metrics = {
-                    f'fold_{fold}/epoch': epoch, # Log the actual epoch number for this fold
-                    f'fold_{fold}/train_loss': train_loss,
-                    f'fold_{fold}/train_auc': train_auc,
-                    f'fold_{fold}/val_loss': val_loss,
-                    f'fold_{fold}/val_auc': val_auc,
-                    f'fold_{fold}/lr': optimizer.param_groups[0]['lr']
+                    f'fold_{fold_idx}/epoch': epoch, # Log the actual epoch number for this fold
+                    f'fold_{fold_idx}/train_loss': train_loss,
+                    f'fold_{fold_idx}/train_auc': train_auc,
+                    f'fold_{fold_idx}/val_loss': val_loss,
+                    f'fold_{fold_idx}/val_auc': val_auc,
+                    f'fold_{fold_idx}/lr': optimizer.param_groups[0]['lr']
                 }
                 if wandb_run: # Check if wandb run is active
                     wandb.log(log_metrics) # Let wandb use the defined step_metric
@@ -1140,15 +1006,15 @@ def run_training(df, config, trial=None, all_spectrograms=None,
                     if should_report_this_hpo_step:
                         # print(f"DEBUG HPO: Trial {trial.number}, REPORTING val_auc {val_auc:.4f} for global_step {current_global_step}.") # Optional debug
                         trial.report(val_auc, current_global_step) # Report intermediate val_auc with global step
-                        if trial.should_prune():
-                            print(f"  Pruning HPO trial {trial.number} based on value at global_step {current_global_step} (val_auc: {val_auc:.4f}).")
-                            # Clean up before pruning to release GPU memory if possible for next trial
-                            del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
-                            if 'train_df_fold' in locals(): del train_df_fold
-                            if 'val_df_fold' in locals(): del val_df_fold
-                            torch.cuda.empty_cache()
-                            gc.collect()
-                            raise optuna.TrialPruned() # Raise exception to stop training
+                    if trial.should_prune():
+                        print(f"  Pruning HPO trial {trial.number} based on value at global_step {current_global_step} (val_auc: {val_auc:.4f}).")
+                        # Clean up before pruning to release GPU memory if possible for next trial
+                        del model, optimizer, criterion, scheduler, train_loader, val_loader, train_dataset, val_dataset
+                        if 'train_df_fold' in locals(): del train_df_fold
+                        if 'val_df_fold' in locals(): del val_df_fold
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        raise optuna.TrialPruned() # Raise exception to stop training
 
                 # --- Model Checkpointing --- #
                 if val_auc > best_val_auc:
@@ -1171,7 +1037,7 @@ def run_training(df, config, trial=None, all_spectrograms=None,
                         # Optionally, store per-class metrics in checkpoint if desired, though it can make files large
                         # 'val_per_class_metrics': val_per_class_metrics 
                     }
-                    save_path = os.path.join(config.MODEL_OUTPUT_DIR, f"{config.model_name}_fold{fold}_best.pth")
+                    save_path = os.path.join(config.MODEL_OUTPUT_DIR, f"{config.model_name}_fold{fold_idx}_best.pth")
                     try:
                         torch.save(checkpoint, save_path)
                         print(f"  Model saved to {save_path}")
@@ -1180,12 +1046,12 @@ def run_training(df, config, trial=None, all_spectrograms=None,
                 # --- EPOCH LOOP ENDS HERE ---
 
             # --- Code to run AFTER all epochs for the current FOLD are done ---
-            print(f"\nFinished Fold {fold}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
+            print(f"\nFinished Fold {fold_idx}. Best Validation AUC: {best_val_auc:.4f} at epoch {best_epoch}")
             
             # New: Store the best epoch details for this fold for later OOF aggregation
             if best_epoch_val_per_class_metrics is not None: # Ensure we have data from a best epoch
                 best_epoch_details_all_folds.append({
-                    'fold': fold,
+                    'fold': fold_idx,
                     'best_val_auc': best_val_auc,
                     'best_epoch': best_epoch,
                     'per_class_metrics': best_epoch_val_per_class_metrics,
@@ -1195,7 +1061,7 @@ def run_training(df, config, trial=None, all_spectrograms=None,
 
             # Log best AUC for this fold to wandb summary for easy viewing
             if wandb_run: # Check if wandb run is active
-                wandb.summary[f'fold_{fold}_best_val_auc'] = best_val_auc
+                wandb.summary[f'fold_{fold_idx}_best_val_auc'] = best_val_auc
             single_fold_best_auc = best_val_auc
 
             all_folds_history.append(fold_history)
@@ -1453,13 +1319,20 @@ def run_training(df, config, trial=None, all_spectrograms=None,
 
 if __name__ == "__main__":
     print("\n--- Initializing Training Script ---")
-    print(f"Using configuration: LOAD_PREPROCESSED_DATA={config.LOAD_PREPROCESSED_DATA}, USE_PSEUDO_LABELS={config.USE_PSEUDO_LABELS}")
+    print(f"Using configuration: USE_PSEUDO_LABELS={config.USE_PSEUDO_LABELS}, USE_RARE_DATA={config.USE_RARE_DATA}")
+    print(f"Model Name: {config.model_name}")
 
     set_seed(config.seed)
 
-    all_spectrograms = None 
+    main_df = pd.DataFrame()
+    pseudo_df = None 
 
-    print("Loading main training metadata...")
+    main_train_specs = {}
+    main_val_specs = {}
+    pseudo_train_specs = {}
+    pseudo_val_specs = {}
+
+    print("\n--- Loading Main Training Metadata ---")
     try:
         main_train_df_full = pd.read_csv(config.train_csv_path)
         main_train_df_full['filepath'] = main_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_dir, f))
@@ -1467,128 +1340,154 @@ if __name__ == "__main__":
         main_train_df_full['samplename'] = main_train_df_full.filename.map(lambda x: x.split('/')[0] + '-' + x.split('/')[-1].split('.')[0])
         main_train_df_full['data_source'] = 'main'
         
-        # Select only necessary columns for training
-        required_cols_main = ['samplename', 'primary_label', 'secondary_labels', 'filepath', 'filename', 'data_source', 'latitude', 'longitude', 'author'] # Added author
-        main_train_df = main_train_df_full[required_cols_main].copy()
-        print(f"Loaded and selected columns for {len(main_train_df)} main training samples.")
+        required_cols_main = ['filename', 'primary_label', 'secondary_labels', 'filepath', 'data_source', 'latitude', 'longitude', 'author', 'samplename']
+        main_df = main_train_df_full[required_cols_main].copy()
+        print(f"Loaded {len(main_df)} main training samples from {config.train_csv_path}.")
         del main_train_df_full; gc.collect()
     except Exception as e:
         print(f"CRITICAL ERROR loading main training CSV {config.train_csv_path}: {e}. Exiting.")
         sys.exit(1)
 
-    training_df = main_train_df 
-
-    # --- Load Preprocessed Spectrograms (if configured) --- #
-    if config.LOAD_PREPROCESSED_DATA:
-        all_spectrograms = {} 
-        
-        # Load PRIMARY spectrograms
-        primary_npz_path = config.PREPROCESSED_NPZ_PATH
-        print(f"Attempting to load primary spectrograms from: {primary_npz_path}")
+    if config.USE_RARE_DATA:
+        print("\n--- Loading Rare Species Data ---")
         try:
-            start_load_time = time.time()
-            with np.load(primary_npz_path) as data_archive:
-                primary_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Primary Specs")}
-            end_load_time = time.time()
-            all_spectrograms.update(primary_specs)
-            print(f"Successfully loaded {len(primary_specs)} primary samples in {end_load_time - start_load_time:.2f} seconds.")
-            del primary_specs; gc.collect()
+            rare_train_df_full = pd.read_csv(config.train_rare_csv_path)
+            rare_train_df_full['filepath'] = rare_train_df_full['filename'].apply(lambda f: os.path.join(config.train_audio_rare_dir, f))
+            rare_train_df_full['samplename'] = rare_train_df_full.filename.map(lambda x: str(x.split('/')[0]) + '-' + str(x.split('/')[-1].split('.')[0]))
+            rare_train_df_full['data_source'] = 'main' # Treat as 'main' for consistency in key handling
+            
+            # Ensure all necessary columns exist, adding defaults for geo/author if missing
+            for col in ['latitude', 'longitude', 'author']:
+                if col not in rare_train_df_full.columns:
+                    rare_train_df_full[col] = np.nan 
+            if 'secondary_labels' not in rare_train_df_full.columns:
+                 rare_train_df_full['secondary_labels'] = [[] for _ in range(len(rare_train_df_full))]
+
+            rare_df = rare_train_df_full[required_cols_main].copy() # Use same required_cols_main
+            print(f"Loaded {len(rare_df)} rare training samples from {config.train_rare_csv_path}.")
+            main_df = pd.concat([main_df, rare_df], ignore_index=True)
+            print(f"Combined main_df size (main + rare): {len(main_df)} samples.")
+            del rare_train_df_full, rare_df; gc.collect()
         except Exception as e:
-            print(f"CRITICAL ERROR loading primary NPZ file {primary_npz_path}: {e}")
+            print(f"ERROR loading or processing rare labels CSV {config.train_rare_csv_path}: {e}")
             sys.exit(1)
 
-        # --- Conditionally Load PSEUDO-LABEL Data & Spectrograms --- #
-        if config.USE_PSEUDO_LABELS:
-            print("\n--- Loading Pseudo-Label Data (USE_PSEUDO_LABELS=True) ---")
+    if config.USE_PSEUDO_LABELS:
+        print("\n--- Loading Pseudo-Label Metadata ---")
+        try:
+            pseudo_labels_df_full = pd.read_csv(config.soundscape_pseudo_calibrated_csv_path)
+            # 'samplename' for pseudo-data is the direct key for NPZ files
+            pseudo_labels_df_full['samplename'] = pseudo_labels_df_full.apply(
+                    lambda row: f"{row['filename']}_{int(row['start_time'])}_{int(row['end_time'])}", axis=1)
+            pseudo_labels_df_full['filepath'] = pseudo_labels_df_full['filename'].apply(lambda f: os.path.join(config.unlabeled_audio_dir, f))
+            pseudo_labels_df_full['data_source'] = 'pseudo'
             
-            try:
-                pseudo_labels_df_full = pd.read_csv(config.soundscape_pseudo_csv_path)
-                if not pseudo_labels_df_full.empty:
-                    # Create required derived columns
-                    pseudo_labels_df_full['samplename'] = pseudo_labels_df_full.apply(
-                        lambda row: f"{row['filename']}_{int(row['start_time'])}_{int(row['end_time'])}", axis=1
-                    )
-                    pseudo_labels_df_full['filepath'] = pseudo_labels_df_full['filename'].apply(lambda f: os.path.join(config.unlabeled_audio_dir, f))
-                    pseudo_labels_df_full['data_source'] = 'pseudo' # Add data source identifier
-                    
-                    # Select necessary columns including confidence for filtering later
-                    required_cols_pseudo = ['samplename', 'primary_label', 'filepath', 'filename', 'data_source', 'confidence'] # Include data_source AND confidence
-                    pseudo_labels_df = pseudo_labels_df_full[required_cols_pseudo].copy()
-                    print(f"Loaded and selected columns (including confidence) for {len(pseudo_labels_df)} pseudo labels.")
-                    del pseudo_labels_df_full; gc.collect()
+            # --- Deduplicate pseudo_labels_df_full based on 'samplename' BEFORE further processing ---
+            original_pseudo_rows = len(pseudo_labels_df_full)
+            pseudo_labels_df_full = pseudo_labels_df_full.drop_duplicates(subset=['samplename'], keep='first').reset_index(drop=True)
+            deduplicated_count = original_pseudo_rows - len(pseudo_labels_df_full)
+            if deduplicated_count > 0:
+                print(f"  Deduplicated pseudo_labels_df: Removed {deduplicated_count} rows with duplicate 'samplename's. Kept first occurrence.")
+            print(f"  Size of pseudo_labels_df after deduplication: {len(pseudo_labels_df_full)}")
+            # --- End Deduplication ---
 
-                    # Load pseudo spectrograms
-                    pseudo_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, 'pseudo_spectrograms.npz')
-                    print(f"Attempting to load pseudo spectrograms from: {pseudo_npz_path}")
-                    
-                    try:
-                        start_load_time = time.time()
-                        with np.load(pseudo_npz_path) as data_archive:
-                            pseudo_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Pseudo Specs")}
-                        end_load_time = time.time()
-                        all_spectrograms.update(pseudo_specs) # Merge into the main dictionary
-                        print(f"Successfully loaded and merged {len(pseudo_specs)} pseudo samples in {end_load_time - start_load_time:.2f} seconds.")
-                        del pseudo_specs; gc.collect()
-                        
-                        training_df = pd.concat([training_df, pseudo_labels_df], ignore_index=True)
-                        print(f"Combined DataFrame size: {len(training_df)} samples.")
-                        
-                    except Exception as e:
-                         print(f"ERROR loading pseudo NPZ file {pseudo_npz_path}: {e}")
-                         print("Continuing training without pseudo-labels due to NPZ loading error.")
-                else:
-                    print("Pseudo labels CSV found but is empty. Skipping.")
+            required_cols_pseudo = ['samplename', 'primary_label', 'filepath', 'filename', 'data_source', 'confidence']
+            # Add geo/author as NaN for pseudo_df if not present, for consistency with main_df structure
+            for col in ['latitude', 'longitude', 'author', 'secondary_labels']:
+                if col not in pseudo_labels_df_full.columns:
+                    if col == 'secondary_labels':
+                        pseudo_labels_df_full[col] = [[] for _ in range(len(pseudo_labels_df_full))]
+                    else:
+                        pseudo_labels_df_full[col] = np.nan
 
-            except Exception as e:
-                print(f"CRITICAL ERROR loading or processing pseudo labels CSV {config.soundscape_pseudo_csv_path}: {e}")
-                sys.exit(1)
-        else:
-            print("\nSkipping pseudo-label data (USE_PSEUDO_LABELS=False).")
+            all_expected_cols_pseudo = required_cols_pseudo + [c for c in ['latitude', 'longitude', 'author', 'secondary_labels'] if c not in required_cols_pseudo and c in pseudo_labels_df_full.columns]
+            pseudo_df = pseudo_labels_df_full[all_expected_cols_pseudo].copy()
+            print(f"Loaded and prepared {len(pseudo_df)} pseudo-label samples from {config.soundscape_pseudo_calibrated_csv_path}.")
+            del pseudo_labels_df_full; gc.collect()
+        except Exception as e:
+            print(f"ERROR loading or processing pseudo labels CSV {config.soundscape_pseudo_calibrated_csv_path}: {e}")
+            pseudo_df = pd.DataFrame() 
 
-    # Final check on combined dataframe and spectrograms
-    print(f"\nFinal training dataframe size: {len(training_df)} samples.")
+    print(f"\n--- Loading Preprocessed Spectrograms ({config.model_name}) ---")
     
-    # --- Filter training_df based on loaded spectrogram keys if configured to load them --- #
-    if config.LOAD_PREPROCESSED_DATA:
-        print(f"\nConfigured to load preprocessed data. Filtering dataframe...")
-        print(f"Total pre-loaded spectrogram keys available: {len(all_spectrograms)}")
-        
-        original_count = len(training_df)
-
-        loaded_keys = set(all_spectrograms.keys())
-        training_df = training_df[training_df['samplename'].isin(loaded_keys)].reset_index(drop=True)
-        filtered_count = len(training_df)
-        
-        removed_count = original_count - filtered_count
-        if removed_count > 0:
-            print(f"  WARNING: Removed {removed_count} samples from training_df because their spectrograms were not found in the loaded NPZ file(s).")
-        
-        print(f"  Final training_df size after filtering: {filtered_count} samples.")
-    else:
-        print("\nWarning: all_spectrograms is None. Cannot filter training_df by loaded keys (which is expected if not loading preprocessed data).")
-
-    # --- Load Preprocessed Validation Spectrograms (if available) ---
-    loaded_val_spectrograms = None # Initialize
-
-    val_npz_path = config.SOUNDSCAPE_VAL_NPZ_PATH
-    print(f"\nAttempting to load DEDICATED SOUNDSCAPE VALIDATION spectrograms from: {val_npz_path}")
+    main_train_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, f"spectrograms_{config.model_name}_train.npz")
+    main_val_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, f"spectrograms_{config.model_name}_val.npz")
+    pseudo_train_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, f"pseudo_spectrograms_{config.model_name}_train.npz")
+    pseudo_val_npz_path = os.path.join(config._PREPROCESSED_OUTPUT_DIR, f"pseudo_spectrograms_{config.model_name}_val.npz")
+    
+    print(f"Attempting to load MAIN TRAIN spectrograms from: {main_train_npz_path}")
     try:
-        start_load_time_val = time.time()
-        with np.load(val_npz_path) as data_archive_val:
-            loaded_val_spectrograms = {key: data_archive_val[key] for key in tqdm(data_archive_val.keys(), desc="Loading Soundscape VAL Specs")}
-        end_load_time_val = time.time()
-        print(f"Successfully loaded {len(loaded_val_spectrograms) if loaded_val_spectrograms is not None else 0} DEDICATED SOUNDSCAPE VALIDATION specs in {end_load_time_val - start_load_time_val:.2f} seconds.")
-        if loaded_val_spectrograms is not None and not loaded_val_spectrograms: # Check if loaded but empty
-            print("Warning: DEDICATED SOUNDSCAPE VALIDATION NPZ file was loaded but contained no spectrograms.")
-    except FileNotFoundError:
-        print(f"INFO: DEDICATED SOUNDSCAPE VALIDATION NPZ file not found at {val_npz_path}. Will use K-Fold validation or main spectrograms for validation.")
-        loaded_val_spectrograms = None 
-    except Exception as e_val_load:
-        print(f"ERROR loading DEDICATED SOUNDSCAPE VALIDATION NPZ file {val_npz_path}: {e_val_load}. Proceeding without it.")
-        loaded_val_spectrograms = None 
+        with np.load(main_train_npz_path) as data_archive:
+            main_train_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Main Train Specs")}
+        print(f"Successfully loaded {len(main_train_specs)} main train spectrograms.")
+    except Exception as e:
+        print(f"ERROR loading main train NPZ file {main_train_npz_path}: {e}. Main train specs will be empty.")
 
-    run_training(training_df, config, all_spectrograms=all_spectrograms, 
-                 val_spectrogram_data=loaded_val_spectrograms, # Pass the loaded validation specs
-                 custom_run_name=cmd_args.run_name)
+    print(f"Attempting to load MAIN VAL spectrograms from: {main_val_npz_path}")
+    try:
+        with np.load(main_val_npz_path) as data_archive:
+            main_val_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Main Val Specs")}
+        print(f"Successfully loaded {len(main_val_specs)} main val spectrograms.")
+    except Exception as e:
+        print(f"ERROR loading main val NPZ file {main_val_npz_path}: {e}. Main val specs will be empty.")
+
+    if config.USE_PSEUDO_LABELS:
+        print(f"Attempting to load PSEUDO TRAIN spectrograms from: {pseudo_train_npz_path}")
+        try:
+            with np.load(pseudo_train_npz_path) as data_archive:
+                pseudo_train_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Pseudo Train Specs")}
+            print(f"Successfully loaded {len(pseudo_train_specs)} pseudo train spectrograms.")
+        except Exception as e:
+            print(f"ERROR loading pseudo train NPZ file {pseudo_train_npz_path}: {e}. Pseudo train specs will be empty.")
+
+        print(f"Attempting to load PSEUDO VAL spectrograms from: {pseudo_val_npz_path}")
+        try:
+            with np.load(pseudo_val_npz_path) as data_archive:
+                pseudo_val_specs = {key: data_archive[key] for key in tqdm(data_archive.keys(), desc="Loading Pseudo Val Specs")}
+            print(f"Successfully loaded {len(pseudo_val_specs)} pseudo val spectrograms.")
+        except Exception as e:
+            print(f"ERROR loading pseudo val NPZ file {pseudo_val_npz_path}: {e}. Pseudo val specs will be empty.")
+    
+    print("\n--- Filtering DataFrames by TRAIN Spectrogram Availability ---")
+    original_main_count = len(main_df)
+    loaded_keys_main = set(main_train_specs.keys())
+    main_df = main_df[main_df['samplename'].isin(loaded_keys_main)].reset_index(drop=True)
+    removed_main_count = original_main_count - len(main_df)
+    if removed_main_count > 0:
+        print(f"  Filtered main_df: Removed {removed_main_count} samples whose 'samplename' was not found in main_train_specs keys.")
+    print(f"  Final main_df size after filtering: {len(main_df)} samples.")
+
+
+    # Filter pseudo_df
+    if config.USE_PSEUDO_LABELS:
+        original_pseudo_count = len(pseudo_df)
+        loaded_keys_pseudo = set(pseudo_train_specs.keys())
+        pseudo_df = pseudo_df[pseudo_df['samplename'].isin(loaded_keys_pseudo)].reset_index(drop=True)
+        removed_pseudo_count = original_pseudo_count - len(pseudo_df)
+        if removed_pseudo_count > 0:
+            print(f"  Filtered pseudo_df: Removed {removed_pseudo_count} samples whose 'samplename' was not found in pseudo_train_specs keys.")
+        print(f"  Final pseudo_df size after filtering: {len(pseudo_df)} samples.")
+
+    print(f"\n--- Proceeding to run_training ---")
+    print(f"  main_df size: {len(main_df)}")
+    if pseudo_df is not None:
+        print(f"  pseudo_df size: {len(pseudo_df)}")
+    else:
+        print(f"  pseudo_df is None")
+    print(f"  Number of main_train_specs loaded: {len(main_train_specs)}")
+    print(f"  Number of main_val_specs loaded: {len(main_val_specs)}")
+    print(f"  Number of pseudo_train_specs loaded: {len(pseudo_train_specs)}")
+    print(f"  Number of pseudo_val_specs loaded: {len(pseudo_val_specs)}")
+
+    run_training(
+        main_df=main_df, 
+        pseudo_df=pseudo_df, 
+        config=config, 
+        main_train_spectrograms=main_train_specs,
+        main_val_spectrograms=main_val_specs,
+        pseudo_train_spectrograms=pseudo_train_specs,
+        pseudo_val_spectrograms=pseudo_val_specs,
+        custom_run_name=cmd_args.run_name
+    )
 
     print("\nTraining script finished!")

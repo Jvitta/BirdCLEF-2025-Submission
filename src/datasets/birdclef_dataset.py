@@ -31,18 +31,16 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 class BirdCLEFDataset(Dataset):
     """Dataset class for BirdCLEF.
-    Handles loading pre-computed spectrograms from a pre-loaded dictionary
-    or generating them on-the-fly.
+    Handles loading pre-computed spectrograms from pre-loaded dictionaries for main and pseudo data.
     Supports different preprocessing for EfficientNet vs. MobileNet architectures based on config.model_name.
     """
-    def __init__(self, df, config, mode="train", all_spectrograms=None):
-        self.df = df.copy()
+    def __init__(self, df_fold, config, mode="train", main_spectrograms: dict = None, pseudo_spectrograms: dict = None):
+        self.df = df_fold.copy()
         self.config = config
         self.mode = mode
-        self.all_spectrograms = all_spectrograms
-        # self.model_architecture = self.config.MODEL_ARCHITECTURE # Removed
-
-        # Load taxonomy data
+        self.main_spectrograms = main_spectrograms if main_spectrograms is not None else {}
+        self.pseudo_spectrograms = pseudo_spectrograms if pseudo_spectrograms is not None else {}
+        
         taxonomy_df = pd.read_csv(self.config.taxonomy_path)
         self.species_ids = taxonomy_df['primary_label'].tolist()
 
@@ -78,23 +76,19 @@ class BirdCLEFDataset(Dataset):
         else:
             raise ValueError(f"Unsupported model_name for dataset configuration: {self.config.model_name}. Check if 'efficientnet' or 'mn' is in the name.")
 
-        # Clarify logging based on whether this is a soundscape validation specific instance
-        is_soundscape_val_mode = (self.mode == 'valid' and \
-                                   hasattr(self.df, 'detection_id') and \
-                                   self.df['detection_id'].iloc[0].startswith(self.df['original_filename'].iloc[0]) and \
-                                   self.df['detection_id'].iloc[0].count('_idx_') > 0)
-
-        if self.all_spectrograms is not None:
-            if is_soundscape_val_mode:
-                print(f"Dataset mode '{self.mode}' (Soundscape Val): Using pre-loaded spectrogram dictionary.")
-                print(f"  Found {len(self.all_spectrograms)} detection_ids with precomputed spectrograms.")
-            else:
-                print(f"Dataset mode '{self.mode}': Using pre-loaded spectrogram dictionary.")
-                print(f"  Found {len(self.all_spectrograms)} samplenames with precomputed chunks.")
-        elif self.config.LOAD_PREPROCESSED_DATA:
-            print(f"Dataset mode '{self.mode}': ERROR - Configured to load preprocessed data, but none provided. Dataset will be empty.")
+        # Logging about received spectrograms
+        print(f"Dataset mode '{self.mode}': Initialized with {len(self.df)} samples.")
+        if self.main_spectrograms:
+            print(f"  Received {len(self.main_spectrograms)} main data spectrograms.")
         else:
-            print(f"Dataset mode '{self.mode}': Configured for on-the-fly generation from {len(self.df)} files (ensure preprocessing logic is present if used).")
+            print("  No main data spectrograms provided.")
+        if self.pseudo_spectrograms:
+            print(f"  Received {len(self.pseudo_spectrograms)} pseudo data spectrograms.")
+        else:
+            print("  No pseudo data spectrograms provided.")
+        
+        if not self.main_spectrograms and not self.pseudo_spectrograms and self.config.LOAD_PREPROCESSED_DATA:
+             print(f"WARNING: Dataset mode '{self.mode}' configured to load preprocessed data, but no spectrogram dictionaries provided or they are empty. Errors may occur if data is expected.")
 
     def __len__(self):
         return len(self.df)
@@ -102,26 +96,34 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        # Determine key for spectrogram lookup and relevant filename for errors/logging
-        # Also determine data_source string
-        is_soundscape_val_item = (self.mode == 'valid' and 'detection_id' in row and 'original_filename' in row)
-        
-        if is_soundscape_val_item:
-            # This is our fixed soundscape validation set
-            lookup_key = row['detection_id']
-            filename_for_error = row['original_filename']
-            samplename_for_output = row['detection_id'] # Use detection_id as the unique identifier
-            data_source = 'soundscape_validation' # Specific source
-        else:
-            # Standard training data or K-fold validation from training data
-            lookup_key = row['samplename']
-            filename_for_error = row.get('filename', lookup_key)
-            samplename_for_output = row['samplename']
-            data_source = row.get('data_source', 'unknown') 
-        
+        data_source = row.get('data_source', 'unknown') 
         primary_label = row['primary_label']
-        secondary_labels_str = str(row.get('secondary_labels', '')) # Gracefully handle missing secondary_labels
+        secondary_labels_str = str(row.get('secondary_labels', ''))
         
+        # Determine lookup_key and which spectrogram dictionary to use
+        lookup_key = row['samplename'] # 'samplename' is the key for both main and pseudo after __main__ processing
+        filename_for_error = row.get('filename', lookup_key) # Original audio filename for context in errors
+        samplename_for_output = row['samplename']
+
+        current_spectrogram_dict = None
+        is_main_data = False
+        
+        if data_source == 'main':
+            current_spectrogram_dict = self.main_spectrograms
+            is_main_data = True
+        elif data_source == 'pseudo':
+            current_spectrogram_dict = self.pseudo_spectrograms
+        else:
+            print(f"WARNING: Unknown data_source '{data_source}' for sample {samplename_for_output}. Attempting main_spectrograms, then pseudo_spectrograms.")
+            # Fallback strategy: try main, then pseudo. Or could raise error.
+            if lookup_key in self.main_spectrograms:
+                current_spectrogram_dict = self.main_spectrograms
+                is_main_data = True
+            elif lookup_key in self.pseudo_spectrograms:
+                current_spectrogram_dict = self.pseudo_spectrograms
+            else:
+                current_spectrogram_dict = {} # Leads to fallback zeros
+
         sample_weight = 1.0 
         if (self.mode == 'train' or self.mode == 'valid') and self.enable_distance_weighting:
             # For soundscape_validation, lat/lon won't be present in its metadata, so will use default
@@ -142,24 +144,32 @@ class BirdCLEFDataset(Dataset):
             else: sample_weight = self.default_weight_value
         
         loaded_chunk_np = None
-        if self.all_spectrograms is not None and lookup_key in self.all_spectrograms:
-            spec_data_from_npz = self.all_spectrograms[lookup_key]
+        if current_spectrogram_dict and lookup_key in current_spectrogram_dict:
+            spec_data_from_npz = current_spectrogram_dict[lookup_key]
             
-            if is_soundscape_val_item: # For soundscape val, NPZ stores (H, W) directly
-                if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 2:
-                    loaded_chunk_np = spec_data_from_npz
-                else:
-                    print(f"WARNING (Soundscape VAL): Data for '{lookup_key}' has unexpected format. Expected 2D ndarray. Using zeros.")
-            else: # For training data, NPZ stores (N_chunks, H, W)
-                if isinstance(spec_data_from_npz, np.ndarray) and spec_data_from_npz.ndim == 3:
-                    num_available_chunks = spec_data_from_npz.shape[0]
-                    if num_available_chunks > 0:
-                        selected_idx = 0
-                        if self.mode == 'train' and num_available_chunks > 1:
-                            selected_idx = random.randint(0, num_available_chunks - 1)
-                        loaded_chunk_np = spec_data_from_npz[selected_idx]
-                    # else: print(f"WARNING (Train/KFold-Val): Data for '{lookup_key}' (3D array) has 0 chunks. Using zeros.") # Covered by fallback
-                # else: print(f"WARNING (Train/KFold-Val): Data for '{lookup_key}' has unexpected format. Expected 3D ndarray. Using zeros.") # Covered by fallback
+            if is_main_data: # Main data NPZ stores (N_chunks, H, W) or (H,W) if PRECOMPUTE_VERSIONS=1
+                if isinstance(spec_data_from_npz, np.ndarray):
+                    if spec_data_from_npz.ndim == 3: # (N_chunks, H, W)
+                        num_available_chunks = spec_data_from_npz.shape[0]
+                        if num_available_chunks > 0:
+                            selected_idx = 0
+                            if self.mode == 'train' and num_available_chunks > 1:
+                                selected_idx = random.randint(0, num_available_chunks - 1)
+                            loaded_chunk_np = spec_data_from_npz[selected_idx]
+                    elif spec_data_from_npz.ndim == 2: # Directly (H,W) - e.g. if PRECOMPUTE_VERSIONS was 1
+                        loaded_chunk_np = spec_data_from_npz
+                    # else: print(f"WARNING ({data_source}): Data for '{lookup_key}' has unexpected ndim {spec_data_from_npz.ndim}. Expect 2 or 3.")
+                # else: print(f"WARNING ({data_source}): Data for '{lookup_key}' is not ndarray.")
+            
+            else: # Pseudo data NPZ stores (H,W) directly (as per birdnet_specs.py saving one version)
+                  # or if main data was precomputed with PRECOMPUTE_VERSIONS=1 (already handled by ndim == 2 above for main)
+                if isinstance(spec_data_from_npz, np.ndarray):
+                    if spec_data_from_npz.ndim == 3 and spec_data_from_npz.shape[0] == 1: # Check for (1, H, W)
+                        loaded_chunk_np = spec_data_from_npz[0] # Extract the 2D array
+                    elif spec_data_from_npz.ndim == 2: # Check for (H, W)
+                        loaded_chunk_np = spec_data_from_npz
+                    # else: print(f"WARNING ({data_source}): Data for '{lookup_key}' has unexpected format. Expected 2D or 3D (1,H,W) ndarray.")
+                # else: print(f"WARNING ({data_source}): Data for '{lookup_key}' has unexpected format. Expected 2D ndarray.")
 
             if loaded_chunk_np is not None and loaded_chunk_np.shape != self.config.PREPROCESS_TARGET_SHAPE:
                 print(f"WARNING: '{lookup_key}' - loaded chunk {loaded_chunk_np.shape} != PREPROCESS_TARGET_SHAPE {self.config.PREPROCESS_TARGET_SHAPE}. Resizing.")
@@ -192,7 +202,7 @@ class BirdCLEFDataset(Dataset):
             if processed_spec_np.shape != self.config.TARGET_SHAPE: # For MN, this handles 5s chunk -> 10s model input if needed
                  # This logic assumes TARGET_SHAPE width is double PREPROCESS_TARGET_SHAPE width for MN concatenation
                 if self.config.TARGET_SHAPE[1] == 2 * self.config.PREPROCESS_TARGET_SHAPE[1] and \
-                   self.config.TARGET_SHAPE[0] == self.config.PREPROCESS_TARGET_SHAPE[0] and not is_soundscape_val_item:
+                   self.config.TARGET_SHAPE[0] == self.config.PREPROCESS_TARGET_SHAPE[0] and not is_main_data:
                     # Concatenation only for train/kfold-val if using MN and shapes suggest it
                     processed_spec_np = np.concatenate([loaded_chunk_np, loaded_chunk_np], axis=1)
                 else: # Otherwise, resize to the final TARGET_SHAPE
