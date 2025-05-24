@@ -35,19 +35,20 @@ parser.add_argument("--mode", type=str, choices=["train", "val"], default="train
                     help="Preprocessing mode: 'train' for augmented spectrograms, 'val' for fixed-setting spectrograms.")
 cmd_args = parser.parse_args()
 
-efficient_at_spectrogram_generator = AugmentMelSTFT(
-            n_mels=config.N_MELS,
-            sr=config.FS,
-            win_length=config.WIN_LENGTH,
-            hopsize=config.HOP_LENGTH,
-            n_fft=config.N_FFT,
-            fmin=config.FMIN,
-            fmax=config.FMAX, 
-            freqm=0,       
-            timem=0,         
-            fmin_aug_range=config.FMIN_AUG_RANGE,
-            fmax_aug_range=config.FMAX_AUG_RANGE
-        )
+if 'mn' in config.model_name.lower():
+    efficient_at_spectrogram_generator = AugmentMelSTFT(
+                n_mels=config.N_MELS,
+                sr=config.FS,
+                win_length=config.WIN_LENGTH,
+                hopsize=config.HOP_LENGTH,
+                n_fft=config.N_FFT,
+                fmin=config.FMIN,
+                fmax=config.FMAX, 
+                freqm=0,       
+                timem=0,         
+                fmin_aug_range=config.FMIN_AUG_RANGE,
+                fmax_aug_range=config.FMAX_AUG_RANGE
+            )
 
 # Determine output path based on model name and mode
 base_output_filename = f"spectrograms_{config.model_name}_{cmd_args.mode}.npz"

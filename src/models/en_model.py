@@ -11,7 +11,7 @@ class EfficientNetBirdCLEF(nn.Module):
             config.model_name,
             pretrained=config.pretrained,
             in_chans=config.in_channels,
-            drop_rate=config.drop_rate, # Consider making these configurable
+            drop_rate=config.dropout, # Consider making these configurable
             drop_path_rate=0.2 # Consider making these configurable
         )
 
@@ -33,14 +33,14 @@ class EfficientNetBirdCLEF(nn.Module):
         logits = self.classifier(features)
         return logits
 
-def get_en_model(config_obj):
+def get_en_model(config):
     """Helper function to instantiate the EfficientNetBirdCLEF model."""
     required_attrs = ['model_name', 'pretrained', 'in_channels', 'num_classes']
-    if 'efficientnet' not in config_obj.model_name:
-        raise ValueError(f"Model name {config_obj.model_name} is not an EfficientNet model.")
+    if 'efficientnet' not in config.model_name:
+        raise ValueError(f"Model name {config.model_name} is not an EfficientNet model.")
     for attr in required_attrs:
-        if not hasattr(config_obj, attr):
+        if not hasattr(config, attr):
             raise AttributeError(f"Config object is missing required attribute for EN model: {attr}")
             
-    model = EfficientNetBirdCLEF(config_obj)
+    model = EfficientNetBirdCLEF(config)
     return model

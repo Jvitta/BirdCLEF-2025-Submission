@@ -11,6 +11,9 @@ class Config:
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
     MODEL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'models')
     _PREPROCESSED_OUTPUT_DIR = os.path.join(OUTPUT_DIR, 'preprocessed')
+    PREPROCESSED_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms.npz')
+    PREPROCESSED_NPZ_PATH_VAL = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'spectrograms_val.npz')
+    SOUNDSCAPE_VAL_NPZ_PATH = os.path.join(_PREPROCESSED_OUTPUT_DIR, 'soundscape_val.npz')
     PROCESSED_DATA_DIR = os.path.join(DATA_ROOT, 'processed')
 
     # These derived paths use the mount point
@@ -48,7 +51,7 @@ class Config:
     seed = 43
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model_name = 'mn20_as' 
+    model_name = 'efficientnet_b0' 
 
     if 'mn' in model_name:
         width_mult = 2.0
@@ -58,10 +61,10 @@ class Config:
 
         epochs = 10 # 10
         optimizer = 'AdamW'
-        lr = 0.001072 #0.0006124336720699518 # Doubled from 0.000536 for batch_size 128
+        lr = 0.000268 #0.0006124336720699518 # Doubled from 0.000536 for batch_size 128
         min_lr = 1e-6
         weight_decay = 0.000285 #0.0009586824835340106 
-        dropout = 0.482918 #0.2
+        dropout = 0.2
         scheduler = 'CosineAnnealingLR' 
         T_max = 15
 
@@ -104,22 +107,22 @@ class Config:
 
         criterion = 'FocalLossBCE'
         focal_loss_alpha = 0.25
-        focal_loss_gamma = 3.403297 #2.0
-        focal_loss_bce_weight = 0.291471 #0.6 # Focal weight will be calculated as 2.0 - bce_weight
+        focal_loss_gamma = 2.0
+        focal_loss_bce_weight = 0.6 # Focal weight will be calculated as 2.0 - bce_weight
 
-        label_smoothing_factor = 0.188891 #0.17663005428851927
+        label_smoothing_factor = 0.17663005428851927
 
         n_fold = 5
         selected_folds = [0, 1, 2, 3, 4]
 
-        train_batch_size = 128
-        val_batch_size = 128
+        train_batch_size = 32
+        val_batch_size = 64
         inference_batch_size = 64
 
         # --- Augmentation Parameters ---
         batch_augment_prob = 1.0  # Probability of applying Mixup OR CutMix to a batch
         mixup_vs_cutmix_ratio = 1.0  # If augmenting, probability of choosing Mixup (vs CutMix)
-        mixup_alpha = 0.244065 #0.4194592538670868
+        mixup_alpha = 0.4194592538670868
         cutmix_alpha = 1.0           
 
         # Spectrogram Augmentation (applied manually in Dataset)
@@ -182,13 +185,14 @@ class Config:
         # Data Handling
         LOAD_PREPROCESSED_DATA = True
         REMOVE_SPEECH_INTERVALS = True
-        USE_RARE_DATA = False 
+        USE_RARE_DATA = False
         USE_PSEUDO_LABELS = False
         REMOVE_SPEECH_ONLY_NON_AVES = True
         USE_WEIGHTED_SAMPLING = False
         USE_MANUAL_ANNOTATIONS = False
-        EXCLUDE_FILES_WITH_ONLY_LOW_QUALITY_MANUAL_ANNOTATIONS = True
+        EXCLUDE_FILES_WITH_ONLY_LOW_QUALITY_MANUAL_ANNOTATIONS = False
         ENABLE_DISTANCE_WEIGHTING = False 
+        USE_GLOBAL_OVERSAMPLING = False
 
         NUM_SPECTROGRAM_SAMPLES_TO_LOG = 30
         PRECOMPUTE_VERSIONS = 3
@@ -212,6 +216,7 @@ class Config:
         focal_loss_gamma = 2.0
         focal_loss_bce_weight = 0.6
         label_smoothing_factor = 0.1
+        dropout = 0.2
 
         # Folds
         n_fold = 5
